@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+project(roblox_libcxx_linker C CXX)
+set(APPLE_TARGET_TRIPLET_PRIMARY x86_64-apple-darwin)
+set(TARGET_x86_64 ON)
+add_subdirectory("${DARLING_SOURCE}/src/external/cctools-port/cctools/ld64/src" ld64)

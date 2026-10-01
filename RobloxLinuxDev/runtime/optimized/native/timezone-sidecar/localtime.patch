@@ -1,0 +1,268 @@
+--- trackA/src/darling/src/external/libc/stdtime/FreeBSD/localtime.c
++++ trackA/src/darling/src/external/libc/stdtime/FreeBSD/localtime.c
+@@ -28,6 +28,10 @@
+ #include <time.h>
+ #include <fcntl.h>
+ #include <pthread.h>
++#ifdef DARLING
++/* Darling does not provide a working notifyd service; use the file cache. */
++#undef NOTIFY_TZ
++#endif
+ #ifdef NOTIFY_TZ
+ //#define NOTIFY_TZ_DEBUG
+ //#define NOTIFY_TZ_DEBUG_FILE	"/var/log/localtime.debug"
+@@ -288,11 +292,8 @@
+ 				  const struct rule * rulep, long offset)
+   ATTRIBUTE_PURE;
+ static int		typesequiv(const struct state * sp, int a, int b);
+-#ifdef NOTIFY_TZ
+-static int		tzload(const char * name, struct state * sp, char *path, int doextend);
+-#else /* ! NOTIFY_TZ */
+-static int		tzload(const char * name, struct state * sp, int doextend);
+-#endif /* NOTIFY_TZ */
++static int		tzload(const char *name, struct state *sp, char *path,
++			struct stat *metadata, int doextend);
+ static int		tzparse(const char * name, struct state * sp,
+ 				int lastditch);
+ 
+@@ -631,16 +632,11 @@
+ }
+ 
+ static int
+-#ifdef NOTIFY_TZ
+-tzload(name, sp, path, doextend)
+-#else /* ! NOTIFY_TZ */
+-tzload(name, sp, doextend)
+-#endif /* NOTIFY_TZ */
++tzload(name, sp, path, metadata, doextend)
+ const char *		name;
+ struct state * const	sp;
+-#ifdef NOTIFY_TZ
+ char *			path; /* copy full path if non-NULL */
+-#endif /* NOTIFY_TZ */
++struct stat *		metadata; /* identity of the opened file, if requested */
+ register const int	doextend;
+ {
+ 	const char *	p;
+@@ -668,10 +664,8 @@
+ 		if ((name[0] == ':' && name[1] == '/') || 
+ 		    name[0] == '/' || strchr(name, '.'))
+ 			name = NULL;
+-#ifdef NOTIFY_TZ
+ 	if (path)
+ 		*path = 0; /* default to empty string on error */
+-#endif /* NOTIFY_TZ */
+ 	if (name == NULL && (name = TZDEFAULT) == NULL)
+ 		return -1;
+ 	{
+@@ -712,13 +706,13 @@
+ 				doaccess = TRUE;
+ 			name = fullname;
+ 		}
+-#ifdef NOTIFY_TZ
+ 		if (path) {
+-			if (strlen(name) > FILENAME_MAX)
++			if (strlen(name) > FILENAME_MAX) {
++				free(fullname);
+ 				return -1;
++			}
+ 			strcpy(path, name);
+ 		}
+-#endif /* NOTIFY_TZ */
+ 		if (doaccess && access(name, R_OK) != 0) {
+ 			free(fullname);
+ 		     	return -1;
+@@ -732,6 +726,8 @@
+ 			_close(fid);
+ 			return -1;
+ 		}
++		if (metadata)
++			*metadata = stab;
+ 		free(fullname);
+ 	}
+ 	u = malloc(sizeof(*u));
+@@ -1309,11 +1305,7 @@
+ 				return -1;
+ 		}
+ 	}
+-#ifdef NOTIFY_TZ
+-	load_result = tzload(TZDEFRULES, sp, NULL, FALSE);
+-#else /* !NOTIFY_TZ */
+-	load_result = tzload(TZDEFRULES, sp, FALSE);
+-#endif /* NOTIFY_TZ */
++	load_result = tzload(TZDEFRULES, sp, NULL, NULL, FALSE);
+ 	if (load_result != 0)
+ 		sp->leapcnt = 0;		/* so, we're off a little */
+ 	if (*name != '\0') {
+@@ -1515,9 +1507,9 @@
+ #endif /* NOTIFY_TZ */
+ {
+ #ifdef NOTIFY_TZ
+-	if (tzload(gmt, sp, path, TRUE) != 0)
++	if (tzload(gmt, sp, path, NULL, TRUE) != 0)
+ #else /* ! NOTIFY_TZ */
+-	if (tzload(gmt, sp, TRUE) != 0)
++	if (tzload(gmt, sp, NULL, NULL, TRUE) != 0)
+ #endif /* NOTIFY_TZ */
+ 		(void) tzparse(gmt, sp, TRUE);
+ }
+@@ -1532,6 +1524,7 @@
+  * we try to use it. This is a special case that occurs at first boot for launchd (and other early boot-tasks)
+  * rdar://60592414
+  */
++#ifdef NOTIFY_TZ
+ static struct timespec last_default_tzload_mtimespec = {0, 0};
+ static void
+ tzsetwall_check_default_file_timestamp(void)
+@@ -1553,18 +1546,57 @@
+ 	}
+ }
+ 
++#else
++static struct stat last_tzload_stat;
++static int last_tzload_valid;
++static char last_tzload_path[FILENAME_MAX + 1];
++
++/* Read under lcl_rwlock; only a successful load under its write lock commits. */
++static int
++tzfile_changed(const char *path)
++{
++	struct stat current;
++	return !path || stat(path, &current) != 0 || !last_tzload_valid ||
++		current.st_dev != last_tzload_stat.st_dev ||
++		current.st_ino != last_tzload_stat.st_ino ||
++		current.st_size != last_tzload_stat.st_size ||
++		current.st_mtimespec.tv_sec != last_tzload_stat.st_mtimespec.tv_sec ||
++		current.st_mtimespec.tv_nsec != last_tzload_stat.st_mtimespec.tv_nsec ||
++		current.st_ctimespec.tv_sec != last_tzload_stat.st_ctimespec.tv_sec ||
++		current.st_ctimespec.tv_nsec != last_tzload_stat.st_ctimespec.tv_nsec;
++}
++#endif
++
+ static void
+ tzsetwall_basic(int rdlocked)
+ {
+-#ifdef NOTIFY_TZ
++#ifndef NOTIFY_TZ
++	struct stat loaded;
++	int changed;
++	if (!rdlocked)
++		_RWLOCK_RDLOCK(&lcl_rwlock);
++	changed = tzfile_changed(TZDEFAULT);
++	if (lcl_is_set < 0 && !changed) {
++		if (!rdlocked)
++			_RWLOCK_UNLOCK(&lcl_rwlock);
++		return;
++	}
++	_RWLOCK_UNLOCK(&lcl_rwlock);
++	_RWLOCK_WRLOCK(&lcl_rwlock);
++	/* Another reader may have completed the same load while we upgraded. */
++	changed = tzfile_changed(TZDEFAULT);
++	if (lcl_is_set < 0 && !changed) {
++		_RWLOCK_UNLOCK(&lcl_rwlock);
++		if (rdlocked)
++			_RWLOCK_RDLOCK(&lcl_rwlock);
++		return;
++	}
++#else
+ 	if (bootstrap_port != MACH_PORT_NULL) {
+ 		notify_check_tz(&lcl_notify);
+ 	} else {
+ 		tzsetwall_check_default_file_timestamp();
+ 	}
+-#else
+-	tzsetwall_check_default_file_timestamp();
+-#endif /* NOTIFY_TZ */
+ 
+ 	if (!rdlocked)
+ 		_RWLOCK_RDLOCK(&lcl_rwlock);
+@@ -1582,6 +1614,7 @@
+ 	_RWLOCK_UNLOCK(&lcl_rwlock);
+ 
+ 	_RWLOCK_WRLOCK(&lcl_rwlock);
++#endif
+ 	lcl_is_set = -1;
+ 
+ #ifdef ALL_STATE
+@@ -1599,7 +1632,7 @@
+ #ifdef NOTIFY_TZ
+ 	{
+ 		char		fullname[FILENAME_MAX + 1];
+-		if (tzload((char *) NULL, lclptr, fullname, TRUE) != 0) {
++		if (tzload((char *) NULL, lclptr, fullname, NULL, TRUE) != 0) {
+ 			// The load failed, so we need to reset the cached modified time
+ 			// of the timezone file
+ 			last_default_tzload_mtimespec = (const struct timespec){0};
+@@ -1613,8 +1646,14 @@
+ 		notify_register_tz(fullname, &lcl_notify);
+ 	}
+ #else /* ! NOTIFY_TZ */
+-	if (tzload((char *) NULL, lclptr, TRUE) != 0)
++	if (tzload((char *) NULL, lclptr, NULL, &loaded, TRUE) != 0) {
++		last_tzload_valid = 0;
+ 		gmtload(lclptr);
++	} else {
++		last_tzload_stat = loaded;
++		last_tzload_valid = 1;
++	}
++	last_tzload_path[0] = '\0';
+ #endif /* NOTIFY_TZ */
+ 	settzname();
+ 	_RWLOCK_UNLOCK(&lcl_rwlock);
+@@ -1648,7 +1687,11 @@
+ #endif /* NOTIFY_TZ */
+ 	if (!rdlocked)
+ 		_RWLOCK_RDLOCK(&lcl_rwlock);
+-	if (lcl_is_set > 0 && strcmp(lcl_TZname, name) == 0) {
++	if (lcl_is_set > 0 && strcmp(lcl_TZname, name) == 0
++#ifndef NOTIFY_TZ
++		&& (!last_tzload_path[0] || !tzfile_changed(last_tzload_path))
++#endif
++	) {
+ 		if (!rdlocked)
+ 			_RWLOCK_UNLOCK(&lcl_rwlock);
+ #ifdef NOTIFY_TZ_DEBUG
+@@ -1675,6 +1718,10 @@
+ 		}
+ 	}
+ #endif /* defined ALL_STATE */
++#ifndef NOTIFY_TZ
++	last_tzload_valid = 0;
++	last_tzload_path[0] = '\0';
++#endif
+ 	if (*name == '\0') {
+ 		/*
+ 		** User wants it fast rather than right.
+@@ -1700,7 +1747,7 @@
+ 		 * notifications.
+ 		 */
+ 		int		parsedOK = FALSE;
+-		if (tzload(name, lclptr, fullname, TRUE) != 0) {
++		if (tzload(name, lclptr, fullname, NULL, TRUE) != 0) {
+ 			if (name[0] == ':' || !(parsedOK = tzparse(name, lclptr, FALSE) == 0)) {
+ 				/*
+ 				 * If fullname is empty (an error occurred) then
+@@ -1712,9 +1759,20 @@
+ 		notify_register_tz(parsedOK ? NULL : fullname, &lcl_notify);
+ 	}
+ #else /* ! NOTIFY_TZ */
+-	if (tzload(name, lclptr, TRUE) != 0)
+-		if (name[0] == ':' || tzparse(name, lclptr, FALSE) != 0)
+-			(void) gmtload(lclptr);
++	{
++		struct stat loaded;
++		if (tzload(name, lclptr, last_tzload_path, &loaded, TRUE) == 0) {
++			last_tzload_stat = loaded;
++			last_tzload_valid = 1;
++		} else {
++			last_tzload_path[0] = '\0';
++			if (name[0] == ':' || tzparse(name, lclptr, FALSE) != 0) {
++				/* A missing file can appear later; do not cache its GMT fallback. */
++				lcl_is_set = 0;
++				(void) gmtload(lclptr);
++			}
++		}
++	}
+ #endif /* NOTIFY_TZ */
+ 	settzname();
+ 	_RWLOCK_UNLOCK(&lcl_rwlock);

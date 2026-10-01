@@ -1,0 +1,13 @@
+--- a/src/external/libcxxabi/CMakeLists.txt
++++ b/src/external/libcxxabi/CMakeLists.txt
+@@ -34,6 +34,10 @@ set(cxxabi_sources
+ 	src/stdlib_typeinfo.cpp
+ )
+ 
++# RTTI hierarchy searches are hot even in otherwise unoptimized native builds.
++# Keep the original cast/catch rules, exception runtime and thread primitives.
++set_source_files_properties(src/private_typeinfo.cpp PROPERTIES COMPILE_FLAGS "-O2")
++
+ add_darling_object_library(cxxabi_obj ${cxxabi_sources})
+ make_fat(cxxabi_obj)
+ 

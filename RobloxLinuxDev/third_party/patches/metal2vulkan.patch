@@ -1,0 +1,173 @@
+diff --git a/src/meta/mod.rs b/src/meta/mod.rs
+index 78b4b47..b631bde 100644
+--- a/src/meta/mod.rs
++++ b/src/meta/mod.rs
+@@ -107,7 +107,6 @@ pub enum FragRole {
+     /// A texture argument the variant this module describes declares no slot for, so no descriptor
+     /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
+     /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
+-    /// See [`variant_texture_slot`].
+     VariantAbsentTexture,
+     /// Anything we don't model.
+     Other,
+@@ -432,7 +431,6 @@ pub enum VertRole {
+     /// A texture argument the variant this module describes declares no slot for, so no descriptor
+     /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
+     /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
+-    /// See [`variant_texture_slot`].
+     VariantAbsentTexture,
+     Other,
+ }
+@@ -714,7 +712,6 @@ pub enum KernRole {
+     /// A texture argument the variant this module describes declares no slot for, so no descriptor
+     /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
+     /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
+-    /// See [`variant_texture_slot`].
+     VariantAbsentTexture,
+     Other,
+ }
+@@ -2652,10 +2649,9 @@ pub fn execution_group_role(marker: &str) -> Option<(ExecutionGroupFact, u32)> {
+         (ExecutionGroupFact::GroupIndexInThreadgroup, group)
+     } else if let Some(group) = marker.strip_suffix("s_per_threadgroup") {
+         (ExecutionGroupFact::GroupsPerThreadgroup, group)
+-    } else if let Some(group) = marker.strip_prefix("threads_per_") {
+-        (ExecutionGroupFact::ThreadsPerGroup, group)
+     } else {
+-        return None;
++        let group = marker.strip_prefix("threads_per_")?;
++        (ExecutionGroupFact::ThreadsPerGroup, group)
+     };
+     let lanes = AIR_EXECUTION_GROUPS
+         .iter()
+diff --git a/src/native/emitter/ops/air_calls.rs b/src/native/emitter/ops/air_calls.rs
+index 505a6dd..7150be8 100644
+--- a/src/native/emitter/ops/air_calls.rs
++++ b/src/native/emitter/ops/air_calls.rs
+@@ -552,9 +552,11 @@ impl Emitter {
+             | "air.atomic.global.min.u.i32"
+             | "air.atomic.global.sub.s.i32"
+             | "air.atomic.global.sub.u.i32" => {
+-                if call.args.len() != 5 {
++                // Older AIR has no trailing boolean operand. The pointer, value, order and
++                // scope occupy the same positions in both signatures.
++                if !matches!(call.args.len(), 4 | 5) {
+                     return Err(format!(
+-                        "native emitter: {} expects 5 operands",
++                        "native emitter: {} expects 4 or 5 operands",
+                         call.callee
+                     ));
+                 }
+diff --git a/src/native/tests/intrinsics.rs b/src/native/tests/intrinsics.rs
+index 9522635..22e0eff 100644
+--- a/src/native/tests/intrinsics.rs
++++ b/src/native/tests/intrinsics.rs
+@@ -2467,6 +2467,18 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
+     // branch this test guards, so translating it directly would assert nothing.
+     let (san, _) = crate::tools::sanitize_ll_text_with_datalayout(ll);
+     let spv = crate::translate_sanitized_native(&san, Stage::Kernel, &tmp).expect("translate");
++    let older = san
++        .replace("i32 %old, i32 0, i32 2, i1 true", "i32 %old, i32 0, i32 2")
++        .replace(
++            "@air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)",
++            "@air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32)",
++        );
++    let legacy_spv = crate::translate_sanitized_native(&older, Stage::Kernel, &tmp)
++        .expect("older atomic signature");
++    assert_eq!(
++        spv, legacy_spv,
++        "both signatures must preserve the same atomic operation"
++    );
+     let asm = disassemble(&spv).expect("disassemble");
+ 
+     let mut constants = std::collections::HashMap::new();
+diff --git a/src/native/tests/textures.rs b/src/native/tests/textures.rs
+index e97db0f..db379cc 100644
+--- a/src/native/tests/textures.rs
++++ b/src/native/tests/textures.rs
+@@ -2990,27 +2990,34 @@ declare { <4 x half>, i8 } @air.sample_texture_2d_grad.v4f16(ptr addrspace(1), p
+         std::process::id()
+     ));
+     let _ = std::fs::create_dir_all(&tmp);
+-    let spv =
+-        crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("gradient translate");
+-    let asm = disassemble(&spv).expect("disassemble");
+-    let sample = asm
+-        .lines()
+-        .find(|line| line.contains("OpImageSampleExplicitLod"))
+-        .unwrap_or_else(|| panic!("a gradient sample names its level: {asm}"));
+-    assert!(
+-        sample.contains("Grad"),
+-        "the derivatives Metal was handed choose the level: {sample}"
+-    );
+-    assert!(
+-        !sample.contains(" Lod "),
+-        "SPIR-V forbids the Lod image operand beside Grad: {sample}"
+-    );
+-    if std::process::Command::new("spirv-val")
+-        .arg("--version")
+-        .output()
+-        .is_ok()
+-    {
+-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    // Older AIR omits the min-LOD operand and places the offset flag after the derivatives.
++    for input in [
++        ll.to_string(),
++        ll.replace("float 0.000000e+00, i1 true", "i1 true")
++            .replace("<2 x float>, float, i1", "<2 x float>, i1"),
++    ] {
++        let spv = crate::translate_sanitized_native(&input, Stage::Fragment, &tmp)
++            .expect("gradient translate");
++        let asm = disassemble(&spv).expect("disassemble");
++        let sample = asm
++            .lines()
++            .find(|line| line.contains("OpImageSampleExplicitLod"))
++            .unwrap_or_else(|| panic!("a gradient sample names its level: {asm}"));
++        assert!(
++            sample.contains("Grad"),
++            "the derivatives Metal was handed choose the level: {sample}"
++        );
++        assert!(
++            !sample.contains(" Lod "),
++            "SPIR-V forbids the Lod image operand beside Grad: {sample}"
++        );
++        if std::process::Command::new("spirv-val")
++            .arg("--version")
++            .output()
++            .is_ok()
++        {
++            tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++        }
+     }
+     let _ = std::fs::remove_dir_all(tmp);
+ }
+diff --git a/src/passes/air_calls/images/sample.rs b/src/passes/air_calls/images/sample.rs
+index c87ced7..3ff66e6 100644
+--- a/src/passes/air_calls/images/sample.rs
++++ b/src/passes/air_calls/images/sample.rs
+@@ -20,7 +20,8 @@ fn is_gradient_family(name: &str) -> bool {
+ /// Metal's `gradient2d(dPdx, dPdy)` operands, when the AIR family names the gradient form.
+ ///
+ /// The `_grad` symbol places the two derivative vectors immediately after the coordinate (and, for
+-/// an arrayed family, its layer), then a single scalar `min_lod_clamp` float. Without this the
++/// an arrayed family, its layer), then an optional scalar `min_lod_clamp` float. Older AIR goes straight to the boolean offset
++/// flag. Without distinguishing these signatures the
+ /// generic LOD search reads that clamp as an explicit level and the derivatives are dropped, which
+ /// is a sample of the wrong mip in every module that asked for one.
+ fn sample_gradient_pair(
+@@ -50,6 +51,16 @@ fn sample_gradient_pair(
+     // The clamp that follows selects a floor for the derived level. Zero is no clamp at all, which
+     // is what every gradient sample in the corpus asks for; a real one would need `MinLod`.
+     if let Some(&clamp) = args.get(start + 2) {
++        let ty = value_result_type(ctx, clamp);
++        if ty
++            .and_then(|ty| type_def_of(ctx, ty))
++            .is_some_and(|def| def.class.opcode == Op::TypeBool)
++        {
++            return Ok(Some((dx, dy)));
++        }
++        if !ty.is_some_and(|ty| is_f32_scalar(ctx, ty)) {
++            return Err(format!("{name} minimum-LOD clamp must be a scalar float"));
++        }
+         let is_zero = value_def_instruction(ctx, clamp).is_some_and(|def| {
+             matches!(def.class.opcode, Op::ConstantNull)
+                 || (def.class.opcode == Op::Constant

@@ -1,0 +1,14 @@
+{
+  "overrides": [
+    "src/external/metal/private-include/Metal/MTLTextureInternal.h",
+    "src/external/metal/private-include/Metal/MTLBufferInternal.h",
+    "src/external/metal/private-include/Metal/MTLRenderCommandEncoderInternal.h",
+    "src/external/cocotron/QuartzCore/CAMetalDrawable.mm",
+    "src/external/libkqueue/src/common/map.c",
+    "src/external/darlingserver/src/server.cpp",
+    "src/external/darlingserver/src/message.cpp",
+    "src/external/darlingserver/internal-include/darlingserver/message.hpp",
+    "src/startup/darling.c"
+  ],
+  "deleted": []
+}

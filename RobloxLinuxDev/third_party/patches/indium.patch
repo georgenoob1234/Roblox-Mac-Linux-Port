@@ -1,0 +1,1946 @@
+diff --git a/private-include/indium/buffer.private.hpp b/private-include/indium/buffer.private.hpp
+index a348b2b..518abcb 100644
+--- a/private-include/indium/buffer.private.hpp
++++ b/private-include/indium/buffer.private.hpp
+@@ -29,5 +29,8 @@ namespace Indium {
+ 
+ 		INDIUM_PROPERTY(VkBuffer, b, B,uffer) = VK_NULL_HANDLE;
+ 		INDIUM_PROPERTY(VkDeviceMemory, m, M,emory) = VK_NULL_HANDLE;
++	private:
++		// Append state: prebuilt Darling uses inline getters at the original offsets.
++		VkDeviceSize _allocationSize;
+ 	};
+ };
+diff --git a/private-include/indium/command-buffer.private.hpp b/private-include/indium/command-buffer.private.hpp
+index b7ffcce..03ab4e0 100644
+--- a/private-include/indium/command-buffer.private.hpp
++++ b/private-include/indium/command-buffer.private.hpp
+@@ -53,5 +53,8 @@ namespace Indium {
+ 		INDIUM_PROPERTY_READONLY_OBJECT(PrivateDevice, p, P,rivateDevice);
+ 
+ 		INDIUM_PROPERTY(VkCommandBuffer, c, C,ommandBuffer) = VK_NULL_HANDLE;
++	private:
++		// Append state: prebuilt Darling uses inline getters at the original offsets.
++		VkCommandPool _commandPool = VK_NULL_HANDLE;
+ 	};
+ };
+diff --git a/private-include/indium/command-encoder.private.hpp b/private-include/indium/command-encoder.private.hpp
+index c3b1b93..ce3ba62 100644
+--- a/private-include/indium/command-encoder.private.hpp
++++ b/private-include/indium/command-encoder.private.hpp
+@@ -51,7 +51,7 @@ namespace Indium {
+ 				samplers.resize(index + 1);
+ 			}
+ 
+-			if (lodClamps) {
++			if (lodClamps && state) {
+ 				auto privateState = std::dynamic_pointer_cast<PrivateSamplerState>(state);
+ 				samplers[index] = privateState->cloneWithClamps(lodClamps->first, lodClamps->second);
+ 			} else {
+@@ -68,8 +68,15 @@ namespace Indium {
+ 		};
+ 	};
+ 
++	static constexpr std::array<VkDescriptorPoolSize, 4> poolSizes {
++		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 },
++		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 512 },
++		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512 },
++		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_SAMPLER, 512 },
++	};
++
+ 	template<size_t setCount>
+-	std::array<VkDescriptorSet, setCount> createDescriptorSets(std::array<VkDescriptorSetLayout, setCount>& setLayouts, VkDescriptorPool pool, std::shared_ptr<PrivateDevice> privateDevice, const std::array<std::reference_wrapper<const FunctionResources>, setCount>& funcResources, const std::array<std::reference_wrapper<const FunctionInfo>, setCount>& functionInfos, std::vector<std::shared_ptr<Buffer>>& keepAliveBuffers) {
++	std::array<VkDescriptorSet, setCount> createDescriptorSets(std::array<VkDescriptorSetLayout, setCount>& setLayouts, VkDescriptorPool& pool, std::vector<VkDescriptorPool>& fullPools, std::shared_ptr<PrivateDevice> privateDevice, const std::array<std::reference_wrapper<const FunctionResources>, setCount>& funcResources, const std::array<std::reference_wrapper<const FunctionInfo>, setCount>& functionInfos, std::vector<std::shared_ptr<Buffer>>& keepAliveBuffers) {
+ 		std::array<VkDescriptorSet, setCount> descriptorSets {};
+ 
+ 		VkDescriptorSetAllocateInfo setAllocateInfo {};
+@@ -78,10 +85,24 @@ namespace Indium {
+ 		setAllocateInfo.descriptorSetCount = descriptorSets.size();
+ 		setAllocateInfo.pSetLayouts = setLayouts.data();
+ 
+-		if (DynamicVK::vkAllocateDescriptorSets(privateDevice->device(), &setAllocateInfo, descriptorSets.data()) != VK_SUCCESS) {
+-			// TODO
+-			abort();
++		auto status = DynamicVK::vkAllocateDescriptorSets(privateDevice->device(), &setAllocateInfo, descriptorSets.data());
++		if (status == VK_ERROR_OUT_OF_POOL_MEMORY || status == VK_ERROR_FRAGMENTED_POOL) {
++			// Submitted draws still reference old sets: retain every pool until completion.
++			fullPools.push_back(pool);
++			pool = VK_NULL_HANDLE;
++			VkDescriptorPoolCreateInfo info {};
++			info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++			info.maxSets = 64;
++			info.poolSizeCount = poolSizes.size();
++			info.pPoolSizes = poolSizes.data();
++			status = DynamicVK::vkCreateDescriptorPool(privateDevice->device(), &info, nullptr, &pool);
++			if (status == VK_SUCCESS) {
++				setAllocateInfo.descriptorPool = pool;
++				status = DynamicVK::vkAllocateDescriptorSets(privateDevice->device(), &setAllocateInfo, descriptorSets.data());
++			}
+ 		}
++		if (status != VK_SUCCESS)
++			throw std::runtime_error("Vulkan descriptor allocation failed: " + std::to_string(status));
+ 
+ 		for (size_t i = 0; i < descriptorSets.size(); ++i) {
+ 			std::vector<VkWriteDescriptorSet> writeDescSet;
+@@ -91,45 +112,27 @@ namespace Indium {
+ 			const FunctionResources& functionResources = funcResources[i];
+ 			const FunctionInfo& funcInfo = functionInfos[i];
+ 
+-			if (functionResources.buffers.size() > 0) {
+-				std::vector<uint64_t> addresses;
+-
+-				// find the right buffer for each binding (using the binding index)
+-				for (size_t j = 0; j < funcInfo.bindings.size(); ++j) {
+-					auto& bindingInfo = funcInfo.bindings[j];
+-
+-					if (bindingInfo.type != Iridium::BindingType::Buffer) {
+-						continue;
+-					}
+-
+-					if (bindingInfo.index >= functionResources.buffers.size()) {
+-						addresses.push_back(0);
+-						continue;
+-					}
+-
+-					auto privateBuf = std::dynamic_pointer_cast<PrivateBuffer>(functionResources.buffers[bindingInfo.index].first);
+-					addresses.push_back(privateBuf->gpuAddress() + functionResources.buffers[bindingInfo.index].second);
+-				}
+-
+-				auto addressBuffer = privateDevice->newBuffer(addresses.data(), functionResources.buffers.size() * 8, ResourceOptions::StorageModeShared);
+-				auto privateAddrBuf = std::dynamic_pointer_cast<PrivateBuffer>(addressBuffer);
+-
+-				// we need to keep this buffer alive until the operation is completed
+-				keepAliveBuffers.push_back(addressBuffer);
+-
++			// metal2vulkan exposes each Metal buffer as a Vulkan storage-buffer descriptor.
++			for (const auto& binding : funcInfo.bindings) {
++				if (binding.type != Iridium::BindingType::Buffer) continue;
++				if (binding.index >= functionResources.buffers.size())
++					throw std::runtime_error("Missing Metal buffer binding");
++				const auto& resource = functionResources.buffers[binding.index];
++				auto buffer = std::dynamic_pointer_cast<PrivateBuffer>(resource.first);
++				if (!buffer || resource.second >= buffer->length())
++					throw std::runtime_error("Invalid Metal buffer binding or offset");
++				keepAliveBuffers.push_back(buffer);
+ 				auto& info = bufInfos.emplace_front();
+-				info.buffer = privateAddrBuf->buffer();
+-				info.offset = 0;
+-				info.range = VK_WHOLE_SIZE;
+-
+-				auto& descSet = writeDescSet.emplace_back();
+-				descSet.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-				descSet.dstSet = descriptorSets[i];
+-				descSet.dstBinding = 0;
+-				descSet.dstArrayElement = 0;
+-				descSet.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+-				descSet.descriptorCount = 1;
+-				descSet.pBufferInfo = &info;
++				info.buffer = buffer->buffer();
++				info.offset = resource.second;
++				info.range = buffer->length() - resource.second;
++				auto& write = writeDescSet.emplace_back();
++				write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++				write.dstSet = descriptorSets[i];
++				write.dstBinding = binding.internalIndex;
++				write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++				write.descriptorCount = 1;
++				write.pBufferInfo = &info;
+ 			}
+ 
+ 			for (size_t j = 0; j < funcInfo.bindings.size(); ++j) {
+@@ -187,11 +190,4 @@ namespace Indium {
+ 
+ 		return descriptorSets;
+ 	};
+-
+-	static constexpr std::array<VkDescriptorPoolSize, 4> poolSizes {
+-		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 512 },
+-		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 512 },
+-		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512 },
+-		VkDescriptorPoolSize { VK_DESCRIPTOR_TYPE_SAMPLER, 512 },
+-	};
+ };
+diff --git a/private-include/indium/compute-command-encoder.private.hpp b/private-include/indium/compute-command-encoder.private.hpp
+index 8546daa..8b84894 100644
+--- a/private-include/indium/compute-command-encoder.private.hpp
++++ b/private-include/indium/compute-command-encoder.private.hpp
+@@ -7,6 +7,7 @@
+ 
+ namespace Indium {
+ 	class PrivateComputeCommandEncoder: public ComputeCommandEncoder {
++		friend class PrivateCommandBuffer;
+ 	private:
+ 		// the command buffer always outlives us
+ 		std::weak_ptr<PrivateCommandBuffer> _privateCommandBuffer;
+@@ -15,10 +16,10 @@ namespace Indium {
+ 		FunctionResources _functionResources;
+ 		std::shared_ptr<PrivateComputePipelineState> _pso;
+ 		VkDescriptorPool _pool = VK_NULL_HANDLE;
++		std::vector<VkDescriptorPool> _fullPools;
+ 
+-		// XXX: not sure if we actually need to store pipelines until the command buffer finishes executing,
+-		//      but let's do it just in case.
+-		std::vector<VkPipeline> _savedPipelines;
++		// Retain every dispatched state, including states replaced before completion.
++		std::vector<std::shared_ptr<PrivateComputePipelineState>> _savedPipelineStates;
+ 		std::vector<FunctionResources> _savedFunctionResources;
+ 		std::vector<std::shared_ptr<Buffer>> _keepAliveBuffers;
+ 
+diff --git a/private-include/indium/compute-pipeline.private.hpp b/private-include/indium/compute-pipeline.private.hpp
+index 759a4df..39f490d 100644
+--- a/private-include/indium/compute-pipeline.private.hpp
++++ b/private-include/indium/compute-pipeline.private.hpp
+@@ -2,6 +2,8 @@
+ 
+ #include <indium/compute-pipeline.hpp>
+ #include <indium/pipeline.private.hpp>
++#include <map>
++#include <mutex>
+ 
+ namespace Indium {
+ 	class PrivateDevice;
+@@ -15,11 +17,7 @@ namespace Indium {
+ 		PrivateComputePipelineState(std::shared_ptr<PrivateDevice> device, const ComputePipelineDescriptor& descriptor);
+ 		~PrivateComputePipelineState();
+ 
+-		// the pipeline unfortunately has to be recreated on every dispatch since Metal allows setting the number of threads-per-threadgroup
+-		// at dispatch-time in the API while Vulkan only allows setting it within shader code, which usually means it has to be baked-in at
+-		// shader compilation time. however, Vulkan *does* allow it to be set with a specialization constant within the shader, which means
+-		// that we can set it at pipeline-creation time. thus, we have to create a new pipeline with an updated set of specialization constants
+-		// when dispatching the work.
++		// Specialization depends on local size, not on dispatch count or grid size.
+ 		VkPipeline createPipeline(Size threadsPerThreadgroup);
+ 
+ 		const FunctionInfo& functionInfo() const;
+@@ -33,5 +31,9 @@ namespace Indium {
+ 
+ 		INDIUM_PROPERTY_REF(DescriptorSetLayouts<1>, d,D,escriptorSetLayouts);
+ 		INDIUM_PROPERTY_READONLY(VkPipelineLayout, l,L,ayout) = VK_NULL_HANDLE;
++	private:
++		// Append state to preserve prebuilt Darling's inline accessor offsets.
++		std::mutex _pipelineMutex;
++		std::map<std::array<uint32_t, 3>, VkPipeline> _pipelines;
+ 	};
+ };
+diff --git a/private-include/indium/device.private.hpp b/private-include/indium/device.private.hpp
+index 58f1794..d879c8e 100644
+--- a/private-include/indium/device.private.hpp
++++ b/private-include/indium/device.private.hpp
+@@ -111,5 +111,8 @@ namespace Indium {
+ 
+ 		INDIUM_PROPERTY(VkPhysicalDeviceMemoryProperties, m, M,emoryProperties);
+ 		INDIUM_PROPERTY_READONLY(Feature, f, F,eatures);
++		public:
++		// Append state to preserve offsets used by the prebuilt framework.
++		std::mutex queueMutex, oneshotMutex;
+ 	};
+ };
+diff --git a/private-include/indium/dynamic-vk.hpp b/private-include/indium/dynamic-vk.hpp
+index 4957eca..f2c47ce 100644
+--- a/private-include/indium/dynamic-vk.hpp
++++ b/private-include/indium/dynamic-vk.hpp
+@@ -22,6 +22,7 @@ namespace Indium {
+ 		 * @note The global Vulkan instance (`globalInstance`) must be created prior to calling this function.
+ 		 */
+ 		bool eagerlyResolveRequired();
++		VkDeviceSize allocatedSize(VkDevice device);
+ 
+ 		struct DynamicFunctionBase {
+ 			void* pointer;
+@@ -84,6 +85,7 @@ namespace Indium {
+ 			_macro(vkCmdCopyBufferToImage) \
+ 			_macro(vkCmdCopyImage) \
+ 			_macro(vkCmdCopyImageToBuffer) \
++			_macro(vkCmdPushConstants) \
+ 			_macro(vkCmdDispatch) \
+ 			_macro(vkCmdDraw) \
+ 			_macro(vkCmdDrawIndexed) \
+diff --git a/private-include/indium/library.private.hpp b/private-include/indium/library.private.hpp
+index 8752aa2..55327e4 100644
+--- a/private-include/indium/library.private.hpp
++++ b/private-include/indium/library.private.hpp
+@@ -56,6 +56,7 @@ namespace Indium {
+ 		~PrivateLibrary();
+ 
+ 		virtual std::shared_ptr<Function> newFunction(const std::string& name) override;
++		const FunctionInfoMap& functionInfos() const { return _functionInfos; }
+ 		virtual std::shared_ptr<Device> device() override;
+ 
+ 		INDIUM_PROPERTY_READONLY_OBJECT(PrivateDevice, p, P,rivateDevice);
+diff --git a/private-include/indium/pipeline.private.hpp b/private-include/indium/pipeline.private.hpp
+index a43f532..58e8130 100644
+--- a/private-include/indium/pipeline.private.hpp
++++ b/private-include/indium/pipeline.private.hpp
+@@ -37,11 +37,14 @@ namespace Indium {
+ 			size_t index = 0;
+ 			std::vector<VkDescriptorSetLayoutBinding> bindings;
+ 
+-			bool needUBO = false;
+-
+-			for (const auto bindingInfo: function->functionInfo().bindings) {
++			const FunctionInfo empty{};
++			for (const auto bindingInfo: (function ? function->functionInfo() : empty).bindings) {
+ 				if (bindingInfo.type == Iridium::BindingType::Buffer) {
+-					needUBO = true;
++					auto& binding = bindings.emplace_back();
++					binding.binding = bindingInfo.internalIndex;
++					binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++					binding.descriptorCount = 1;
++					binding.stageFlags = functionTypeToVkShaderStageFlags(function->functionInfo().functionType);
+ 				} else if (bindingInfo.type == Iridium::BindingType::Texture) {
+ 					auto& binding = bindings.emplace_back();
+ 					binding.binding = bindingInfo.internalIndex;
+@@ -57,15 +60,6 @@ namespace Indium {
+ 				}
+ 			}
+ 
+-			if (needUBO) {
+-				// we need a UBO to store the buffer addresses
+-				auto& binding = bindings.emplace_back();
+-				binding.binding = 0;
+-				binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+-				binding.descriptorCount = 1;
+-				binding.stageFlags = functionTypeToVkShaderStageFlags(function->functionInfo().functionType);
+-			}
+-
+ 			VkDescriptorSetLayoutCreateInfo layoutInfo {};
+ 			layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+ 			layoutInfo.bindingCount = bindings.size();
+diff --git a/private-include/indium/render-command-encoder.private.hpp b/private-include/indium/render-command-encoder.private.hpp
+index a41b951..f02f657 100644
+--- a/private-include/indium/render-command-encoder.private.hpp
++++ b/private-include/indium/render-command-encoder.private.hpp
+@@ -29,6 +29,7 @@ namespace Indium {
+ 		VkFramebuffer _framebuffer = VK_NULL_HANDLE;
+ 		VkRenderPass _renderPass = VK_NULL_HANDLE;
+ 		VkDescriptorPool _pool = VK_NULL_HANDLE;
++		std::vector<VkDescriptorPool> _fullPools;
+ 
+ 		std::vector<FunctionResources> _savedFunctionResources;
+ 
+@@ -98,5 +99,9 @@ namespace Indium {
+ 
+ 		INDIUM_PROPERTY_OBJECT_VECTOR(Texture, r, R,eadOnlyTextures);
+ 		INDIUM_PROPERTY_OBJECT_VECTOR(Texture, r, R,eadWriteTextures);
++	private:
++		// Append state: prebuilt Darling uses inline getters at the original offsets.
++		std::vector<VkImageView> _attachmentViews;
++		bool _depthClamp = false;
+ 	};
+ };
+diff --git a/private-include/indium/render-pipeline.private.hpp b/private-include/indium/render-pipeline.private.hpp
+index 7e5f242..2bd32df 100644
+--- a/private-include/indium/render-pipeline.private.hpp
++++ b/private-include/indium/render-pipeline.private.hpp
+@@ -36,7 +36,7 @@ namespace Indium {
+ 			//       (which does not include e.g. load and store ops).
+ 			//       if so, we would always be able to create the pipeline immediately
+ 			//       in the constructor.
+-			void recreatePipeline(VkRenderPass compatibleRenderPass, bool force);
++			VkPipeline pipelineFor(VkRenderPass compatibleRenderPass, PrimitiveType primitive, bool depthClamp = false);
+ 
+ 			const FunctionInfo& vertexFunctionInfo();
+ 			const FunctionInfo& fragmentFunctionInfo();
+@@ -51,5 +51,7 @@ namespace Indium {
+ 			INDIUM_PROPERTY_REF(DescriptorSetLayouts<2>, d, D,escriptorSetLayouts);
+ 
+ 			INDIUM_PROPERTY_READONLY_REF(std::vector<size_t>, v,V,ertexInputBindings);
++		private:
++			PipelineArray _clampedPipelines {};
+ 	};
+ };
+diff --git a/private-include/indium/texture.private.hpp b/private-include/indium/texture.private.hpp
+index ccc27bb..33e7950 100644
+--- a/private-include/indium/texture.private.hpp
++++ b/private-include/indium/texture.private.hpp
+@@ -150,6 +150,14 @@ namespace Indium {
+ 		VkImageView _imageView;
+ 		VkDeviceMemory _memory;
+ 		StorageMode _storageMode;
++#ifdef TRACKB_RENDERER
++		// Raw Vulkan allocation owner: upload batches retain it without retaining Device.
++		std::shared_ptr<void> _uploadLifetime;
++		// Set when this image occupies a slot in a shared block instead of owning a
++		// whole allocation; _memory then belongs to the block, not to the texture.
++		std::shared_ptr<struct ImageMemoryBlock> _imageBlock;
++		VkDeviceSize _imageOffset = 0;
++#endif
+ 
+ 	public:
+ 		ConcreteTexture(std::shared_ptr<PrivateDevice> device, const TextureDescriptor& descriptor);
+diff --git a/private-include/indium/types.private.hpp b/private-include/indium/types.private.hpp
+index d49b5f4..a37c22b 100644
+--- a/private-include/indium/types.private.hpp
++++ b/private-include/indium/types.private.hpp
+@@ -5,6 +5,8 @@
+ #include <vulkan/vulkan.h>
+ 
+ #include <memory>
++#include <stdexcept>
++#include <limits>
+ #include <vulkan/vulkan_core.h>
+ 
+ namespace Indium {
+@@ -210,6 +212,7 @@ namespace Indium {
+ 			case PixelFormat::R32Uint:               return 4;
+ 			case PixelFormat::R32Sint:               return 4;
+ 			case PixelFormat::R32Float:              return 4;
++			case PixelFormat::Depth32Float:          return 4;
+ 			case PixelFormat::RG16Unorm:             return 4;
+ 			case PixelFormat::RG16Snorm:             return 4;
+ 			case PixelFormat::RG16Uint:              return 4;
+@@ -244,6 +247,42 @@ namespace Indium {
+ 		}
+ 	};
+ 
++	struct TextureCopyLayout { uint32_t rowLength, imageHeight; size_t dataSize; };
++	static inline TextureCopyLayout textureCopyLayout(PixelFormat format, size_t width, size_t height, size_t depth, size_t rowBytes, size_t imageBytes) {
++		size_t blockWidth=1, blockHeight=1, blockBytes=pixelFormatToByteCount(format);
++		switch(format) {
++			case PixelFormat::BC1_RGBA: case PixelFormat::BC1_RGBA_sRGB:
++			case PixelFormat::BC4_RUnorm: case PixelFormat::BC4_RSnorm:
++				blockWidth=blockHeight=4;blockBytes=8;break;
++			case PixelFormat::BC2_RGBA: case PixelFormat::BC2_RGBA_sRGB:
++			case PixelFormat::BC3_RGBA: case PixelFormat::BC3_RGBA_sRGB:
++			case PixelFormat::BC5_RGUnorm: case PixelFormat::BC5_RGSnorm:
++			case PixelFormat::BC6H_RGBFloat: case PixelFormat::BC6H_RGBUfloat:
++			case PixelFormat::BC7_RGBAUnorm: case PixelFormat::BC7_RGBAUnorm_sRGB:
++				blockWidth=blockHeight=4;blockBytes=16;break;
++			default: break;
++		}
++		if(!blockBytes || !width || !height || !depth || width>UINT32_MAX || height>UINT32_MAX || depth>UINT32_MAX)
++			throw std::invalid_argument("Unsupported texture copy format or extent");
++		auto multiply=[](size_t a,size_t b) {
++			if(b && a>std::numeric_limits<size_t>::max()/b)throw std::overflow_error("Texture copy size overflow");
++			return a*b;
++		};
++		size_t tightRow=multiply((width+blockWidth-1)/blockWidth,blockBytes);
++		size_t rows=(height+blockHeight-1)/blockHeight;
++		size_t stride=rowBytes ? rowBytes : tightRow;
++		if(stride<tightRow || stride%blockBytes)throw std::invalid_argument("Invalid texture row stride");
++		size_t tightImage=multiply(stride,rows);
++		size_t imageStride=imageBytes ? imageBytes : tightImage;
++		if(imageStride<tightImage || imageStride%stride)throw std::invalid_argument("Invalid texture image stride");
++		size_t rowLength=multiply(stride/blockBytes,blockWidth);
++		size_t imageHeight=multiply(imageStride/stride,blockHeight);
++		if(rowLength>UINT32_MAX || imageHeight>UINT32_MAX)throw std::overflow_error("Texture copy stride overflow");
++		size_t preceding=multiply(depth-1,imageStride), lastRows=multiply(rows-1,stride);
++		if(preceding>SIZE_MAX-lastRows || preceding+lastRows>SIZE_MAX-tightRow)throw std::overflow_error("Texture copy size overflow");
++		return {rowBytes ? uint32_t(rowLength) : 0, imageBytes ? uint32_t(imageHeight) : 0, preceding+lastRows+tightRow};
++	}
++
+ 	static constexpr bool pixelFormatIsCompressed(PixelFormat pixelFormat) {
+ 		switch (pixelFormat) {
+ 			case PixelFormat::R8Unorm:
+diff --git a/src/indium/blit-command-encoder.cpp b/src/indium/blit-command-encoder.cpp
+index e58f0ba..a19384d 100644
+--- a/src/indium/blit-command-encoder.cpp
++++ b/src/indium/blit-command-encoder.cpp
+@@ -3,6 +3,9 @@
+ #include <indium/texture.private.hpp>
+ #include <indium/buffer.private.hpp>
+ #include <indium/dynamic-vk.hpp>
++#ifdef TRACKB_RENDERER
++#include <indium/gpu-timing.hpp>
++#endif
+ 
+ Indium::BlitCommandEncoder::~BlitCommandEncoder() {};
+ 
+@@ -38,6 +41,9 @@ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Buffer> source, siz
+ };
+ 
+ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Buffer> source, size_t sourceOffset, size_t sourceBytesPerRow, size_t sourceBytesPerImage, Size sourceSize, std::shared_ptr<Texture> destination, size_t destinationSlice, size_t destinationLevel, Origin destinationOrigin, BlitOption options) {
++#ifdef TRACKB_RENDERER
++	UploadProfileScope profile(RBX_PROF_BLIT_TEXTURE);
++#endif
+ 	auto cmdbuf = _privateCommandBuffer.lock();
+ 	auto privateSource = std::dynamic_pointer_cast<PrivateBuffer>(source);
+ 	auto privateDest = std::dynamic_pointer_cast<PrivateTexture>(destination);
+@@ -47,8 +53,8 @@ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Buffer> source, siz
+ 	}
+ 
+ 	auto aspect = pixelFormatToVkImageAspectFlags(privateDest->pixelFormat());
+-	// FIXME: handle compressed formats
+-	size_t bytesPerPixel = pixelFormatToByteCount(privateDest->pixelFormat());
++	auto layout=textureCopyLayout(privateDest->pixelFormat(),sourceSize.width,sourceSize.height,sourceSize.depth,sourceBytesPerRow,sourceBytesPerImage);
++	if(sourceOffset>source->length() || layout.dataSize>source->length()-sourceOffset)throw std::out_of_range("Texture upload exceeds source buffer");
+ 
+ 	// first, transition the image to the optimal layout for transfer destinations
+ 	VkImageMemoryBarrier barrier {};
+@@ -71,9 +77,9 @@ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Buffer> source, siz
+ 
+ 	// now encode the copy
+ 	VkBufferImageCopy copyInfo {};
+-	copyInfo.bufferOffset = 0;
+-	copyInfo.bufferRowLength = sourceBytesPerRow / bytesPerPixel;
+-	copyInfo.bufferImageHeight = sourceBytesPerImage / sourceBytesPerRow;
++	copyInfo.bufferOffset = sourceOffset;
++	copyInfo.bufferRowLength = layout.rowLength;
++	copyInfo.bufferImageHeight = layout.imageHeight;
+ 	copyInfo.imageSubresource.aspectMask = aspect;
+ 	copyInfo.imageSubresource.mipLevel = destinationLevel;
+ 	copyInfo.imageSubresource.baseArrayLayer = destinationSlice;
+@@ -105,8 +111,8 @@ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Texture> source, si
+ 	}
+ 
+ 	auto aspect = pixelFormatToVkImageAspectFlags(privateSource->pixelFormat());
+-	// FIXME: handle compressed formats
+-	size_t bytesPerPixel = pixelFormatToByteCount(privateSource->pixelFormat());
++	auto layout=textureCopyLayout(privateSource->pixelFormat(),sourceSize.width,sourceSize.height,sourceSize.depth,destinationBytesPerRow,destinationBytesPerImage);
++	if(destinationOffset>destination->length() || layout.dataSize>destination->length()-destinationOffset)throw std::out_of_range("Texture readback exceeds destination buffer");
+ 
+ 	// first, transition the image to the optimal layout for transfer sources
+ 	VkImageMemoryBarrier barrier {};
+@@ -129,9 +135,9 @@ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Texture> source, si
+ 
+ 	// now encode the copy
+ 	VkBufferImageCopy copyInfo {};
+-	copyInfo.bufferOffset = 0;
+-	copyInfo.bufferRowLength = destinationBytesPerRow / bytesPerPixel;
+-	copyInfo.bufferImageHeight = destinationBytesPerImage / destinationBytesPerRow;
++	copyInfo.bufferOffset = destinationOffset;
++	copyInfo.bufferRowLength = layout.rowLength;
++	copyInfo.bufferImageHeight = layout.imageHeight;
+ 	copyInfo.imageSubresource.aspectMask = aspect;
+ 	copyInfo.imageSubresource.mipLevel = sourceLevel;
+ 	copyInfo.imageSubresource.baseArrayLayer = sourceSlice;
+@@ -184,6 +190,8 @@ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Texture> source, si
+ 	barriers[1].oldLayout = privateDest->imageLayout();
+ 	barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+ 	barriers[1].image = privateDest->image();
++	barriers[1].subresourceRange.baseMipLevel = destinationLevel;
++	barriers[1].subresourceRange.baseArrayLayer = destinationSlice;
+ 
+ 	DynamicVK::vkCmdPipelineBarrier(cmdbuf->commandBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, sizeof(barriers) / sizeof(*barriers), barriers);
+ 
+@@ -207,9 +215,21 @@ void Indium::PrivateBlitCommandEncoder::copy(std::shared_ptr<Texture> source, si
+ 		copyInfo.dstOffset.x = destinationOrigin.x;
+ 		copyInfo.dstOffset.y = destinationOrigin.y;
+ 		copyInfo.dstOffset.z = destinationOrigin.z;
+-		copyInfo.extent.width = size.width / (1ull << i);
+-		copyInfo.extent.height = size.height / (1ull << i);
+-		copyInfo.extent.depth = size.depth / (1ull << i);
++		// Metal permits whole compressed edge blocks for tiny mip levels;
++		// Vulkan's extent still names logical texels, not the padded block.
++		auto extent = [&](size_t requested, size_t src, size_t dst, size_t srcOrigin, size_t dstOrigin, bool compressed) {
++			src = std::max<size_t>(1, src >> (sourceLevel+i));
++			dst = std::max<size_t>(1, dst >> (destinationLevel+i));
++			if(srcOrigin>=src || dstOrigin>=dst)throw std::out_of_range("Texture copy origin outside mip");
++			size_t limit=std::min(src-srcOrigin,dst-dstOrigin),n=std::max<size_t>(1,requested>>i);
++			if(compressed && n>limit && n<=((limit+3)/4)*4)n=limit;
++			if(n>limit)throw std::out_of_range("Texture copy extent outside mip");
++			return n;
++		};
++		bool compressed=pixelFormatIsCompressed(source->pixelFormat());
++		copyInfo.extent.width = extent(size.width,source->width(),destination->width(),sourceOrigin.x,destinationOrigin.x,compressed);
++		copyInfo.extent.height = extent(size.height,source->height(),destination->height(),sourceOrigin.y,destinationOrigin.y,compressed);
++		copyInfo.extent.depth = extent(size.depth,source->depth(),destination->depth(),sourceOrigin.z,destinationOrigin.z,false);
+ 	}
+ 
+ 	DynamicVK::vkCmdCopyImage(cmdbuf->commandBuffer(), privateSource->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, privateDest->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copyInfos.size(), copyInfos.data());
+@@ -424,18 +444,18 @@ void Indium::PrivateBlitCommandEncoder::generateMipmapsForTexture(std::shared_pt
+ 		barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+ 		barrier.newLayout = privateTexture->imageLayout();
+ 
+-		DynamicVK::vkCmdPipelineBarrier(cmdbuf->commandBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++		DynamicVK::vkCmdPipelineBarrier(cmdbuf->commandBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+ 	}
+ 
+ 	// finally, transition the last level into the image's original layout
+ 	barrier.subresourceRange.baseMipLevel = privateTexture->mipmapLevelCount() - 1;
+-	barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+ 	// TODO: relax dstAccessMask
+ 	barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+ 	barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+ 	barrier.newLayout = privateTexture->imageLayout();
+ 
+-	DynamicVK::vkCmdPipelineBarrier(cmdbuf->commandBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
++	DynamicVK::vkCmdPipelineBarrier(cmdbuf->commandBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+ };
+ 
+ void Indium::PrivateBlitCommandEncoder::endEncoding() {
+diff --git a/src/indium/buffer.cpp b/src/indium/buffer.cpp
+index 23fd2d3..70772cd 100644
+--- a/src/indium/buffer.cpp
++++ b/src/indium/buffer.cpp
+@@ -72,6 +72,7 @@ Indium::PrivateBuffer::PrivateBuffer(std::shared_ptr<PrivateDevice> device, size
+ 	VkMemoryAllocateInfo allocateInfo {};
+ 	allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+ 	allocateInfo.allocationSize = requirements.size;
++	_allocationSize = requirements.size;
+ 	allocateInfo.memoryTypeIndex = targetIndex;
+ 
+ 	VkMemoryAllocateFlagsInfo allocateFlags {};
+@@ -146,11 +147,19 @@ void* Indium::PrivateBuffer::contents() {
+ };
+ 
+ void Indium::PrivateBuffer::didModifyRange(Range<size_t> range) {
++	if (range.start > _length || range.length > _length - range.start)
++		throw std::out_of_range("Modified buffer range exceeds allocation");
++	if (!range.length) return;
++	if (!_mapped) throw std::runtime_error("Modified buffer is not mapped");
++	const auto atom = _privateDevice->properties().limits.nonCoherentAtomSize;
++	const auto start = range.start - range.start % atom;
++	const auto end = range.start + range.length;
++	const auto padding = (atom - end % atom) % atom;
+ 	VkMappedMemoryRange vulkanRange {};
+ 	vulkanRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+ 	vulkanRange.memory = _memory;
+-	vulkanRange.size = range.length;
+-	vulkanRange.offset = range.start;
++	vulkanRange.size = end + std::min<VkDeviceSize>(padding, _allocationSize - end) - start;
++	vulkanRange.offset = start;
+ 	if (DynamicVK::vkFlushMappedMemoryRanges(_privateDevice->device(), 1, &vulkanRange) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+diff --git a/src/indium/command-buffer.cpp b/src/indium/command-buffer.cpp
+index 43f4a84..29aa884 100644
+--- a/src/indium/command-buffer.cpp
++++ b/src/indium/command-buffer.cpp
+@@ -9,6 +9,7 @@
+ #include <indium/dynamic-vk.hpp>
+ 
+ #include <condition_variable>
++#include <map>
+ 
+ Indium::CommandBuffer::~CommandBuffer() {};
+ 
+@@ -24,9 +25,17 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
+ {
+ 	_privateDevice = _privateCommandQueue->privateDevice();
+ 
++	// Metal buffers can record while a completion thread destroys another buffer.
++	// Vulkan requires separate pools for that concurrent use.
++	// ponytail: one pool per live buffer; recycle pools if profiling justifies it.
++	VkCommandPoolCreateInfo poolInfo {};
++	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++	poolInfo.queueFamilyIndex = _privateDevice->graphicsQueueFamilyIndex() ? *_privateDevice->graphicsQueueFamilyIndex() : *_privateDevice->computeQueueFamilyIndex();
++	if (DynamicVK::vkCreateCommandPool(_privateDevice->device(), &poolInfo, nullptr, &_commandPool) != VK_SUCCESS)
++		throw std::runtime_error("Could not create command pool");
+ 	VkCommandBufferAllocateInfo allocInfo {};
+ 	allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+-	allocInfo.commandPool = _privateCommandQueue->commandPool();
++	allocInfo.commandPool = _commandPool;
+ 	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+ 	allocInfo.commandBufferCount = 1;
+ 
+@@ -44,7 +53,7 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
+ };
+ 
+ Indium::PrivateCommandBuffer::~PrivateCommandBuffer() {
+-	DynamicVK::vkFreeCommandBuffers(_privateDevice->device(), _privateCommandQueue->commandPool(), 1, &_commandBuffer);
++	DynamicVK::vkDestroyCommandPool(_privateDevice->device(), _commandPool, nullptr);
+ };
+ 
+ std::shared_ptr<Indium::RenderCommandEncoder> Indium::PrivateCommandBuffer::renderCommandEncoder(const RenderPassDescriptor& descriptor) {
+@@ -96,23 +105,35 @@ void Indium::PrivateCommandBuffer::commit() {
+ 
+ 	_committed = true;
+ 
++	// Multiple passes (and texture views) may reference the same image. Lock/acquire
++	// it only once per submission; otherwise we deadlock or wait on our own signal.
++	std::map<VkImage, std::shared_ptr<PrivateTexture>> reads, writes;
+ 	for (const auto& encoder: _commandEncoders) {
+-		if (auto renderEncoder = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
+-			for (const auto& texture: renderEncoder->readOnlyTextures()) {
+-				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
+-					privateTexture->precommit(shared_from_this());
+-				}
++		if (auto render = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
++			for (const auto& texture: render->readOnlyTextures()) {
++				auto image = std::dynamic_pointer_cast<PrivateTexture>(texture);
++				if (image) reads.emplace(image->image(), image);
+ 			}
+-			for (const auto& texture: renderEncoder->readWriteTextures()) {
+-				if (auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture)) {
+-					privateTexture->precommit(shared_from_this());
+-				}
++			for (const auto& texture: render->readWriteTextures()) {
++				auto image = std::dynamic_pointer_cast<PrivateTexture>(texture);
++				if (image) writes.emplace(image->image(), image);
+ 			}
+ 		}
+-
+-		// TODO: same for other encoders
++		// TODO: track accesses from compute and blit encoders as well.
++	}
++	std::vector<std::shared_ptr<Texture>> readOnlyTextures, readWriteTextures;
++	for (const auto& [image, texture]: writes) {
++		reads.erase(image);
++		readWriteTextures.push_back(texture);
++		texture->precommit(shared_from_this());
++	}
++	for (const auto& [image, texture]: reads) {
++		readOnlyTextures.push_back(texture);
++		texture->precommit(shared_from_this());
+ 	}
+ 
++	// Serialize texture dependency allocation and submission on the shared VkQueue.
++	std::unique_lock queueLock(_privateDevice->queueMutex);
+ 	if (DynamicVK::vkEndCommandBuffer(_commandBuffer) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+@@ -126,21 +147,8 @@ void Indium::PrivateCommandBuffer::commit() {
+ 
+ 	++timelineSemaphore->count;
+ 
+-	std::vector<std::shared_ptr<Texture>> readOnlyTextures;
+-	std::vector<std::shared_ptr<Texture>> readWriteTextures;
+ 	std::vector<std::shared_ptr<BinarySemaphore>> presentationSemaphores;
+ 
+-	for (const auto& encoder: _commandEncoders) {
+-		if (auto renderEncoder = std::dynamic_pointer_cast<PrivateRenderCommandEncoder>(encoder)) {
+-			auto& readOnly = renderEncoder->readOnlyTextures();
+-			auto& readWrite = renderEncoder->readWriteTextures();
+-			readOnlyTextures.insert(readOnlyTextures.end(), readOnly.begin(), readOnly.end());
+-			readWriteTextures.insert(readWriteTextures.end(), readWrite.begin(), readWrite.end());
+-		}
+-
+-		// TODO: implement this for other encoders (we need to synchronize those texture accesses as well)
+-	}
+-
+ 	for (const auto& texture: readWriteTextures) {
+ 		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(texture);
+ 		auto sema = _privateDevice->getWrappedBinarySemaphore(privateTexture->needsExportablePresentationSemaphore());
+@@ -257,6 +265,7 @@ void Indium::PrivateCommandBuffer::commit() {
+ 		abort();
+ 	}
+ 
++	queueLock.unlock();
+ 	lock.unlock();
+ 
+ 	// now that the binary semaphore signals are pending, we can allow them to be used
+diff --git a/src/indium/compute-command-encoder.cpp b/src/indium/compute-command-encoder.cpp
+index 5f62ad0..e11c119 100644
+--- a/src/indium/compute-command-encoder.cpp
++++ b/src/indium/compute-command-encoder.cpp
+@@ -1,12 +1,24 @@
+ #include <indium/compute-command-encoder.private.hpp>
+ #include <indium/device.private.hpp>
+ #include <indium/dynamic-vk.hpp>
++#ifdef TRACKB_RENDERER
++#include <indium/gpu-timing.hpp>
++#include <indium/pipeline.private.hpp>
++#endif
++
++static void computeMemoryBarrier(VkCommandBuffer command, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage) {
++    VkMemoryBarrier barrier { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    Indium::DynamicVK::vkCmdPipelineBarrier(command, sourceStage, destinationStage,
++        0, 1, &barrier, 0, nullptr, 0, nullptr);
++}
+ 
+ Indium::ComputeCommandEncoder::~ComputeCommandEncoder() {};
+ 
+ Indium::PrivateComputeCommandEncoder::PrivateComputeCommandEncoder(std::shared_ptr<PrivateCommandBuffer> commandBuffer, const ComputePassDescriptor& descriptor):
+ 	_privateCommandBuffer(commandBuffer),
+-	_privateDevice(std::dynamic_pointer_cast<PrivateDevice>(commandBuffer->device())),
++	_privateDevice(std::static_pointer_cast<PrivateDevice>(commandBuffer->device())),
+ 	_descriptor(descriptor)
+ {
+ 	VkDescriptorPoolCreateInfo poolCreateInfo {};
+@@ -19,21 +31,21 @@ Indium::PrivateComputeCommandEncoder::PrivateComputeCommandEncoder(std::shared_p
+ 		// TODO
+ 		abort();
+ 	}
++    if (_descriptor.dispatchType == DispatchType::Concurrent)
++        computeMemoryBarrier(commandBuffer->commandBuffer(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+ };
+ 
+ Indium::PrivateComputeCommandEncoder::~PrivateComputeCommandEncoder() {
+-	for (auto& pipeline: _savedPipelines) {
+-		DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
+-	}
+ 	DynamicVK::vkDestroyDescriptorPool(_privateDevice->device(), _pool, 0);
++	for (auto pool : _fullPools) DynamicVK::vkDestroyDescriptorPool(_privateDevice->device(), pool, nullptr);
+ };
+ 
+ void Indium::PrivateComputeCommandEncoder::endEncoding() {
+-	// nothing for now
++    computeMemoryBarrier(_privateCommandBuffer.lock()->commandBuffer(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+ };
+ 
+ void Indium::PrivateComputeCommandEncoder::setComputePipelineState(std::shared_ptr<ComputePipelineState> state) {
+-	_pso = std::dynamic_pointer_cast<PrivateComputePipelineState>(state);
++	_pso = std::static_pointer_cast<PrivateComputePipelineState>(state);
+ };
+ 
+ void Indium::PrivateComputeCommandEncoder::setBuffer(std::shared_ptr<Buffer> buffer, size_t offset, size_t index) {
+@@ -88,40 +100,56 @@ void Indium::PrivateComputeCommandEncoder::setThreadgroupMemoryLength(size_t len
+ 	throw std::runtime_error("TODO");
+ };
+ 
+-void Indium::PrivateComputeCommandEncoder::dispatchThreadgroups(Size threadgroupsPerGrid, Size threadsPerThreadgroup) {
+-	auto buf = _privateCommandBuffer.lock();
+-
+-	auto pipeline = _pso->createPipeline(threadsPerThreadgroup);
+-	_savedPipelines.push_back(pipeline);
+-
+-	DynamicVK::vkCmdBindPipeline(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+-
+-	// TODO: avoid re-binding descriptors on every dispatch
+-	updateBindings();
+-
+-	DynamicVK::vkCmdDispatch(buf->commandBuffer(), threadgroupsPerGrid.width, threadgroupsPerGrid.height, threadgroupsPerGrid.depth);
+-
+-	// see PrivateRenderCommandEncoder::drawPrimitives() for why we do this
+-	_savedFunctionResources.push_back(_functionResources);
+-};
+-
+-void Indium::PrivateComputeCommandEncoder::dispatchThreads(Size threadsPerGrid, Size threadsPerThreadgroup) {
+-	Size threadgroupsPerGrid {
+-		threadsPerGrid.width / threadsPerThreadgroup.width,
+-		threadsPerGrid.height / threadsPerThreadgroup.height,
+-		threadsPerGrid.depth / threadsPerThreadgroup.depth,
+-	};
+-
+-	if (
+-		(threadgroupsPerGrid.width * threadsPerThreadgroup.width != threadsPerGrid.width) ||
+-		(threadgroupsPerGrid.height * threadsPerThreadgroup.height != threadsPerGrid.height) ||
+-		(threadgroupsPerGrid.depth * threadsPerThreadgroup.depth != threadsPerGrid.depth)
+-	) {
+-		throw std::runtime_error("TODO: support partial threadgroups");
+-	}
+-
+-	return dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup);
+-};
++void Indium::PrivateComputeCommandEncoder::dispatchThreadgroups(Size groups, Size local) {
++    auto multiply = [](size_t a, size_t b) {
++        if (!b || a > UINT32_MAX / b) throw std::runtime_error("Invalid compute grid");
++        return a * b;
++    };
++    dispatchThreads({multiply(groups.width, local.width), multiply(groups.height, local.height), multiply(groups.depth, local.depth)}, local);
++}
++
++void Indium::PrivateComputeCommandEncoder::dispatchThreads(Size gridSize, Size localSize) {
++#ifdef TRACKB_RENDERER
++    UploadProfileScope profile(RBX_PROF_COMPUTE_DISPATCH);
++#endif
++    const std::array<size_t,3> grid {gridSize.width,gridSize.height,gridSize.depth};
++    const std::array<size_t,3> nominal {localSize.width,localSize.height,localSize.depth};
++    for (size_t d=0;d<3;++d) {
++        if (!nominal[d] || nominal[d]>UINT32_MAX || grid[d]>UINT32_MAX)
++            throw std::runtime_error("Invalid compute grid");
++        if (!grid[d]) return;
++    }
++    if (!_pso) throw std::runtime_error("Missing compute pipeline");
++    auto buf = _privateCommandBuffer.lock();
++    // A buffer-growth copy must see every word written by the preceding instance update.
++    if (_descriptor.dispatchType == DispatchType::Serial)
++        computeMemoryBarrier(buf->commandBuffer(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++    if (_savedPipelineStates.empty() || _savedPipelineStates.back() != _pso) _savedPipelineStates.push_back(_pso);
++    updateBindings();
++    // The translator's 48-byte dispatch payload preserves Metal's partial threadgroups.
++    for (unsigned mask=0;mask<8;++mask) {
++        std::array<uint32_t,12> push{};
++        std::array<uint32_t,3> local{},groups{};
++        bool nonempty=true;
++        for (size_t d=0;d<3;++d) {
++            auto full=grid[d]/nominal[d], tail=grid[d]%nominal[d];
++            push[d]=grid[d]; push[9+d]=full+(tail!=0);
++            if (mask & (1u<<d)) {
++                local[d]=tail; groups[d]=tail ? 1 : 0;
++                push[3+d]=full*nominal[d]; push[6+d]=full;
++            } else {
++                local[d]=nominal[d]; groups[d]=full;
++            }
++            nonempty &= groups[d]!=0;
++        }
++        if (!nonempty) continue;
++        auto pipeline=_pso->createPipeline({local[0],local[1],local[2]});
++        DynamicVK::vkCmdBindPipeline(buf->commandBuffer(),VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);
++        DynamicVK::vkCmdPushConstants(buf->commandBuffer(),_pso->layout(),VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push.data());
++        DynamicVK::vkCmdDispatch(buf->commandBuffer(),groups[0],groups[1],groups[2]);
++    }
++    _savedFunctionResources.push_back(_functionResources);
++}
+ 
+ void Indium::PrivateComputeCommandEncoder::setImageblockSize(size_t width, size_t height) {
+ 	throw std::runtime_error("TODO");
+@@ -136,9 +164,55 @@ Indium::DispatchType Indium::PrivateComputeCommandEncoder::dispatchType() {
+ };
+ 
+ void Indium::PrivateComputeCommandEncoder::updateBindings() {
++#ifdef TRACKB_RENDERER
++	UploadProfileScope profile(RBX_PROF_COMPUTE_BINDINGS);
++#endif
+ 	auto buf = _privateCommandBuffer.lock();
++#ifdef TRACKB_RENDERER
++	// Small compute sets are pushed into the command buffer: no descriptor set
++	// allocation per dispatch. The per-dispatch resource snapshot retains them.
++	const auto& info = _pso->functionInfo();
++	if (pushesComputeSet(info, *_privateDevice)) {
++		std::array<VkWriteDescriptorSet, maxPushedComputeBindings> writes;
++		std::array<VkDescriptorBufferInfo, maxPushedComputeBindings> buffers;
++		std::array<VkDescriptorImageInfo, maxPushedComputeBindings> images;
++		uint32_t count = 0;
++		for (const auto& binding : info.bindings) {
++			auto& write = writes[count];
++			write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++			write.dstBinding = binding.internalIndex;
++			write.descriptorCount = 1;
++			if (binding.type == Iridium::BindingType::Buffer) {
++				if (binding.index >= _functionResources.buffers.size()) throw std::runtime_error("Missing Metal buffer binding");
++				const auto& [buffer, offset] = _functionResources.buffers[binding.index];
++				auto* privateBuffer = static_cast<PrivateBuffer*>(buffer.get());
++				if (!privateBuffer || offset >= privateBuffer->length()) throw std::runtime_error("Invalid Metal buffer binding or offset");
++				buffers[count] = {privateBuffer->buffer(), offset, privateBuffer->length() - offset};
++				write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++				write.pBufferInfo = &buffers[count];
++			} else if (binding.type == Iridium::BindingType::Texture) {
++				if (binding.index >= _functionResources.textures.size() || !_functionResources.textures[binding.index]) continue;
++				auto* texture = static_cast<PrivateTexture*>(_functionResources.textures[binding.index].get());
++				images[count] = {VK_NULL_HANDLE, texture->imageView(), texture->imageLayout()};
++				write.descriptorType = binding.textureAccessType == Iridium::TextureAccessType::Sample ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++				write.pImageInfo = &images[count];
++			} else if (binding.type == Iridium::BindingType::Sampler) {
++				const bool embedded = binding.index == SIZE_MAX;
++				if (!embedded && binding.index >= _functionResources.samplers.size()) continue;
++				const auto& sampler = embedded ? info.embeddedSamplerStates[binding.embeddedSamplerIndex] : _functionResources.samplers[binding.index];
++				if (!sampler) continue;
++				images[count] = {static_cast<PrivateSamplerState*>(sampler.get())->sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
++				write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
++				write.pImageInfo = &images[count];
++			} else continue;
++			++count;
++		}
++		if (count) DynamicVK::vkCmdPushDescriptorSetKHR(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, _pso->layout(), 0, count, writes.data());
++		return;
++	}
++#endif
+ 
+-	std::array<VkDescriptorSet, 1> descriptorSets = createDescriptorSets(_pso->descriptorSetLayouts().layouts, _pool, _privateDevice, { _functionResources }, { _pso->functionInfo() }, _keepAliveBuffers);
++	std::array<VkDescriptorSet, 1> descriptorSets = createDescriptorSets(_pso->descriptorSetLayouts().layouts, _pool, _fullPools, _privateDevice, { _functionResources }, { _pso->functionInfo() }, _keepAliveBuffers);
+ 
+ 	DynamicVK::vkCmdBindDescriptorSets(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_COMPUTE, _pso->layout(), 0, descriptorSets.size(), descriptorSets.data(), 0, nullptr);
+ };
+diff --git a/src/indium/compute-pipeline.cpp b/src/indium/compute-pipeline.cpp
+index e89f5d5..be4b7a8 100644
+--- a/src/indium/compute-pipeline.cpp
++++ b/src/indium/compute-pipeline.cpp
+@@ -1,6 +1,9 @@
+ #include <indium/compute-pipeline.private.hpp>
+ #include <indium/device.private.hpp>
+ #include <stdexcept>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <indium/dynamic-vk.hpp>
+ 
+ Indium::ComputePipelineState::~ComputePipelineState() {};
+@@ -21,10 +24,13 @@ Indium::PrivateComputePipelineState::PrivateComputePipelineState(std::shared_ptr
+ 
+ 	_descriptorSetLayouts.processFunction(std::dynamic_pointer_cast<PrivateFunction>(_descriptor.computeFunction), 0);
+ 
++	VkPushConstantRange dispatchRange { VK_SHADER_STAGE_COMPUTE_BIT, 0, 48 };
+ 	VkPipelineLayoutCreateInfo layoutInfo {};
+ 	layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+ 	layoutInfo.setLayoutCount = _descriptorSetLayouts.layouts.size();
+ 	layoutInfo.pSetLayouts = _descriptorSetLayouts.layouts.data();
++	layoutInfo.pushConstantRangeCount = 1;
++	layoutInfo.pPushConstantRanges = &dispatchRange;
+ 
+ 	if (DynamicVK::vkCreatePipelineLayout(_privateDevice->device(), &layoutInfo, nullptr, &_layout) != VK_SUCCESS) {
+ 		// TODO
+@@ -45,22 +51,23 @@ Indium::PrivateComputePipelineState::PrivateComputePipelineState(std::shared_ptr
+ };
+ 
+ Indium::PrivateComputePipelineState::~PrivateComputePipelineState() {
++	for (const auto& entry: _pipelines)
++		DynamicVK::vkDestroyPipeline(_privateDevice->device(), entry.second, nullptr);
+ 	if (_layout) {
+ 		DynamicVK::vkDestroyPipelineLayout(_privateDevice->device(), _layout, nullptr);
+ 	}
+ };
+ 
+ VkPipeline Indium::PrivateComputePipelineState::createPipeline(Size threadsPerThreadgroup) {
+-	// TODO: optimize this by using pipeline caches.
+-	//       also, we can store the most recent pipeline and, if the number of threads per threadgroup stays the same,
+-	//       we can just return that instead (wrapped in a reference counting object).
+-
+ 	VkPipeline pipeline = VK_NULL_HANDLE;
+ 
+ 	auto func = std::dynamic_pointer_cast<PrivateFunction>(_descriptor.computeFunction);
+ 	auto funcName = func->name();
+ 
+ 	std::array<uint32_t, 3> threadsPerThreadgroupData = { static_cast<uint32_t>(threadsPerThreadgroup.width), static_cast<uint32_t>(threadsPerThreadgroup.height), static_cast<uint32_t>(threadsPerThreadgroup.depth) };
++	std::lock_guard<std::mutex> lock(_pipelineMutex);
++	const auto cached = _pipelines.find(threadsPerThreadgroupData);
++	if (cached != _pipelines.end()) return cached->second;
+ 
+ 	std::array<VkSpecializationMapEntry, 3> mapEntries {};
+ 
+@@ -81,15 +88,20 @@ VkPipeline Indium::PrivateComputePipelineState::createPipeline(Size threadsPerTh
+ 	info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+ 	info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+ 	info.stage.module = func->library()->shaderModule();
+-	info.stage.pName = funcName.c_str();
++	info.stage.pName = "main";
+ 	info.stage.pSpecializationInfo = &specInfo;
+ 	info.layout = _layout;
+ 
++	const bool trace = std::getenv("RBX_PIPELINE_TRACE") != nullptr;
++	const auto started = std::chrono::steady_clock::now();
++	if (trace) std::fprintf(stderr, "COMPUTE begin %s %u,%u,%u\n", funcName.c_str(), threadsPerThreadgroupData[0], threadsPerThreadgroupData[1], threadsPerThreadgroupData[2]);
+ 	if (DynamicVK::vkCreateComputePipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+ 	}
+ 
++	if (trace) std::fprintf(stderr, "COMPUTE done %.3fs\n", std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count());
++	_pipelines.emplace(threadsPerThreadgroupData, pipeline);
+ 	return pipeline;
+ };
+ 
+diff --git a/src/indium/device.cpp b/src/indium/device.cpp
+index 322e186..cf667fd 100644
+--- a/src/indium/device.cpp
++++ b/src/indium/device.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include <indium/device.private.hpp>
+ #include <indium/instance.private.hpp>
+ #include <indium/command-queue.private.hpp>
+@@ -240,8 +241,9 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+ 	deviceCreateInfo.pNext = &features; // enable all features
+ 	deviceCreateInfo.enabledExtensionCount = extensions.size();
+ 	deviceCreateInfo.ppEnabledExtensionNames = extensions.data();
+-	if (DynamicVK::vkCreateDevice(_physicalDevice, &deviceCreateInfo, nullptr, &_device) != VK_SUCCESS) {
+-		// TODO
++	auto deviceResult = DynamicVK::vkCreateDevice(_physicalDevice, &deviceCreateInfo, nullptr, &_device);
++	if (deviceResult != VK_SUCCESS) {
++		fprintf(stderr, "Indium: vkCreateDevice failed (%d)\n", int(deviceResult));
+ 		abort();
+ 	}
+ 
+@@ -340,6 +342,10 @@ std::shared_ptr<Indium::Library> Indium::PrivateDevice::newLibrary(const void* d
+ 	size_t translatedSize = 0;
+ 	Iridium::OutputInfo outputInfo;
+ 	auto translatedData = Iridium::translate(data, length, translatedSize, outputInfo);
++	if (!translatedData || translatedSize < 20 || translatedSize % 4) {
++		free(translatedData);
++		return nullptr;
++	}
+ 	PrivateLibrary::FunctionInfoMap funcInfoMap;
+ 
+ 	for (const auto& [name, info]: outputInfo.functionInfos) {
+diff --git a/src/indium/dynamic-vk.cpp b/src/indium/dynamic-vk.cpp
+index a4677c3..6c3099d 100644
+--- a/src/indium/dynamic-vk.cpp
++++ b/src/indium/dynamic-vk.cpp
+@@ -1,4 +1,5 @@
+ #include <indium/dynamic-vk.hpp>
++#include <map>
+ 
+ #ifdef DARLING
+ 	#include <elfcalls.h>
+@@ -72,6 +73,48 @@ void Indium::DynamicVK::finit() {
+ 	}
+ };
+ 
++namespace {
++PFN_vkAllocateMemory allocateMemory;
++PFN_vkFreeMemory freeMemory;
++struct AllocationLedger {
++    std::mutex mutex;
++    std::map<std::pair<VkDevice,VkDeviceMemory>,VkDeviceSize> allocations;
++    std::map<VkDevice,VkDeviceSize> totals;
++};
++AllocationLedger& ledger() {
++    // Kept through process teardown: GPU resource destructors may run very late.
++    static auto *value=new AllocationLedger;
++    return *value;
++}
++VkResult trackedAllocate(VkDevice device,const VkMemoryAllocateInfo *info,const VkAllocationCallbacks *callbacks,VkDeviceMemory *memory) {
++    auto result=allocateMemory(device,info,callbacks,memory);
++    if(result!=VK_SUCCESS)return result;
++    try {
++        auto& data=ledger();std::lock_guard lock(data.mutex);
++        auto& total=data.totals[device];
++        data.allocations.emplace(std::make_pair(device,*memory),info->allocationSize);
++        total+=info->allocationSize;
++    } catch(...) {
++        freeMemory(device,*memory,callbacks);*memory=VK_NULL_HANDLE;
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++    return result;
++}
++void trackedFree(VkDevice device,VkDeviceMemory memory,const VkAllocationCallbacks *callbacks) {
++    auto& data=ledger();
++    {
++        std::lock_guard lock(data.mutex);
++        auto found=data.allocations.find({device,memory});
++        if(found!=data.allocations.end()) {data.totals[device]-=found->second;data.allocations.erase(found);}
++    }
++    freeMemory(device,memory,callbacks);
++}
++}
++VkDeviceSize Indium::DynamicVK::allocatedSize(VkDevice device) {
++    auto& data=ledger();std::lock_guard lock(data.mutex);
++    auto found=data.totals.find(device);return found==data.totals.end() ? 0 : found->second;
++}
++
+ bool Indium::DynamicVK::eagerlyResolveRequired() {
+ 	for (size_t i = 0; i < sizeof(eagerlyResolvedFunctions) / sizeof(*eagerlyResolvedFunctions); ++i) {
+ 		if (!eagerlyResolvedFunctions[i]->resolve()) {
+@@ -79,5 +122,15 @@ bool Indium::DynamicVK::eagerlyResolveRequired() {
+ 			return false;
+ 		}
+ 	}
++    // These shared entry points are also used by Darling's prebuilt CAMetalDrawable.
++    // Counting here includes presentation images as well as Indium buffers/textures.
++    if (!vkAllocateMemory.resolve() || !vkFreeMemory.resolve()) return false;
++    static std::once_flag tracked;
++    std::call_once(tracked, [] {
++        allocateMemory=reinterpret_cast<PFN_vkAllocateMemory>(vkAllocateMemory.pointer);
++        freeMemory=reinterpret_cast<PFN_vkFreeMemory>(vkFreeMemory.pointer);
++        vkAllocateMemory.pointer=reinterpret_cast<void*>(trackedAllocate);
++        vkFreeMemory.pointer=reinterpret_cast<void*>(trackedFree);
++    });
+ 	return true;
+ };
+diff --git a/src/indium/indium.cpp b/src/indium/indium.cpp
+index e7c06fe..a94480f 100644
+--- a/src/indium/indium.cpp
++++ b/src/indium/indium.cpp
+@@ -72,6 +72,22 @@ void Indium::init(const char** additionalExtensions, size_t additionalExtensionC
+ 		extensionSet.insert(additionalExtensions[i]);
+ 	}
+ 
++#ifdef TRACKB_RENDERER
++	// Presentation surfaces for the swapchain presenter (Wayland in the game,
++	// headless in offscreen checks). Only request what the loader offers.
++	{
++		std::vector<VkExtensionProperties> available;
++		uint32_t available_count = 0;
++		if (DynamicVK::vkEnumerateInstanceExtensionProperties(nullptr, &available_count, nullptr) == VK_SUCCESS) {
++			available.resize(available_count);
++			if (DynamicVK::vkEnumerateInstanceExtensionProperties(nullptr, &available_count, available.data()) != VK_SUCCESS) available.clear();
++		}
++		for (const char* wanted : {"VK_KHR_wayland_surface", "VK_EXT_headless_surface"})
++			for (const auto& extension : available)
++				if (strcmp(extension.extensionName, wanted) == 0) extensionSet.insert(wanted);
++	}
++#endif
++
+ 	std::vector<const char*> extensions(extensionSet.begin(), extensionSet.end());
+ 	std::vector<const char*> layers;
+ 
+diff --git a/src/indium/render-command-encoder.cpp b/src/indium/render-command-encoder.cpp
+index b27ffe5..6e0876b 100644
+--- a/src/indium/render-command-encoder.cpp
++++ b/src/indium/render-command-encoder.cpp
+@@ -13,6 +13,7 @@
+ #include <indium/command-encoder.private.hpp>
+ #include <indium/dynamic-vk.hpp>
+ #include <vulkan/vulkan_core.h>
++#include <cstdlib>
+ 
+ Indium::RenderCommandEncoder::~RenderCommandEncoder() {};
+ 
+@@ -37,7 +38,15 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+ 		abort();
+ 	}
+ 
+-	auto firstTexture = descriptor.colorAttachments.front().texture;
++	// Shadow passes have no color target. Use an actual attachment for the extent.
++	const RenderPassAttachmentDescriptor* first = nullptr;
++	for (const auto& color : descriptor.colorAttachments)
++		if (color.texture) { first = &color; break; }
++	if (!first && descriptor.depthAttachment) first = &*descriptor.depthAttachment;
++	if (!first && descriptor.stencilAttachment) first = &*descriptor.stencilAttachment;
++	const auto targetWidth = first ? std::max<size_t>(1, first->texture->width() >> first->level) : descriptor.renderTargetWidth;
++	const auto targetHeight = first ? std::max<size_t>(1, first->texture->height() >> first->level) : descriptor.renderTargetHeight;
++	if (!targetWidth || !targetHeight) throw std::runtime_error("Render pass has no extent");
+ 	std::vector<VkClearValue> clearValues;
+ 
+ 	for (const auto& color: descriptor.colorAttachments) {
+@@ -58,11 +67,27 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+ 		clearValue.depthStencil.depth = descriptor.depthAttachment ? descriptor.depthAttachment->clearDepth : 1.0;
+ 		clearValue.depthStencil.stencil = descriptor.stencilAttachment ? descriptor.stencilAttachment->clearStencil : 0;
+ 		clearValues.push_back(clearValue);
++		if(descriptor.depthAttachment)_readWriteTextures.push_back(descriptor.depthAttachment->texture);
++		if(descriptor.stencilAttachment)_readWriteTextures.push_back(descriptor.stencilAttachment->texture);
+ 	}
+ 
+ 	std::vector<VkAttachmentDescription> renderPassAttachments;
+ 	std::vector<VkSubpassDescription> subpasses;
+ 	std::vector<VkSubpassDependency> dependencies;
++	// Metal's tracked attachments carry dependencies between encoders. Submission
++	// order alone does not make a depth prepass visible to the following pass.
++	VkSubpassDependency incoming{};
++	incoming.srcSubpass=VK_SUBPASS_EXTERNAL;incoming.dstSubpass=0;
++	incoming.srcStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++	incoming.dstStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
++	incoming.srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
++	incoming.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
++	dependencies.push_back(incoming);
++	VkSubpassDependency outgoing=incoming;
++	outgoing.srcSubpass=0;outgoing.dstSubpass=VK_SUBPASS_EXTERNAL;
++	outgoing.srcStageMask=VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
++	outgoing.dstStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++	dependencies.push_back(outgoing);
+ 
+ 	for (const auto& color: descriptor.colorAttachments) {
+ 		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(color.texture);
+@@ -78,24 +103,28 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+ 		renderPassAttachments.push_back(desc);
+ 	}
+ 
+-	if (descriptor.depthAttachment) {
+-		auto privateTexture = std::dynamic_pointer_cast<PrivateTexture>(descriptor.depthAttachment->texture);
++	const RenderPassAttachmentDescriptor* depthStencil = nullptr;
++	if (descriptor.depthAttachment) depthStencil = &*descriptor.depthAttachment;
++	else if (descriptor.stencilAttachment) depthStencil = &*descriptor.stencilAttachment;
++	if (depthStencil) {
++		auto texture = std::dynamic_pointer_cast<PrivateTexture>(depthStencil->texture);
++		if (descriptor.depthAttachment && descriptor.stencilAttachment) {
++			auto stencil = std::dynamic_pointer_cast<PrivateTexture>(descriptor.stencilAttachment->texture);
++			if (texture->image() != stencil->image() || depthStencil->level != descriptor.stencilAttachment->level || depthStencil->slice != descriptor.stencilAttachment->slice)
++				throw std::runtime_error("Separate depth and stencil images are not supported");
++		}
+ 		VkAttachmentDescription desc {};
+-		desc.format = pixelFormatToVkFormat(privateTexture->pixelFormat());
++		desc.format = pixelFormatToVkFormat(texture->pixelFormat());
+ 		desc.samples = VK_SAMPLE_COUNT_1_BIT;
+-		desc.loadOp = loadActionToVkAttachmentLoadOp(descriptor.depthAttachment->loadAction, false);
+-		desc.storeOp = storeActionToVkAttachmentStoreOp(descriptor.depthAttachment->storeAction, false);
+-		desc.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+-		desc.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+-		desc.initialLayout = (descriptor.depthAttachment->loadAction == LoadAction::Load) ? privateTexture->imageLayout() : VK_IMAGE_LAYOUT_UNDEFINED;
+-		desc.finalLayout = privateTexture->imageLayout();
++		desc.loadOp = descriptor.depthAttachment ? loadActionToVkAttachmentLoadOp(descriptor.depthAttachment->loadAction, false) : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++		desc.storeOp = descriptor.depthAttachment ? storeActionToVkAttachmentStoreOp(descriptor.depthAttachment->storeAction, false) : VK_ATTACHMENT_STORE_OP_DONT_CARE;
++		desc.stencilLoadOp = descriptor.stencilAttachment ? loadActionToVkAttachmentLoadOp(descriptor.stencilAttachment->loadAction, false) : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++		desc.stencilStoreOp = descriptor.stencilAttachment ? storeActionToVkAttachmentStoreOp(descriptor.stencilAttachment->storeAction, false) : VK_ATTACHMENT_STORE_OP_DONT_CARE;
++		desc.initialLayout = (desc.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD || desc.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD) ? texture->imageLayout() : VK_IMAGE_LAYOUT_UNDEFINED;
++		desc.finalLayout = texture->imageLayout();
+ 		renderPassAttachments.push_back(desc);
+ 	}
+ 
+-	if (descriptor.stencilAttachment) {
+-		throw std::runtime_error("TODO: support stencil attachments");
+-	}
+-
+ 	std::vector<VkAttachmentReference> colorAttachments;
+ 	VkAttachmentReference depthStencilAttachment {};
+ 
+@@ -108,7 +137,7 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+ 		++index;
+ 	}
+ 
+-	if (descriptor.depthAttachment) {
++	if (depthStencil) {
+ 		depthStencilAttachment.attachment = index;
+ 		depthStencilAttachment.layout = VK_IMAGE_LAYOUT_GENERAL;
+ 		++index;
+@@ -136,22 +165,44 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+ 
+ 	std::vector<VkImageView> framebufferAttachments;
+ 
+-	for (const auto& colorAttachment: descriptor.colorAttachments) {
+-		framebufferAttachments.push_back(std::dynamic_pointer_cast<PrivateTexture>(colorAttachment.texture)->imageView());
+-	}
+-
+-	if (descriptor.depthAttachment) {
+-		framebufferAttachments.push_back(std::dynamic_pointer_cast<PrivateTexture>(descriptor.depthAttachment->texture)->imageView());
+-	}
++	auto attachmentView = [&](const RenderPassAttachmentDescriptor& attachment) {
++		auto texture = std::dynamic_pointer_cast<PrivateTexture>(attachment.texture);
++		if (attachment.level >= texture->mipmapLevelCount() || attachment.slice >= texture->vulkanArrayLength())
++			throw std::out_of_range("Render attachment mip or slice out of range");
++		VkImageViewCreateInfo info {};
++		info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++		info.image = texture->image();
++		info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++		info.format = pixelFormatToVkFormat(texture->pixelFormat());
++		info.subresourceRange.aspectMask = pixelFormatToVkImageAspectFlags(texture->pixelFormat());
++		info.subresourceRange.baseMipLevel = attachment.level;
++		info.subresourceRange.baseArrayLayer = attachment.slice;
++		for (auto parent = attachment.texture; parent->parentTexture(); parent = parent->parentTexture()) {
++			info.subresourceRange.baseMipLevel += parent->parentRelativeLevel();
++			info.subresourceRange.baseArrayLayer += parent->parentRelativeSlice();
++		}
++		info.subresourceRange.levelCount = 1;
++		info.subresourceRange.layerCount = std::max<size_t>(1, descriptor.renderTargetArrayLength);
++		if (info.subresourceRange.layerCount > 1) info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++		VkImageView view;
++		if (DynamicVK::vkCreateImageView(vkDevice, &info, nullptr, &view) != VK_SUCCESS)
++			throw std::runtime_error("Could not create render attachment view");
++		_attachmentViews.push_back(view);
++		return view;
++	};
++	for (const auto& colorAttachment: descriptor.colorAttachments)
++		framebufferAttachments.push_back(attachmentView(colorAttachment));
++	if (depthStencil)
++		framebufferAttachments.push_back(attachmentView(*depthStencil));
+ 
+ 	VkFramebufferCreateInfo framebufferInfo {};
+ 	framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+ 	framebufferInfo.renderPass = _renderPass;
+ 	framebufferInfo.attachmentCount = framebufferAttachments.size();
+ 	framebufferInfo.pAttachments = framebufferAttachments.data();
+-	framebufferInfo.width = firstTexture->width();
+-	framebufferInfo.height = firstTexture->height();
+-	framebufferInfo.layers = std::dynamic_pointer_cast<PrivateTexture>(firstTexture)->vulkanArrayLength();
++	framebufferInfo.width = targetWidth;
++	framebufferInfo.height = targetHeight;
++	framebufferInfo.layers = std::max<size_t>(1, descriptor.renderTargetArrayLength);
+ 	if (DynamicVK::vkCreateFramebuffer(vkDevice, &framebufferInfo, nullptr, &_framebuffer) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+@@ -161,16 +212,16 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
+ 	renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+ 	renderPassBeginInfo.renderPass = _renderPass;
+ 	renderPassBeginInfo.framebuffer = _framebuffer;
+-	renderPassBeginInfo.renderArea.extent.width = firstTexture->width();
+-	renderPassBeginInfo.renderArea.extent.height = firstTexture->height();
++	renderPassBeginInfo.renderArea.extent.width = targetWidth;
++	renderPassBeginInfo.renderArea.extent.height = targetHeight;
+ 	renderPassBeginInfo.clearValueCount = clearValues.size();
+ 	renderPassBeginInfo.pClearValues = clearValues.data();
+ 	DynamicVK::vkCmdBeginRenderPass(vkCmdBuf, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+ 
+ 	// set default values
+ 
+-	setViewport(Viewport { 0, 0, static_cast<double>(firstTexture->width()), static_cast<double>(firstTexture->height()), 0, 1 });
+-	setScissorRect(ScissorRect { firstTexture->height(), firstTexture->width(), 0, 0 });
++	setViewport(Viewport { 0, 0, static_cast<double>(targetWidth), static_cast<double>(targetHeight), 0, 1 });
++	setScissorRect(ScissorRect { targetHeight, targetWidth, 0, 0 });
+ 	setCullMode(CullMode::None);
+ 	setFrontFacingWinding(Winding::Clockwise);
+ 
+@@ -190,16 +241,17 @@ Indium::PrivateRenderCommandEncoder::~PrivateRenderCommandEncoder() {
+ 	if (_framebuffer) {
+ 		DynamicVK::vkDestroyFramebuffer(_privateDevice->device(), _framebuffer, nullptr);
+ 	}
++	for (auto view : _attachmentViews) DynamicVK::vkDestroyImageView(_privateDevice->device(), view, nullptr);
+ 	if (_renderPass) {
+ 		DynamicVK::vkDestroyRenderPass(_privateDevice->device(), _renderPass, nullptr);
+ 	}
+ 	DynamicVK::vkDestroyDescriptorPool(_privateDevice->device(), _pool, 0);
++	for (auto pool : _fullPools) DynamicVK::vkDestroyDescriptorPool(_privateDevice->device(), pool, nullptr);
+ };
+ 
+ void Indium::PrivateRenderCommandEncoder::setRenderPipelineState(std::shared_ptr<RenderPipelineState> renderPipelineState) {
+ 	auto buf = _privateCommandBuffer.lock();
+ 	_privatePSO = std::dynamic_pointer_cast<PrivateRenderPipelineState>(renderPipelineState);
+-	_privatePSO->recreatePipeline(_renderPass, false);
+ };
+ 
+ void Indium::PrivateRenderCommandEncoder::setFrontFacingWinding(Winding frontFaceWinding) {
+@@ -220,9 +272,8 @@ void Indium::PrivateRenderCommandEncoder::setDepthBias(float depthBias, float sl
+ };
+ 
+ void Indium::PrivateRenderCommandEncoder::setDepthClipMode(DepthClipMode depthClipMode) {
+-	if (depthClipMode != DepthClipMode::Clip) {
+-		throw std::runtime_error("TODO: support setting depth clip mode");
+-	}
++	if (depthClipMode != DepthClipMode::Clip && depthClipMode != DepthClipMode::Clamp) throw BadEnumValue();
++	_depthClamp = depthClipMode == DepthClipMode::Clamp;
+ };
+ 
+ void Indium::PrivateRenderCommandEncoder::setViewport(const Viewport& viewport) {
+@@ -239,7 +290,7 @@ void Indium::PrivateRenderCommandEncoder::setViewports(const Viewport* viewports
+ 		//       so we use a Vulkan 1.1 feature here and just flip the Y-axis of the viewport
+ 		//       (with a corresponding change in the origin).
+ 		vkViewport.x = viewport.originX;
+-		vkViewport.y = viewport.height - viewport.originY;
++		vkViewport.y = viewport.originY + viewport.height;
+ 		vkViewport.width = viewport.width;
+ 		vkViewport.height = -viewport.height;
+ 		// the documentation for setViewport and setViewports states that znear and zfar must be between
+@@ -292,7 +343,7 @@ void Indium::PrivateRenderCommandEncoder::updateBindings() {
+ 
+ 	auto buf = _privateCommandBuffer.lock();
+ 
+-	std::array<VkDescriptorSet, 2> descriptorSets = createDescriptorSets(_privatePSO->descriptorSetLayouts().layouts, _pool, _privateDevice, { _functionResources[0], _functionResources[1] }, { _privatePSO->vertexFunctionInfo(), _privatePSO->fragmentFunctionInfo() }, _keepAliveBuffers);
++	std::array<VkDescriptorSet, 2> descriptorSets = createDescriptorSets(_privatePSO->descriptorSetLayouts().layouts, _pool, _fullPools, _privateDevice, { _functionResources[0], _functionResources[1] }, { _privatePSO->vertexFunctionInfo(), _privatePSO->fragmentFunctionInfo() }, _keepAliveBuffers);
+ 
+ 	DynamicVK::vkCmdBindDescriptorSets(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_GRAPHICS, _privatePSO->pipelineLayout(), 0, descriptorSets.size(), descriptorSets.data(), 0, nullptr);
+ 
+@@ -326,23 +377,7 @@ void Indium::PrivateRenderCommandEncoder::updateBindings() {
+ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitiveType, size_t vertexStart, size_t vertexCount, size_t instanceCount, size_t baseInstance) {
+ 	auto buf = _privateCommandBuffer.lock();
+ 
+-	// bind the pipeline with the right topology class for this primitive
+-	VkPipeline pipeline = VK_NULL_HANDLE;
+-	switch (primitiveType) {
+-		case PrimitiveType::Point:
+-			pipeline = _privatePSO->pipelines()[0];
+-			break;
+-		case PrimitiveType::Line:
+-		case PrimitiveType::LineStrip:
+-			pipeline = _privatePSO->pipelines()[1];
+-			break;
+-		case PrimitiveType::Triangle:
+-		case PrimitiveType::TriangleStrip:
+-			pipeline = _privatePSO->pipelines()[2];
+-			break;
+-		default:
+-			throw BadEnumValue();
+-	}
++	VkPipeline pipeline = _privatePSO->pipelineFor(_renderPass, primitiveType, _depthClamp);
+ 	DynamicVK::vkCmdBindPipeline(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+ 
+ 	DynamicVK::vkCmdSetPrimitiveTopology(buf->commandBuffer(), primitiveTypeToVkPrimitiveTopology(primitiveType));
+@@ -473,23 +508,7 @@ void Indium::PrivateRenderCommandEncoder::setFragmentTextures(std::vector<std::s
+ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType primitiveType, size_t indexCount, IndexType indexType, std::shared_ptr<Buffer> indexBuffer, size_t indexBufferOffset, size_t instanceCount, int64_t baseVertex, size_t baseInstance) {
+ 	auto buf = _privateCommandBuffer.lock();
+ 
+-	// bind the pipeline with the right topology class for this primitive
+-	VkPipeline pipeline = VK_NULL_HANDLE;
+-	switch (primitiveType) {
+-		case PrimitiveType::Point:
+-			pipeline = _privatePSO->pipelines()[0];
+-			break;
+-		case PrimitiveType::Line:
+-		case PrimitiveType::LineStrip:
+-			pipeline = _privatePSO->pipelines()[1];
+-			break;
+-		case PrimitiveType::Triangle:
+-		case PrimitiveType::TriangleStrip:
+-			pipeline = _privatePSO->pipelines()[2];
+-			break;
+-		default:
+-			throw BadEnumValue();
+-	}
++	VkPipeline pipeline = _privatePSO->pipelineFor(_renderPass, primitiveType, _depthClamp);
+ 	DynamicVK::vkCmdBindPipeline(buf->commandBuffer(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+ 
+ 	DynamicVK::vkCmdSetPrimitiveTopology(buf->commandBuffer(), primitiveTypeToVkPrimitiveTopology(primitiveType));
+@@ -521,7 +540,8 @@ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType pr
+ void Indium::PrivateRenderCommandEncoder::setDepthStencilState(std::shared_ptr<DepthStencilState> state) {
+ 	auto buf = _privateCommandBuffer.lock();
+ 	auto privateState = std::dynamic_pointer_cast<PrivateDepthStencilState>(state);
+-	auto& desc = privateState->descriptor();
++	const DepthStencilDescriptor defaultState{};
++	const auto& desc = privateState ? privateState->descriptor() : defaultState;
+ 
+ 	DynamicVK::vkCmdSetDepthWriteEnable(buf->commandBuffer(), desc.depthWriteEnabled ? VK_TRUE : VK_FALSE);
+ 	DynamicVK::vkCmdSetDepthCompareOp(buf->commandBuffer(), compareFunctionToVkCompareOp(desc.depthCompareFunction));
+diff --git a/src/indium/render-pipeline.cpp b/src/indium/render-pipeline.cpp
+index 1b6bb3b..8d4a399 100644
+--- a/src/indium/render-pipeline.cpp
++++ b/src/indium/render-pipeline.cpp
+@@ -5,6 +5,9 @@
+ #include <indium/dynamic-vk.hpp>
+ 
+ #include <stdexcept>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ 
+ Indium::RenderPipelineState::~RenderPipelineState() {};
+ 
+@@ -17,6 +20,9 @@ Indium::PrivateRenderPipelineState::PrivateRenderPipelineState(std::shared_ptr<P
+ 	_descriptorSetLayouts(_privateDevice)
+ {
+ 	_colorAttachments = descriptor.colorAttachments;
++	// Accessing an unused Metal attachment creates a descriptor with Invalid format.
++	while (!_colorAttachments.empty() && _colorAttachments.back().pixelFormat == PixelFormat::Invalid)
++		_colorAttachments.pop_back();
+ 	_vertexDescriptor = descriptor.vertexDescriptor;
+ 	_primitiveTopology = descriptor.inputPrimitiveTopology;
+ 
+@@ -28,12 +34,8 @@ Indium::PrivateRenderPipelineState::PrivateRenderPipelineState(std::shared_ptr<P
+ };
+ 
+ Indium::PrivateRenderPipelineState::~PrivateRenderPipelineState() {
+-	if (_pipelines[0]) {
+-		for (auto& pipeline: _pipelines) {
+-			DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
+-			pipeline = VK_NULL_HANDLE;
+-		}
+-	}
++	for (auto& variants : { _pipelines, _clampedPipelines })
++		for (auto pipeline : variants) DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
+ 
+ 	if (_pipelineLayout) {
+ 		DynamicVK::vkDestroyPipelineLayout(_privateDevice->device(), _pipelineLayout, nullptr);
+@@ -41,26 +43,20 @@ Indium::PrivateRenderPipelineState::~PrivateRenderPipelineState() {
+ 	}
+ };
+ 
+-void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibleRenderPass, bool force) {
+-	if (!force && _pipelines[0]) {
+-		// assumes that the current pipeline is compatible with the given render pass
+-		return;
+-	}
+-
+-	if (_pipelines[0]) {
+-		for (auto& pipeline: _pipelines) {
+-			DynamicVK::vkDestroyPipeline(_privateDevice->device(), pipeline, nullptr);
+-			pipeline = VK_NULL_HANDLE;
+-		}
+-	}
+-
+-	if (_pipelineLayout) {
+-		DynamicVK::vkDestroyPipelineLayout(_privateDevice->device(), _pipelineLayout, nullptr);
+-		_pipelineLayout = VK_NULL_HANDLE;
++VkPipeline Indium::PrivateRenderPipelineState::pipelineFor(VkRenderPass compatibleRenderPass, PrimitiveType primitive, bool depthClamp) {
++	auto& pipelines = depthClamp ? _clampedPipelines : _pipelines;
++	size_t index;
++	switch (primitive) {
++		case PrimitiveType::Point: index = 0; break;
++		case PrimitiveType::Line: case PrimitiveType::LineStrip: index = 1; break;
++		case PrimitiveType::Triangle: case PrimitiveType::TriangleStrip: index = 2; break;
++		default: throw BadEnumValue();
+ 	}
++	// Compile only topologies actually drawn; triangle shaders need not write PointSize.
++	if (pipelines[index]) return pipelines[index];
+ 
+ 	auto vertexFunctionName = _vertexFunction->name();
+-	auto fragmentFunctionName = _fragmentFunction->name();
++	auto fragmentFunctionName = _fragmentFunction ? _fragmentFunction->name() : "<depth-only>";
+ 	std::vector<VkPipelineShaderStageCreateInfo> stages;
+ 
+ 	VkPipelineShaderStageCreateInfo shaderStage {};
+@@ -68,13 +64,15 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+ 
+ 	shaderStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
+ 	shaderStage.module = _vertexFunction->library()->shaderModule();
+-	shaderStage.pName = vertexFunctionName.c_str();
++	shaderStage.pName = "main";
+ 	stages.push_back(shaderStage);
+ 
++	if (_fragmentFunction) {
+ 	shaderStage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+ 	shaderStage.module = _fragmentFunction->library()->shaderModule();
+-	shaderStage.pName = fragmentFunctionName.c_str();
++	shaderStage.pName = "main";
+ 	stages.push_back(shaderStage);
++	}
+ 
+ 	VkPipelineVertexInputStateCreateInfo vertexInputState {};
+ 	vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+@@ -144,8 +142,7 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+ 
+ 	VkPipelineRasterizationStateCreateInfo rasterizationState {};
+ 	rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+-	// TODO: figure out how to set `depthClampEnable` and `polgygonMode` dynamically;
+-	//       might have to just create multiple pipelines
++	rasterizationState.depthClampEnable = depthClamp;
+ 	rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
+ 	rasterizationState.lineWidth = 1.0f;
+ 
+@@ -213,7 +210,7 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+ 	layoutCreateInfo.pushConstantRangeCount = pushConstantRanges.size();
+ 	layoutCreateInfo.pPushConstantRanges = pushConstantRanges.data();
+ 
+-	if (DynamicVK::vkCreatePipelineLayout(_privateDevice->device(), &layoutCreateInfo, nullptr, &_pipelineLayout) != VK_SUCCESS) {
++	if (!_pipelineLayout && DynamicVK::vkCreatePipelineLayout(_privateDevice->device(), &layoutCreateInfo, nullptr, &_pipelineLayout) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+ 	}
+@@ -234,30 +231,14 @@ void Indium::PrivateRenderPipelineState::recreatePipeline(VkRenderPass compatibl
+ 	pipelineCreateInfo.layout = _pipelineLayout;
+ 	pipelineCreateInfo.renderPass = compatibleRenderPass;
+ 
+-	// we can set the primitive topology dynamically, but unfortunately, we can only set it for a different topology
+-	// in the same topology class that the pipeline was created for. this means we need to create 3 pipelines
+-	// (one for each topology class) rather than 5 (one for each primitive topology).
+-
+-	// first, one for points
+-	inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+-	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &_pipelines[0]) != VK_SUCCESS) {
+-		// TODO
+-		abort();
+-	}
+-
+-	// now, one for lines
+-	inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+-	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &_pipelines[1]) != VK_SUCCESS) {
+-		// TODO
+-		abort();
+-	}
+-
+-	// finally, one for triangles
+-	inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+-	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &_pipelines[2]) != VK_SUCCESS) {
+-		// TODO
+-		abort();
+-	}
++	inputAssemblyState.topology = primitiveTypeToVkPrimitiveTopology(primitive);
++	const bool trace = std::getenv("RBX_PIPELINE_TRACE") != nullptr;
++	const auto started = std::chrono::steady_clock::now();
++	if (trace) std::fprintf(stderr, "PIPELINE begin %s / %s\n", vertexFunctionName.c_str(), fragmentFunctionName.c_str());
++	if (DynamicVK::vkCreateGraphicsPipelines(_privateDevice->device(), VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipelines[index]) != VK_SUCCESS)
++		throw std::runtime_error("Could not create render pipeline");
++	if (trace) std::fprintf(stderr, "PIPELINE done %.3fs %s / %s\n", std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count(), vertexFunctionName.c_str(), fragmentFunctionName.c_str());
++	return pipelines[index];
+ };
+ 
+ const Indium::FunctionInfo& Indium::PrivateRenderPipelineState::vertexFunctionInfo() {
+@@ -265,5 +246,6 @@ const Indium::FunctionInfo& Indium::PrivateRenderPipelineState::vertexFunctionIn
+ };
+ 
+ const Indium::FunctionInfo& Indium::PrivateRenderPipelineState::fragmentFunctionInfo() {
+-	return _fragmentFunction->functionInfo();
++	static const FunctionInfo empty{};
++	return _fragmentFunction ? _fragmentFunction->functionInfo() : empty;
+ };
+diff --git a/src/indium/sampler.cpp b/src/indium/sampler.cpp
+index 71392df..efa4d4b 100644
+--- a/src/indium/sampler.cpp
++++ b/src/indium/sampler.cpp
+@@ -19,7 +19,7 @@ Indium::PrivateSamplerState::PrivateSamplerState(std::shared_ptr<PrivateDevice>
+ 	info.mipLodBias = 0; // not sure where to get this from
+ 	info.anisotropyEnable = (descriptor.maxAnisotropy > 1) ? VK_TRUE : VK_FALSE;
+ 	info.maxAnisotropy = descriptor.maxAnisotropy;
+-	info.compareEnable = descriptor.normalizedCoordinates ? VK_TRUE : VK_FALSE; // FIXME: this assumes that the implementation defers to whatever the shader state specifies
++	info.compareEnable = descriptor.compareFunction != CompareFunction::Never ? VK_TRUE : VK_FALSE;
+ 	info.compareOp = compareFunctionToVkCompareOp(descriptor.compareFunction);
+ 	info.minLod = descriptor.normalizedCoordinates ? descriptor.lodMinClamp : 0;
+ 	info.maxLod = descriptor.normalizedCoordinates ? descriptor.lodMaxClamp : 0;
+diff --git a/src/indium/texture.cpp b/src/indium/texture.cpp
+index 1e3e971..2ba6349 100644
+--- a/src/indium/texture.cpp
++++ b/src/indium/texture.cpp
+@@ -3,8 +3,34 @@
+ #include <indium/types.private.hpp>
+ #include <indium/buffer.private.hpp>
+ #include <indium/dynamic-vk.hpp>
++#ifdef TRACKB_RENDERER
++#include <indium/uploads.hpp>
++#include <indium/gpu-timing.hpp>
++#include <indium/image-memory.hpp>
++#endif
+ 
+ #include <cstring>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++namespace {
++struct UploadTiming {
++    using Clock=std::chrono::steady_clock;
++    bool active;Clock::time_point start;
++    UploadTiming():active(std::getenv("RBX_GPU_UPLOAD_TIMING")!=nullptr){if(active)start=Clock::now();}
++    ~UploadTiming(){
++        if(!active)return;
++        static std::mutex mutex;static auto epoch=Clock::now();static unsigned count=0;static double total=0,maximum=0;
++        auto now=Clock::now();double ms=std::chrono::duration<double,std::milli>(now-start).count();
++        std::scoped_lock guard(mutex);count++;total+=ms;maximum=std::max(maximum,ms);
++        if(now-epoch>=std::chrono::seconds(2)){
++            std::fprintf(stderr,"GPU UPLOAD calls=%u total=%.2fms max=%.2fms interval=%.2fs\n",count,total,maximum,std::chrono::duration<double>(now-epoch).count());
++            epoch=now;count=0;total=maximum=0;
++        }
++    }
++};
++}
+ 
+ Indium::Texture::~Texture() {};
+ Indium::PrivateTexture::~PrivateTexture() {};
+@@ -225,6 +251,11 @@ bool Indium::TextureView::needsExportablePresentationSemaphore() const {
+ 
+ const Indium::TimelineSemaphore& Indium::PrivateTexture::acquire(uint64_t& waitValue, std::shared_ptr<BinarySemaphore>& extraWaitSemaphore, uint64_t& signalValue) {
+ 	std::unique_lock lock(_syncMutex);
++#ifdef TRACKB_RENDERER
++	// Views synchronize through their original texture; allocate only when this
++	// texture is actually submitted, under the same lock that protects its count.
++	if (!_syncSemaphore) _syncSemaphore = _device->getWrappedTimelineSemaphore();
++#endif
+ 
+ 	if (_extraWaitSemaphore) {
+ 		extraWaitSemaphore = std::move(_extraWaitSemaphore);
+@@ -263,7 +294,9 @@ std::shared_ptr<Indium::BinarySemaphore> Indium::PrivateTexture::synchronizePres
+ Indium::PrivateTexture::PrivateTexture(std::shared_ptr<PrivateDevice> device):
+ 	_device(device)
+ {
++#ifndef TRACKB_RENDERER
+ 	_syncSemaphore = device->getWrappedTimelineSemaphore();
++#endif
+ };
+ 
+ std::shared_ptr<Indium::Device> Indium::PrivateTexture::device() {
+@@ -316,7 +349,7 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 
+ 	if (
+ 		// depth-stencil formats don't seem to work with VK_IMAGE_TILING_LINEAR, so we force OPTIMAL instead
+-		isDepthStencil ||
++		isDepthStencil || pixelFormatIsCompressed(_descriptor.pixelFormat) ||
+ 
+ 		// linear textures only support a single mip level
+ 		_descriptor.mipmapLevelCount > 1
+@@ -326,13 +359,26 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 
+ 	info.tiling = (descriptor.allowGPUOptimizedContents || !canBeLinear) ? VK_IMAGE_TILING_OPTIMAL : VK_IMAGE_TILING_LINEAR;
+ 
+-	// we don't know ahead of time how the image is going to be used, so specify everything we support
+-	info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+-	if (isColor) {
+-		info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+-	} else if (isDepthStencil) {
+-		info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++	// Respect Metal's declared uses; compressed images cannot be storage images or render targets.
++	info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++	bool unknown = descriptor.usage == TextureUsage::Unknown;
++	VkFormatFeatureFlags allowed = 0;
++	if (unknown) {
++		VkFormatProperties properties{};
++		static DynamicVK::DynamicFunction<PFN_vkGetPhysicalDeviceFormatProperties> query("vkGetPhysicalDeviceFormatProperties");
++		query(_device->physicalDevice(),info.format,&properties);
++		allowed=info.tiling==VK_IMAGE_TILING_OPTIMAL ? properties.optimalTilingFeatures : properties.linearTilingFeatures;
+ 	}
++	if ((allowed & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || (descriptor.usage & TextureUsage::ShaderRead) != TextureUsage::Unknown)
++		info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++	if ((allowed & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) || (descriptor.usage & TextureUsage::ShaderWrite) != TextureUsage::Unknown)
++		info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++	if ((descriptor.usage & TextureUsage::RenderTarget) != TextureUsage::Unknown) {
++		if (isColor) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++		else if (isDepthStencil) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++	}
++	if (allowed & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++	if (allowed & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+ 	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE; // TODO: check if this should be "concurrent" instead. i think we're good, though.
+ 	info.queueFamilyIndexCount = 0;
+ 	info.pQueueFamilyIndices = nullptr;
+@@ -345,7 +391,24 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 
+ 	VkMemoryRequirements reqs;
+ 
++#ifdef TRACKB_RENDERER
++	// Ask for dedicated requirements too: some formats and usages must own their
++	// allocation and can never be suballocated.
++	bool requiresDedicated = false;
++	{
++		static DynamicVK::DynamicFunction<PFN_vkGetImageMemoryRequirements2> getRequirements("vkGetImageMemoryRequirements2");
++		VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
++		VkMemoryRequirements2 requirements2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
++		requirements2.pNext = &dedicated;
++		VkImageMemoryRequirementsInfo2 request{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
++		request.image = _image;
++		getRequirements(_device->device(), &request, &requirements2);
++		reqs = requirements2.memoryRequirements;
++		requiresDedicated = dedicated.requiresDedicatedAllocation;
++	}
++#else
+ 	DynamicVK::vkGetImageMemoryRequirements(_device->device(), _image, &reqs);
++#endif
+ 
+ 	size_t targetIndex = SIZE_MAX;
+ 
+@@ -356,23 +419,42 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 			continue;
+ 		}
+ 
+-		if ((_storageMode == StorageMode::Managed || _storageMode == StorageMode::Shared) && (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+-			continue;
+-		}
+-
+-		if (_storageMode == StorageMode::Shared && (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0) {
+-			continue;
+-		}
++		// CPU texture writes use staging buffers below; the image is never mapped.
++		// Requiring HOST_VISIBLE here rejects optimal-tiled images on discrete GPUs.
++		if (targetIndex == SIZE_MAX) targetIndex = i;
++		if (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { targetIndex = i; break; }
+ 
+-		// okay, this is good enough
+-		targetIndex = i;
+-		break;
+ 	}
+ 
+ 	if (targetIndex == SIZE_MAX) {
+ 		throw std::runtime_error("No suitable memory region found for image with requested storage mode");
+ 	}
+ 
++#ifdef TRACKB_RENDERER
++	// ponytail: power-of-two slots in 16 MiB blocks, small images only. Blocks are
++	// not reclaimed mid-session, so the pool settles at peak texture footprint
++	// rather than the 8x the driver's per-allocation rounding was costing; add
++	// reclamation if that peak turns out to matter.
++	if (!requiresDedicated && std::max<VkDeviceSize>(reqs.size, reqs.alignment) <= 4*1024*1024) {
++		VkDeviceSize slotSize = 4096;
++		while (slotSize < std::max<VkDeviceSize>(reqs.size, reqs.alignment)) slotSize *= 2;
++		std::lock_guard lock(_device->imageMemoryMutex);
++		for (auto& block : _device->imageMemoryBlocks) {
++			if (block->type != targetIndex || block->slotSize != slotSize) continue;
++			auto offset = block->take();
++			if (offset == VkDeviceSize(-1)) continue;
++			_imageBlock = block; _imageOffset = offset; break;
++		}
++		if (!_imageBlock) {
++			auto block = std::make_shared<ImageMemoryBlock>(_device->device(), uint32_t(targetIndex), slotSize);
++			_device->imageMemoryBlocks.push_back(block);
++			_imageBlock = block; _imageOffset = block->take();
++		}
++		_memory = _imageBlock->memory;
++	}
++	if (!_imageBlock)
++#endif
++	{
+ 	VkMemoryAllocateInfo allocateInfo {};
+ 	allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+ 	allocateInfo.allocationSize = reqs.size;
+@@ -382,10 +464,24 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 		// TODO
+ 		abort();
+ 	}
++	}
+ 
++	// A slot's offset is a multiple of a power-of-two slot size that is at least
++	// the required alignment, so it satisfies vkBindImageMemory's alignment rule.
++#ifdef TRACKB_RENDERER
++	DynamicVK::vkBindImageMemory(_device->device(), _image, _memory, _imageOffset);
++#else
+ 	DynamicVK::vkBindImageMemory(_device->device(), _image, _memory, 0);
++#endif
+ 
++#ifdef TRACKB_RENDERER
++	VkImageMemoryBarrier barrier{};
++	barrier.subresourceRange = {imageAspect, 0, static_cast<uint32_t>(_descriptor.mipmapLevelCount), 0, static_cast<uint32_t>(_descriptor.arrayLength * (isCube ? 6 : 1))};
++#else
+ 	// transition the image into the general layout
++	// The device shares this transient command pool between texture uploads.
++	UploadTiming timing;
++	std::unique_lock poolLock(_device->oneshotMutex);
+ 	VkCommandBufferAllocateInfo cmdBufAllocInfo {};
+ 	cmdBufAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+ 	cmdBufAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+@@ -438,8 +534,12 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 	submitInfo.commandBufferCount = 1;
+ 	submitInfo.pCommandBuffers = &cmdBuf;
+ 
+-	DynamicVK::vkQueueSubmit(_device->graphicsQueue(), 1, &submitInfo, theFence);
+-	if (DynamicVK::vkWaitForFences(_device->device(), 1, &theFence, VK_TRUE, /* 1s */ 1ull * 1000 * 1000 * 1000) != VK_SUCCESS) {
++	{
++		std::scoped_lock queueLock(_device->queueMutex);
++		if (DynamicVK::vkQueueSubmit(_device->graphicsQueue(), 1, &submitInfo, theFence) != VK_SUCCESS)
++			throw std::runtime_error("Texture transfer submission failed");
++	}
++	if (DynamicVK::vkWaitForFences(_device->device(), 1, &theFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+ 	}
+@@ -447,6 +547,9 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 	DynamicVK::vkDestroyFence(_device->device(), theFence, nullptr);
+ 
+ 	DynamicVK::vkFreeCommandBuffers(_device->device(), _device->oneshotCommandPool(), 1, &cmdBuf);
++	poolLock.unlock();
++
++#endif
+ 
+ 	VkImageViewCreateInfo info2 {};
+ 	info2.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+@@ -463,12 +566,36 @@ Indium::ConcreteTexture::ConcreteTexture(std::shared_ptr<PrivateDevice> device,
+ 		// TODO
+ 		abort();
+ 	}
++#ifdef TRACKB_RENDERER
++	// The recorder can outlive the Metal texture; retain its Vulkan allocation
++	// without retaining the texture/device (which would create an ownership cycle).
++	_uploadLifetime = std::shared_ptr<void>(reinterpret_cast<void*>(1),
++		[device = _device->device(), image = _image, view = _imageView, memory = _memory,
++		 block = _imageBlock, offset = _imageOffset](void*) {
++		DynamicVK::vkDestroyImageView(device, view, nullptr);
++		DynamicVK::vkDestroyImage(device, image, nullptr);
++		// Suballocated images return their slot; the block owns the allocation and
++		// is retained here, so the memory outlives any still-pending upload.
++		if (block) block->give(offset);
++		else DynamicVK::vkFreeMemory(device, memory, nullptr);
++	});
++	std::scoped_lock queueLock(_device->queueMutex);
++	_device->uploadQueue().initialize(_image, barrier.subresourceRange, _uploadLifetime);
++#endif
++
+ };
+ 
+ Indium::ConcreteTexture::~ConcreteTexture() {
++#ifdef TRACKB_RENDERER
++	// The engine frees GPU resources once per frame inside its Present scope and
++	// has no sub-scope there, so this destructor was invisible to both profilers.
++	RbxProfiler::WallScope timing(RBX_PROF_TEXTURE_DESTROY);
++	_uploadLifetime.reset();
++#else
+ 	DynamicVK::vkDestroyImageView(_device->device(), _imageView, nullptr);
+ 	DynamicVK::vkDestroyImage(_device->device(), _image, nullptr);
+ 	DynamicVK::vkFreeMemory(_device->device(), _memory, nullptr);
++#endif
+ };
+ 
+ Indium::TextureType Indium::ConcreteTexture::textureType() const {
+@@ -556,15 +683,44 @@ void Indium::ConcreteTexture::replaceRegion(Indium::Region region, size_t mipmap
+ 
+ 	auto aspect = pixelFormatToVkImageAspectFlags(_descriptor.pixelFormat);
+ 
++#ifdef TRACKB_RENDERER
++	UploadTiming timing;
++	if (!bytes || mipmapLevel >= mipmapLevelCount() || slice >= vulkanArrayLength())
++		throw std::out_of_range("Invalid texture upload data, mip or slice");
++	if (!region.size.width || !region.size.height || !region.size.depth) return;
++	auto fits = [](size_t origin, size_t extent, size_t size) { return origin < size && extent <= size - origin; };
++	if (!fits(region.origin.x, region.size.width, std::max<size_t>(1, width() >> mipmapLevel)) ||
++	    !fits(region.origin.y, region.size.height, std::max<size_t>(1, height() >> mipmapLevel)) ||
++	    !fits(region.origin.z, region.size.depth, std::max<size_t>(1, depth() >> mipmapLevel)))
++		throw std::out_of_range("Texture upload outside mip extent");
++	// Packed depth/stencil requires splitting the aspects; never send both bits
++	// in a buffer-image copy. This path did not support that format previously.
++	if ((aspect & (aspect - 1)) != 0)
++		throw std::invalid_argument("Packed depth/stencil replaceRegion is unsupported");
++	auto layout = textureCopyLayout(_descriptor.pixelFormat, region.size.width, region.size.height, region.size.depth, bytesPerRow, bytesPerImage);
++	VkBufferImageCopy copy{};
++	copy.bufferRowLength = layout.rowLength; copy.bufferImageHeight = layout.imageHeight;
++	copy.imageSubresource = {aspect, static_cast<uint32_t>(mipmapLevel), static_cast<uint32_t>(slice), 1};
++	copy.imageOffset = {static_cast<int32_t>(region.origin.x), static_cast<int32_t>(region.origin.y), static_cast<int32_t>(region.origin.z)};
++	copy.imageExtent = {static_cast<uint32_t>(region.size.width), static_cast<uint32_t>(region.size.height), static_cast<uint32_t>(region.size.depth)};
++	std::unique_lock queueLock(_device->queueMutex, std::defer_lock);
++	{
++		UploadProfileScope lockTiming(RBX_PROF_UPLOAD_QUEUE_LOCK);
++		queueLock.lock();
++	}
++	_device->uploadQueue().copy(_image, aspect, copy, bytes, layout.dataSize, _uploadLifetime);
++#else
+ 	// create a temporary buffer copy
+ 	// FIXME: this doesn't work for PVRTC textures
+ 	// actually, FIXME: this doesn't handle a few cases, particularly with array texture types (since i haven't seen those yet at all)
+-	auto byteSize = bytesPerImage == 0 ? (region.size.height * bytesPerRow) : (region.size.depth * bytesPerImage);
++	auto layout=textureCopyLayout(_descriptor.pixelFormat,region.size.width,region.size.height,region.size.depth,bytesPerRow,bytesPerImage);
++	auto byteSize=layout.dataSize;
+ 	auto tmpBuf = std::dynamic_pointer_cast<PrivateBuffer>(_device->newBuffer(bytes, byteSize, ResourceOptions::StorageModeShared));
+ 
+-	// FIXME: handle compressed formats
+-	size_t bytesPerPixel = pixelFormatToByteCount(_descriptor.pixelFormat);
+ 
++	// The device shares this transient command pool between texture uploads.
++	UploadTiming timing;
++	std::unique_lock poolLock(_device->oneshotMutex);
+ 	VkCommandBufferAllocateInfo cmdBufAllocInfo {};
+ 	cmdBufAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+ 	cmdBufAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+@@ -604,8 +760,8 @@ void Indium::ConcreteTexture::replaceRegion(Indium::Region region, size_t mipmap
+ 	// now encode the copy
+ 	VkBufferImageCopy copyInfo {};
+ 	copyInfo.bufferOffset = 0;
+-	copyInfo.bufferRowLength = bytesPerRow / bytesPerPixel;
+-	copyInfo.bufferImageHeight = bytesPerImage / bytesPerRow;
++	copyInfo.bufferRowLength = layout.rowLength;
++	copyInfo.bufferImageHeight = layout.imageHeight;
+ 	copyInfo.imageSubresource.aspectMask = aspect;
+ 	copyInfo.imageSubresource.mipLevel = mipmapLevel;
+ 	copyInfo.imageSubresource.baseArrayLayer = slice;
+@@ -642,8 +798,12 @@ void Indium::ConcreteTexture::replaceRegion(Indium::Region region, size_t mipmap
+ 	submitInfo.commandBufferCount = 1;
+ 	submitInfo.pCommandBuffers = &cmdBuf;
+ 
+-	DynamicVK::vkQueueSubmit(_device->graphicsQueue(), 1, &submitInfo, theFence);
+-	if (DynamicVK::vkWaitForFences(_device->device(), 1, &theFence, VK_TRUE, /* 1s */ 1ull * 1000 * 1000 * 1000) != VK_SUCCESS) {
++	{
++		std::scoped_lock queueLock(_device->queueMutex);
++		if (DynamicVK::vkQueueSubmit(_device->graphicsQueue(), 1, &submitInfo, theFence) != VK_SUCCESS)
++			throw std::runtime_error("Texture transfer submission failed");
++	}
++	if (DynamicVK::vkWaitForFences(_device->device(), 1, &theFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+ 		// TODO
+ 		abort();
+ 	}
+@@ -651,4 +811,6 @@ void Indium::ConcreteTexture::replaceRegion(Indium::Region region, size_t mipmap
+ 	DynamicVK::vkDestroyFence(_device->device(), theFence, nullptr);
+ 
+ 	DynamicVK::vkFreeCommandBuffers(_device->device(), _device->oneshotCommandPool(), 1, &cmdBuf);
++	poolLock.unlock();
++#endif
+ };

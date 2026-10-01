@@ -1,0 +1,60 @@
+--- a/src/common/kevent.c
++++ b/src/common/kevent.c
+@@ -171,6 +171,12 @@
+     }
+ 
+     if ((src->flags & EV_DELETE) || ((kn->kn_flags & KNFL_DEFER_DELETE) && (src->flags & EV_ENABLE))) {
++        if ((src->flags & EV_DELETE) && !(src->flags & EV_ENABLE) &&
++            (kn->kev.flags & EV_DISPATCH2) == EV_DISPATCH2 && (kn->kev.flags & EV_DISABLE)) {
++            kn->kn_flags |= KNFL_DEFER_DELETE;
++            errno = EINPROGRESS;
++            return (-1);
++        }
+         rv = knote_delete(filt, kn);
+         dbg_printf("knote_delete returned %d", rv);
+     } else if (src->flags & EV_DISABLE) {
+--- a/src/common/kqueue.c
++++ b/src/common/kqueue.c
+@@ -145,6 +145,8 @@
+     return ((struct kqueue *) map_lookup(kqmap, kq));
+ }
+ 
++static void kqueue_prepare_close(int fd);
++
+ int VISIBLE
+ kqueue_close(int kqfd)
+ {
+@@ -162,6 +164,7 @@
+ 	}
+     pthread_mutex_unlock(&kq_mtx);
+ 
++	if (!result) kqueue_prepare_close(kqfd);
+ 	return result;
+ }
+ 
+@@ -207,16 +210,23 @@
+ void VISIBLE
+ kqueue_closed_fd(int fd)
+ {
++	// The fd may already belong to another thread. Cleanup ran before close.
++	(void) fd;
++}
++
++static void
++kqueue_prepare_close(int fd)
++{
+ 	if (kqmap == NULL)
+ 		return;
+ 
+ 	struct kevent64_s ev[2];
+ 
+ 	ev[0].ident = fd;
+-	ev[0].flags = EV_DELETE | EV_RECEIPT;
++	ev[0].flags = EV_DELETE | EV_ENABLE | EV_RECEIPT;
+ 	ev[0].filter = EVFILT_READ;
+ 	ev[1].ident = fd;
+-	ev[1].flags = EV_DELETE | EV_RECEIPT;
++	ev[1].flags = EV_DELETE | EV_ENABLE | EV_RECEIPT;
+ 	ev[1].filter = EVFILT_WRITE;
+ 
+ 	// we know it's not a kqueue FD (since kqueue_close() takes care of those),

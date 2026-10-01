@@ -1,0 +1,330 @@
+#!/bin/sh
+# roblox-mac — run the macOS Roblox client on Linux. Host-native: no Docker, no root, no system
+# install. Everything it needs is beside this script.
+#
+# It re-execs itself inside an unprivileged user+mount namespace, because darlingserver refuses to
+# start unless it is uid 0 and it mounts its prefix overlay itself. Nothing is installed and no
+# privilege is gained: `unshare -Ur` maps your own uid to 0 inside the namespace only.
+#
+#   roblox-mac                    launch the client
+#   roblox-mac --shell 'cmd'      run one command in the macOS guest (debugging)
+#   roblox-mac --diagnose         save hardware and shader-tool checks without launching
+#   roblox-mac --debug [args]     save diagnostics and log a launch
+#
+set -eu
+umask 077
+
+ROOT=${ROBLOX_MAC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+
+# Config: plain KEY=value lines, shell syntax. Copy config.env.example to config.env and edit.
+# Environment variables of the same name win over the file, so one-off overrides need no edit.
+# Use the original AppImage's directory, never its temporary read-only mount.
+if [ -n "${APPDIR:-}" ]; then
+    STATE=$(CDPATH= cd -- "$(dirname -- "${APPIMAGE:-$APPDIR}")" && pwd)
+    # The repository keeps package/ below its configuration and data directory.
+    if [ "$(basename -- "$STATE")" = package ] && [ -f "$STATE/../config.env" ]; then
+        STATE=$(CDPATH= cd -- "$STATE/.." && pwd)
+    fi
+    RELEASE=0
+    if [ -d "$STATE/RobloxVersion" ] || [ -f "$STATE/update-roblox.sh" ]; then RELEASE=1; fi
+    CONFIG=${ROBLOX_MAC_CONFIG:-$STATE/config.env}
+    _default_data=$STATE/data
+    if [ "$RELEASE" = 1 ]; then
+        _default_data=$STATE/DO_NOT_SHARE
+        CONFIG=${ROBLOX_MAC_CONFIG:-$_default_data/config.env}
+    fi
+else
+    CONFIG=${ROBLOX_MAC_CONFIG:-$ROOT/config.env}
+    _default_data=$ROOT/../.build/profile
+fi
+# Before config parsing, so broken settings are captured too. Release logs must
+# survive the updater removing ROBLOX_MAC_DATA's temporary staging directory.
+case "${1:-}" in
+    --diagnose|--debug)
+        mode=$1; shift
+        exec python3 "$ROOT/scripts/diagnostics.py" "$mode" "$ROOT" "$_default_data" "$0" "$@";;
+esac
+if [ -f "$CONFIG" ]; then
+    _env_app=${ROBLOX_MAC_APP:-}; _env_data=${ROBLOX_MAC_DATA:-}; _env_vd=${SDL_VIDEODRIVER:-}; _env_renderer=${ROBLOX_MAC_RENDERER:-}
+    _env_size=${ROBLOX_MAC_RENDER_SIZE:-}
+    _env_opt=${ROBLOX_MAC_OPTIMIZED:-}; _env_cpu=${ROBLOX_MAC_CPU_AFFINITY:-}; _env_workers=${RBX_PIPELINE_WORKERS:-}; _env_swap=${ROBLOX_MAC_SWAP_INTERVAL:-}
+    # shellcheck disable=SC1090
+    . "$CONFIG"
+    [ -n "$_env_app" ]  && ROBLOX_MAC_APP=$_env_app
+    [ -n "$_env_data" ] && ROBLOX_MAC_DATA=$_env_data
+    [ -n "$_env_vd" ]   && SDL_VIDEODRIVER=$_env_vd
+    [ -n "$_env_renderer" ] && ROBLOX_MAC_RENDERER=$_env_renderer
+    [ -n "$_env_opt" ] && ROBLOX_MAC_OPTIMIZED=$_env_opt
+    [ -n "$_env_cpu" ] && ROBLOX_MAC_CPU_AFFINITY=$_env_cpu
+    [ -n "$_env_workers" ] && RBX_PIPELINE_WORKERS=$_env_workers
+    [ -n "$_env_swap" ] && ROBLOX_MAC_SWAP_INTERVAL=$_env_swap
+    [ -n "$_env_size" ] && ROBLOX_MAC_RENDER_SIZE=$_env_size
+fi
+export ROBLOX_MAC_RENDER_SIZE=${ROBLOX_MAC_RENDER_SIZE:-}
+export ROBLOX_MAC_CPU_AFFINITY=${ROBLOX_MAC_CPU_AFFINITY:-}
+export ROBLOX_MAC_SWAP_INTERVAL=${ROBLOX_MAC_SWAP_INTERVAL:-0}
+export TRACKA_NATIVE_MEMORY=${TRACKA_NATIVE_MEMORY:-1}
+case "$ROBLOX_MAC_SWAP_INTERVAL" in ''|0|1) ;; *) echo 'ROBLOX_MAC_SWAP_INTERVAL must be 0 or 1' >&2; exit 2;; esac
+export ROBLOX_MAC_RENDERER=${ROBLOX_MAC_RENDERER:-metal}
+OPTIMIZED=${ROBLOX_MAC_OPTIMIZED:-1}
+case "${1:-}:${2:-}" in --shell:*|--inside:--shell) OPTIMIZED=0;; esac
+if [ "$OPTIMIZED" = 1 ] && [ -f "$ROOT/optimized/ready" ]; then
+    export ROBLOX_MAC_WAYLAND=1 SDL_VIDEODRIVER=wayland
+else
+    OPTIMIZED=0
+fi
+DATA=${ROBLOX_MAC_DATA:-$_default_data}
+if [ "${RELEASE:-0}" = 1 ]; then
+    PRIVATE=$STATE/DO_NOT_SHARE
+    # Ignore inherited home/cache paths; staging overrides must stay in this folder.
+    DATA=$(realpath -m -- "$DATA")
+    case "$DATA" in "$PRIVATE"|"$PRIVATE"/*) ;; *) echo 'Release data must stay inside DO_NOT_SHARE.' >&2; exit 2;; esac
+    mkdir -p "$PRIVATE"
+    chmod 700 "$PRIVATE"
+    export HOME=$PRIVATE/home XDG_CONFIG_HOME=$PRIVATE/config
+    export XDG_DATA_HOME=$PRIVATE/share XDG_CACHE_HOME=$PRIVATE/cache
+    export TMPDIR=$PRIVATE/tmp TMP=$PRIVATE/tmp TEMP=$PRIVATE/tmp
+    export ROBLOX_MAC_BROWSER_DATA=$DATA/browser PYTHONDONTWRITEBYTECODE=1 GSETTINGS_BACKEND=memory
+    mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+fi
+if [ "${1:-}" = --download-client ]; then
+    ROBLOX_MAC_DATA=$DATA exec "$ROOT/scripts/fetch-client.sh"
+fi
+if [ "${1:-}" = --client-version ]; then
+    exec "$ROOT/scripts/fetch-client.sh" --version
+fi
+PREFIX=$DATA/prefix
+if [ -n "${APPDIR:-}" ]; then
+    if [ "$RELEASE" = 1 ]; then
+        APP=${ROBLOX_MAC_APP:-$STATE/RobloxVersion/RobloxPlayer.app}
+    else
+        APP=${ROBLOX_MAC_APP:-$DATA/RobloxPlayer.app}
+    fi
+else
+    APP=${ROBLOX_MAC_APP:-$ROOT/../.build/client/RobloxPlayer.app}
+fi
+CACHE=$DATA/spv-cache-v1
+FLAGS=
+if [ "${RELEASE:-0}" = 1 ]; then
+    CACHE=$(dirname -- "$APP")/spv-cache-v1
+    FLAGS=$STATE/FFlags.json
+fi
+if [ "${1:-}" = --show-config ]; then
+    printf 'CONFIG=%s\nDATA=%s\nAPP=%s\nRENDERER=%s\n' "$CONFIG" "$DATA" "$APP" "$ROBLOX_MAC_RENDERER"
+    printf 'CPU_AFFINITY=%s\nSWAP_INTERVAL=%s\n' "$ROBLOX_MAC_CPU_AFFINITY" "${ROBLOX_MAC_SWAP_INTERVAL:-metal}"
+    printf 'NATIVE_MEMORY=%s\n' "$TRACKA_NATIVE_MEMORY"
+    printf 'RENDER_SIZE=%s\n' "${ROBLOX_MAC_RENDER_SIZE:-window}"
+    printf 'FFLAGS=%s\nSHADER_CACHE=%s\n' "$FLAGS" "$CACHE"
+    if [ "${RELEASE:-0}" = 1 ]; then
+        printf 'HOME=%s\nXDG_CONFIG_HOME=%s\nXDG_DATA_HOME=%s\nXDG_CACHE_HOME=%s\nTMPDIR=%s\n' "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+    fi
+    exit 0
+fi
+if [ "${1:-}" = --frame-trace ]; then
+    [ "$#" -ge 2 ] || { echo 'Usage: --frame-trace NEW_CSV [--place-id ID]' >&2; exit 2; }
+    TRACKB_FRAME_TRACE=$(python3 - "$2" <<'PYTHON'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]).resolve()
+if p.exists() or not p.parent.is_dir():
+    raise SystemExit('Frame trace requires a new file in an existing directory')
+print('/Volumes/SystemRoot'+str(p))
+PYTHON
+    )
+    export TRACKB_FRAME_TRACE
+    shift 2
+fi
+if [ "${1:-}" = --place-id ]; then
+    case "${2:-}" in ''|*[!0-9]*|0) echo 'Usage: roblox-mac --place-id POSITIVE_PLACE_ID' >&2; exit 2;; esac
+    [ "$#" = 2 ] && [ "$2" -gt 0 ] 2>/dev/null || { echo 'Usage: roblox-mac --place-id POSITIVE_PLACE_ID' >&2; exit 2; }
+    set -- --place "$2"
+fi
+case " $* " in *" --shell "*) ;; *)      # a guest shell needs no client
+    # AppImage: the client is not bundled; fetch it on first run (and keep it current).
+    if [ -n "$FLAGS" ] && [ ! -x "$APP/Contents/MacOS/RobloxPlayer" ]; then
+        echo "Run $STATE/update-roblox.sh first." >&2
+        exit 1
+    fi
+    [ -n "${APPDIR:-}" ] && [ ! -x "$APP/Contents/MacOS/RobloxPlayer" ] && ROBLOX_MAC_DATA=$DATA "$ROOT/scripts/fetch-client.sh"
+    [ -x "$APP/Contents/MacOS/RobloxPlayer" ] || {
+        echo "roblox-mac: no client at $APP (set ROBLOX_MAC_APP in $CONFIG or run scripts/fetch-client.sh)" >&2
+        exit 1
+    }
+esac
+export ROBLOX_MAC_APP=$APP ROBLOX_MAC_DATA=$DATA SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-wayland,x11}
+
+if [ "${1:-}" = --prepare-shaders ]; then
+    export PATH="$ROOT/usr/bin:$PATH"
+    export ROBLOX_MAC_SHADER_LIBRARY_PATH="$ROOT/browser/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export ROBLOX_MAC_SHADER_BUILD=$DATA/metal-build
+    "$ROOT/metal/translate-all.sh" "$APP"
+    exec python3 "$ROOT/metal/prepare-cache.py" --app "$APP" --source "$DATA/metal-build/spv" --output "$CACHE"
+fi
+if [ "${1:-}" != --inside ] && [ "${1:-}" != --shell ] && [ "${ROBLOX_MAC_RENDERER:-}" = metal ] && [ ! -f "$CACHE/report.json" ]; then
+    echo "roblox-mac: prepare the Metal shader cache first: $0 --prepare-shaders" >&2
+    exit 1
+fi
+
+# --- outside the namespace ------------------------------------------------------------------
+if [ "${1:-}" != "--inside" ]; then
+    command -v unshare >/dev/null || { echo "roblox-mac: needs util-linux's unshare" >&2; exit 1; }
+    unshare -Ur true 2>/dev/null || {
+        echo "roblox-mac: unprivileged user namespaces are disabled on this system." >&2
+        echo "  sudo sysctl -w kernel.unprivileged_userns_clone=1" >&2
+        exit 1
+    }
+    # Only the parent: `darling` initialises the prefix itself on first run, and skips that setup
+    # entirely if the directory already exists.
+    mkdir -p "$(dirname "$PREFIX")"
+    # The outer process owns cleanup, including when the inner process execs Darling.
+    ROBLOX_MAC_STAGE=$(mktemp -d "$DATA/launch.XXXXXX")
+    export ROBLOX_MAC_STAGE
+    trap 'rm -rf -- "$ROBLOX_MAC_STAGE"' EXIT
+    # --kill-child below also tears down the guest namespace if its supervisor dies.
+    run_inner() {
+        flock -n -E 73 -o "$DATA/instance.lock" "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@"
+    }
+    # --pid --fork --mount-proc: launchd expects to own the process tree, and without a PID
+    # namespace its daemons (opendirectoryd, shellspawn) never come up.
+    if [ "${ROBLOX_MAC_WAYLAND:-}" = 1 ]; then
+        export GDK_BACKEND=wayland EGL_PLATFORM=wayland
+        export ROBLOX_MAC_WAYLAND_HELPER=$ROOT/browser/libroblox-wayland.so
+        if [ "$OPTIMIZED" = 1 ]; then
+            export ROBLOX_MAC_WAYLAND_HELPER=$ROOT/optimized/ui/libroblox-wayland.so
+        fi
+        export ROBLOX_MAC_BROWSER_ROOT=$ROOT/browser
+        if [ -d "$ROOT/browser/lib" ]; then
+            export GST_PLUGIN_SYSTEM_PATH_1_0="$ROOT/browser/lib/gstreamer-1.0" GST_PLUGIN_PATH_1_0=
+            export GST_PLUGIN_SCANNER_1_0="$ROOT/browser/lib/gstreamer-1.0/gst-plugin-scanner"
+            export GIO_MODULE_DIR="$ROOT/browser/lib/gio/modules"
+            export GDK_PIXBUF_MODULE_FILE="$ROOT/browser/lib/gdk-pixbuf-2.0/loaders.cache"
+            export GSETTINGS_SCHEMA_DIR="$ROOT/browser/share/glib-2.0/schemas"
+            if [ -f "$ROOT/browser/share/fontconfig/fonts.conf" ]; then
+                export FONTCONFIG_PATH="$ROOT/browser/share/fontconfig" FONTCONFIG_FILE="$ROOT/browser/share/fontconfig/fonts.conf"
+            fi
+            export WEBKIT_INJECTED_BUNDLE_PATH="$ROOT/browser/lib/webkit2gtk-4.1/injected-bundle"
+        fi
+        export ROBLOX_MAC_UI_SOCKET=/Volumes/SystemRoot$ROBLOX_MAC_STAGE/ui.sock
+        unset DISPLAY
+        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"
+    elif [ "${1:-}" = --shell ]; then
+        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"
+    else
+        run_inner "$ROOT/browser/roblox-gtk" unshare -Urm --pid --fork --kill-child --mount-proc "$ROOT/bin/roblox-mac" --inside "$@"
+    fi
+    exit $?
+fi
+shift
+
+# --- inside the namespace -------------------------------------------------------------------
+# darlingserver hardcodes /usr/libexec/darling (its macOS root) and /usr/bin/darlingserver.
+# Arch has no /usr/libexec at all, and we cannot write to /usr even as namespace-root, so overlay
+# a small directory on top of the real /usr. Read-only, invisible outside this namespace.
+STAGE=${ROBLOX_MAC_STAGE:?missing launcher stage directory}
+mkdir -p "$STAGE/bin" "$STAGE/libexec"
+ln -s "$ROOT/darling-root" "$STAGE/libexec/darling"
+ln -s "$ROOT/darlingserver" "$STAGE/bin/darlingserver"
+ln -s "$ROOT/darling-cli"   "$STAGE/bin/darling"
+mount -t overlay overlay -o "lowerdir=$STAGE:/usr" /usr
+
+# Host flock/unshare/mount must use their own distro libraries. Apply the
+# release's library set only after entering Darling's namespace.
+if [ -d "$ROOT/browser/lib" ]; then
+    export LD_LIBRARY_PATH="$ROOT/browser/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+G=/Volumes/SystemRoot          # the host filesystem, as the guest sees it
+export DPREFIX=$PREFIX
+export ROBLOX_MAC_COOKIE_HELPER=$ROOT/shims/cfnet/libcookies-host.so
+export ROBLOX_MAC_VIDEO_HELPER=$ROOT/optimized/libtracka-video-host.so
+mkdir -p "$DATA/crashes"
+export ROBLOX_MAC_CRASH_LOG=$DATA/crashes/fatal.log
+
+# Creating private/etc first makes Darling mistake an empty prefix for an initialized one.
+[ -d "$PREFIX" ] || darling shell true
+
+# Darling ships a fixed resolv.conf (8.8.8.8), which is wrong on any network that routes DNS
+# through a local resolver or a VPN. Mirror the host's, into the prefix so darling-root stays clean.
+mkdir -p "$PREFIX/private/etc"
+grep -E '^(nameserver|search|options|domain)' /etc/resolv.conf > "$PREFIX/private/etc/resolv.conf" 2>/dev/null || true
+# Darling's usr/lib/native/*.dylib wrappers dlopen host ELF libraries by the soname Ubuntu noble
+# ships (ffmpeg 6). hostlibs/ maps those names onto whatever this distro has (ffmpeg 8 on
+# CachyOS); the wrappers resolve symbols by name, so newer sonames work until a symbol is gone.
+# Built at runtime in $DATA (the AppImage is read-only and the host's versions differ per distro).
+HL=$DATA/hostlibs; mkdir -p "$HL"
+for want in libavformat.so.60 libavcodec.so.60 libavutil.so.58 libswresample.so.4; do
+    [ -e "$HL/$want" ] && continue
+    stem=${want%%.so*}
+    have=$(ls /usr/lib/"$stem".so.[0-9]* /usr/lib64/"$stem".so.[0-9]* /usr/lib/x86_64-linux-gnu/"$stem".so.[0-9]* 2>/dev/null | head -1)
+    [ -n "$have" ] && ln -sf "$have" "$HL/$want"
+done
+# Exact bundled FFmpeg ABIs take precedence over source-build host aliases.
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$HL
+
+# SDL_VIDEODRIVER (wayland first, X11 fallback) was exported before the re-exec; unshare keeps env.
+export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-nvidia}
+
+# X11 (Xwayland). Darling's AppKit is cocotron on X11. The X socket needs no mount work: the ELF
+# side of Darling runs in this namespace's own mount view, where the host's /tmp is untouched.
+# Only the auth cookie has to be named explicitly, because the guest's HOME is /Users/root.
+for x in "${XAUTHORITY:-}" "$HOME/.Xauthority"; do
+    [ -n "$x" ] && [ -f "$x" ] && { export XAUTHORITY=$G$x; break; }
+done
+
+if [ "${1:-}" = "--shell" ]; then
+    exec darling shell bash -c "$2"
+fi
+
+# Inside the guest the host filesystem hangs off /Volumes/SystemRoot, so every path we hand to
+# the client has to be rewritten.
+INSERT=$G$ROOT/shims/fill/librbxfill.dylib:$G$ROOT/shims/appkit/libappkitgaps.dylib:$G$ROOT/shims/xattr/libxattr.dylib:$G$ROOT/shims/setsid/libnosetsid.dylib:$G$ROOT/shims/input/librbxinput.dylib:$G$ROOT/shims/dns/librbxdns.dylib:$G$ROOT/shims/cfnet/librbxcfnet.dylib
+if [ "$OPTIMIZED" != 1 ]; then
+    INSERT=$INSERT:$G$ROOT/shims/kqueue/librbxkqueue.dylib
+fi
+INSERT=$INSERT:$G$ROOT/shims/identity/librbxidentity.dylib
+[ -n "${TRACE:-}" ] && INSERT=$INSERT:$G$ROOT/shims/debug/libthrowtrace.dylib
+
+# Experimental Metal path: shader cache and descriptor layout must be used together.
+if [ "${ROBLOX_MAC_RENDERER:-}" = metal ]; then
+    export DYLD_LIBRARY_PATH=$G$ROOT/shims/metal
+    export ROBLOX_MAC_SHADER_CACHE=$G$CACHE
+    mkdir -p "$DATA/mesa-cache" "$DATA/nvidia-cache"
+    # Darling runs as root inside its namespace; NVIDIA otherwise disables its
+    # disk cache and recompiles materials when they appear again.
+    export __GL_SHADER_DISK_CACHE=${__GL_SHADER_DISK_CACHE:-1}
+    export MESA_SHADER_CACHE_DIR=$DATA/mesa-cache __GL_SHADER_DISK_CACHE_PATH=$DATA/nvidia-cache
+    INSERT=$INSERT:$G$ROOT/shims/metal/libmetalgaps.dylib
+fi
+if [ "$OPTIMIZED" = 1 ]; then
+    # Build-generated paths only; no translator or ARM guest libraries are loaded.
+    . "$ROOT/optimized/libraries.env"
+    export DYLD_LIBRARY_PATH="$OPTIMIZED_LIBRARY_PATH${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+    if [ -d "$ROOT/optimized/native/frameworks/Metal.framework" ]; then
+        export DYLD_FRAMEWORK_PATH="$G$ROOT/optimized/native/frameworks${DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}"
+    fi
+    INSERT="$OPTIMIZED_INSERT:$INSERT"
+    export RBX_PIPELINE_WORKERS=${RBX_PIPELINE_WORKERS:-8}
+fi
+
+# Preserve argument boundaries across the guest shell (including deep links).
+# launchctl empties /private/tmp on every guest boot; Roblox keeps assets there.
+mkdir -p -m 700 "$DATA/client-tmp"
+COMMAND=$(python3 - "$INSERT" "$G$(CDPATH= cd -- "$APP" && pwd)/Contents/MacOS/RobloxPlayer" "$@" <<'PYTHON'
+import os,shlex,sys
+# Use pthread's native futex-backed mode. Darling's psynch RPC path can lose
+# the receiver/update condition-variable wakeup; our shim supplies ulock_wait2.
+client_data='/Volumes/SystemRoot'+os.path.abspath(os.environ['ROBLOX_MAC_DATA'])
+client_tmp=client_data+'/client-tmp'
+args=['env','TMPDIR='+client_tmp,'TEMPDIR='+client_tmp,
+      'ROBLOX_MAC_PIPELINE_CACHE='+client_data+'/vk-pipeline-cache-v1.bin',
+      'PTHREAD_MUTEX_DEFAULT_POLICY=3','PTHREAD_MUTEX_USE_ULOCK=1',
+      'DYLD_FORCE_FLAT_NAMESPACE=1','DYLD_INSERT_LIBRARIES='+sys.argv[1]]
+if os.environ.get('DYLD_PRINT_LIBRARIES'): args.append('DYLD_PRINT_LIBRARIES=1')
+if os.environ.get('DYLD_FRAMEWORK_PATH'): args.append('DYLD_FRAMEWORK_PATH='+os.environ['DYLD_FRAMEWORK_PATH'])
+# Match fetch-client's production build even when account preferences select a test channel.
+client=sys.argv[2:]
+if '-channel' not in client[1:]: client[1:1]=['-channel','production']
+print(shlex.join(args+client))
+PYTHON
+)
+exec darling shell bash -c "$COMMAND"

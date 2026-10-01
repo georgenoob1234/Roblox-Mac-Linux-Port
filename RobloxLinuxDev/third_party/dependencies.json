@@ -1,0 +1,45 @@
+{
+  "darling_source": {
+    "url": "https://github.com/darlinghq/darling/releases/download/v0.1.20260608/darling-source.tar.xz",
+    "sha256": "4fc9eb9a94af2aa396d4fafa0b6bbf0bcd7e210170854d143c080de3b5bb8df7",
+    "destination": "runtime/src/darling",
+    "overlay": "third_party/darling-overlay"
+  },
+  "darling_packages": {
+    "url": "https://github.com/darlinghq/darling/releases/download/v0.1.20260608/debs_20260608.zip",
+    "sha256": "27469ef3932da2e91dd7fb34b70e3628a3e54b7af9fb5480051f44af35eca1fd",
+    "destination": "runtime/debs"
+  },
+  "indium": {
+    "url": "https://github.com/darlinghq/indium.git",
+    "commit": "8423a7d2f053167030d2bc4a227f96243c740667",
+    "destination": "runtime/src/indium",
+    "patch": "third_party/patches/indium.patch"
+  },
+  "metal2vulkan": {
+    "url": "https://github.com/steelbrain/metal2vulkan.git",
+    "commit": "43c46ac8a24adf1a6e872b8a52c706ec9614fad0",
+    "destination": "metal2vulkan",
+    "patch": "third_party/patches/metal2vulkan.patch"
+  },
+  "vulkan_headers": {
+    "url": "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.3.290.tar.gz",
+    "destination": "runtime/src/Vulkan-Headers-1.3.290",
+    "sha256": "f38a653bf93cab7a2a229a53d2d53b1cba9a2819e4c0a7de13c54085bde9bcf5"
+  },
+  "imgui": {
+    "url": "https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b.tar.gz",
+    "destination": "runtime/profiler/vendor/imgui-1.91.9b",
+    "sha256": "8e1bbc76c71d74fef2fb85db7e7ca8eba13d6a86623c54992b60162db554ffdb"
+  },
+  "appimagetool": {
+    "url": "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage",
+    "destination": "runtime/package/tools/appimagetool",
+    "sha256": "a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0"
+  },
+  "appimage_runtime": {
+    "url": "https://github.com/VHSgunzo/uruntime/releases/download/v0.7.1/uruntime-appimage-squashfs-lite-x86_64",
+    "destination": "runtime/package/tools/uruntime-x86_64",
+    "sha256": "d27b343d0cf038c0d986774193c704e579b8be9f863f97440ba4c326d03e3d95"
+  }
+}

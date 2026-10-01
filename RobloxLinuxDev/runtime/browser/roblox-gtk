@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Only the Linux GTK/WebKit host uses these libraries. The guest gets its original environment.
+export ROBLOX_MAC_ORIGINAL_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+if [ -d "$HERE/lib" ]; then
+    export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export GST_PLUGIN_SYSTEM_PATH_1_0="$HERE/lib/gstreamer-1.0"
+    export GST_PLUGIN_PATH_1_0=
+    export GST_PLUGIN_SCANNER_1_0="$HERE/lib/gstreamer-1.0/gst-plugin-scanner"
+    export GIO_MODULE_DIR="$HERE/lib/gio/modules"
+    export GDK_PIXBUF_MODULE_FILE="$HERE/lib/gdk-pixbuf-2.0/loaders.cache"
+    export GSETTINGS_SCHEMA_DIR="$HERE/share/glib-2.0/schemas"
+    if [ -f "$HERE/share/fontconfig/fonts.conf" ]; then
+        export FONTCONFIG_PATH="$HERE/share/fontconfig" FONTCONFIG_FILE="$HERE/share/fontconfig/fonts.conf"
+    fi
+    export WEBKIT_INJECTED_BUNDLE_PATH="$HERE/lib/webkit2gtk-4.1/injected-bundle"
+fi
+cd "$HERE"
+exec "$HERE/roblox-gtk.bin" "$@"

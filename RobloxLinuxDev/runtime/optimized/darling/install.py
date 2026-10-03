@@ -36,7 +36,10 @@ SKIP = (FOUNDATION, 'System/Library/Frameworks/CoreAudio.framework', 'System/Lib
         'usr/lib/system/libsystem_m.dylib',
         # ELF wrappers are regenerated against the build host's library
         # headers; keep the Debian ones, which match what the prefix expects.
-        'usr/lib/native/')
+        'usr/lib/native/',
+        # The x86_64 O2 system_loader does not pass mldr's elfcalls table
+        # through to the guest startup path; retain Darling's stock dyld.
+        'usr/lib/dyld')
 MACHO_KINDS = ('DYLIB', 'BUNDLE', 'DYLINKER')
 
 
@@ -76,6 +79,8 @@ def pairs():
     # The O2 Foundation build breaks Roblox Home (its request returns HTTP 500).
     # Keep the working stock framework while optimizing the rest of the runtime.
     yield ROOT / FOUNDATION, original(ROOT / FOUNDATION)
+    # Also repair build trees where an earlier install replaced the loader.
+    yield ROOT / 'usr/lib/dyld', original(ROOT / 'usr/lib/dyld')
     yield A / 'darlingserver', STAGE / 'usr/bin/darlingserver'
     yield A / 'darling-cli', STAGE / 'usr/bin/darling'
 

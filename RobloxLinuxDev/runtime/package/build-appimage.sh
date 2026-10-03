@@ -66,7 +66,7 @@ cp "$TOP/third_party/licenses/uruntime.txt" "$APPDIR/usr/share/licenses/roblox-m
 # Runtime pieces. darling-root is copied with cp -a (737 MB, ~10 s); hard links would break on FUSE.
 cp -a "$ROOT/bin" "$ROOT/darling-root" "$ROOT/darlingserver" "$ROOT/darling-cli" "$APPDIR/"
 mkdir "$APPDIR/scripts"
-cp "$ROOT/scripts/fetch-client.sh" "$ROOT/scripts/runtime-limits.py" "$ROOT/scripts/launch-settings.sh" "$ROOT/scripts/diagnostics.py" "$APPDIR/scripts/"
+cp "$ROOT/scripts/fetch-client.sh" "$ROOT/scripts/runtime-limits.py" "$ROOT/scripts/launch-settings.sh" "$ROOT/scripts/diagnostics.py" "$ROOT/scripts/uri_handoff.py" "$APPDIR/scripts/"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$APPDIR/BUILD-ID"
 git -C "$TOP" rev-parse HEAD >> "$APPDIR/BUILD-ID"
 mkdir -p "$APPDIR/shims"
@@ -99,6 +99,7 @@ Icon=roblox-mac
 Categories=Game;
 MimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;
 Terminal=false
+StartupNotify=true
 DESK
 python3 - "$APPDIR/roblox-mac.png" <<'PY'
 # 256x256 flat icon, no dependencies; replace with real art whenever.

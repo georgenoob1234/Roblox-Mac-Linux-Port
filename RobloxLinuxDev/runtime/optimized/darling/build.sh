@@ -10,10 +10,28 @@ BUILD=$A/src/darling-o2
 STAGE=$A/src/darling-o2-stage
 PORTABLE=${ROBLOX_MAC_PORTABLE_ROOT:-$(python3 -B "$A/package/portable_runtime.py")}
 mkdir -p "$BUILD"
+run_logged() {
+    log=$1
+    shift
+    "$@" > "$log" 2>&1 || {
+        rc=$?
+        printf 'Darling build step failed (exit %s); log: %s\n' "$rc" "$log" >&2
+        tail -n 80 "$log" >&2
+        return "$rc"
+    }
+}
+# Darling's dyld CMake file enables Apple chained fixups unconditionally. The
+# x86_64 ld64 used by this port does not implement chained binds; x86_64 uses
+# classic relocations, so remove that arm64-oriented flag before configuring.
+DYLD_CMAKE=$A/src/darling/src/external/dyld/CMakeLists.txt
+if grep -q -- '-Wl,-fixup_chains' "$DYLD_CMAKE"; then
+    sed -i 's/ -Wl,-fixup_chains//g' "$DYLD_CMAKE"
+fi
 if [ ! -f "$BUILD/build.ninja" ]; then
     # Same options as debian/rules, x86_64 only; -O2 without NDEBUG so the
     # runtime's assertions keep their stock behavior.
-    (cd "$BUILD" && CFLAGS= CXXFLAGS= CPPFLAGS= LDFLAGS= cmake -G Ninja "$A/src/darling" \
+    run_logged "$BUILD/configure.log" env CFLAGS= CXXFLAGS= CPPFLAGS= LDFLAGS= \
+        cmake -G Ninja -S "$A/src/darling" -B "$BUILD" \
         -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DDEBIAN_PACKAGING=ON -DJSC_UNIFIED_BUILD=ON -DTARGET_i386=OFF \
         -DCOMPONENTS=gui_frameworks,gui_stubs,cli -DENABLE_METAL=ON -DDARLING_NO_CCACHE=ON \
@@ -22,17 +40,17 @@ if [ ! -f "$BUILD/build.ninja" ]; then
         -DCMAKE_OBJC_FLAGS_O2=-O2 -DCMAKE_OBJCXX_FLAGS_O2=-O2 \
         "-DCMAKE_ASM_FLAGS_O2=" "-DCMAKE_ASM-ATT_FLAGS_O2=" \
         -DVulkan_INCLUDE_DIR="$A/src/Vulkan-Headers-1.3.290/include" \
-        -DVulkan_LIBRARY=/usr/lib/libvulkan.so.1) > "$BUILD/configure.log"
+        -DVulkan_LIBRARY=/usr/lib/libvulkan.so.1
 else
-    cmake -S "$A/src/darling" -B "$BUILD" \
-        "-DCMAKE_EXE_LINKER_FLAGS=-B\"$PORTABLE/usr/lib/\"" > "$BUILD/configure.log"
+    run_logged "$BUILD/configure.log" cmake -S "$A/src/darling" -B "$BUILD" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-B\"$PORTABLE/usr/lib/\""
 fi
-ninja -C "$BUILD" -j "${BUILD_JOBS:-4}" > "$BUILD/build.log"
+run_logged "$BUILD/build.log" ninja -C "$BUILD" -j "${BUILD_JOBS:-4}"
 cc -I "$A/src/darling/src/startup" -I "$BUILD/src/include" \
     -I "$BUILD/src/external/darlingserver/include" \
     -I "$A/src/darling/src/external/darlingserver/include" \
     "$HERE/cli-check.c" -lutil -o "$BUILD/cli-check"
 "$BUILD/cli-check"
 rm -rf "$STAGE"
-DESTDIR=$STAGE ninja -C "$BUILD" install > "$BUILD/install.log"
+run_logged "$BUILD/install.log" env DESTDIR="$STAGE" ninja -C "$BUILD" install
 python3 -B "$HERE/install.py"

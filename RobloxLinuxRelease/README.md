@@ -18,6 +18,7 @@ RobloxLinuxRelease/
 ├── RobloxVersion/     (created by update-roblox.sh)
 ├── update-roblox.sh
 ├── run.sh             (terminal launch with diagnostic logs)
+├── install-uri-handler.sh (optional browser protocol registration)
 ├── FFlags.json
 ├── README.md
 ├── .gitignore
@@ -34,6 +35,21 @@ chmod +x RobloxLinux.AppImage
 sh update-roblox.sh
 sh run.sh
 ```
+
+To open browser Play, friend, private-server and other Roblox links in this
+release, install the user-local protocol handler once:
+
+```sh
+sh install-uri-handler.sh
+xdg-mime query default x-scheme-handler/roblox
+```
+
+The handler passes the complete `roblox://` or `roblox-player:` URI as one
+opaque argument. A second click while Roblox is starting or running replaces
+the pending link and is retried after the current client exits. If the client
+has not been downloaded yet, the link remains pending; run
+`sh update-roblox.sh` and launch again. Remove the registration with
+`sh install-uri-handler.sh uninstall`.
 
 Wait for the update to finish successfully before launching. On later launches,
 just run `sh run.sh`. Keep the generated **RobloxVersion** beside the AppImage.

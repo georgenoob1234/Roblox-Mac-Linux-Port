@@ -1,0 +1,76 @@
+#!/bin/sh
+# Register this release as a user-local handler for Roblox browser links.
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+RUN=$HERE/run.sh
+DATA_HOME=${XDG_DATA_HOME:-${HOME:?}/.local/share}
+CONFIG_HOME=${XDG_CONFIG_HOME:-${HOME:?}/.config}
+APP_DIR=$DATA_HOME/applications
+ICON_DIR=$DATA_HOME/icons/hicolor/scalable/apps
+DESKTOP=roblox-mac-port.desktop
+DESKTOP_PATH=$APP_DIR/$DESKTOP
+MIMEAPPS=$CONFIG_HOME/mimeapps.list
+
+escape_exec() {
+    # Desktop Exec fields use backslash escaping for separators and quotes.
+    printf '%s' "$1" | sed 's/[\\"]/[\\&]/g; s/ /\\ /g; s/	/\\	/g'
+}
+
+install_handler() {
+    mkdir -p "$APP_DIR" "$ICON_DIR"
+    exec_path=$(escape_exec "$RUN")
+    umask 022
+    cat > "$DESKTOP_PATH" <<EOF
+[Desktop Entry]
+Name=Roblox (Mac Linux Port)
+Comment=Launch the Intel macOS Roblox client
+Type=Application
+Exec=$exec_path %u
+Icon=roblox-mac-port
+Terminal=false
+StartupNotify=true
+Categories=Game;
+MimeType=x-scheme-handler/roblox;x-scheme-handler/roblox-player;
+EOF
+    cat > "$ICON_DIR/roblox-mac-port.svg" <<'EOF'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="18" fill="#e2231a"/><path fill="#fff" d="M32 32h64v64H32zm16 16v32h32V48z"/></svg>
+EOF
+    chmod 644 "$DESKTOP_PATH" "$ICON_DIR/roblox-mac-port.svg"
+    if command -v xdg-mime >/dev/null 2>&1; then
+        xdg-mime default "$DESKTOP" x-scheme-handler/roblox || echo 'Warning: xdg-mime could not register roblox.' >&2
+        xdg-mime default "$DESKTOP" x-scheme-handler/roblox-player || echo 'Warning: xdg-mime could not register roblox-player.' >&2
+    else
+        echo 'Warning: xdg-mime is unavailable; install it or set mimeapps.list manually.' >&2
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$APP_DIR" >/dev/null 2>&1 || echo 'Warning: update-desktop-database failed.' >&2
+    else
+        echo 'Note: update-desktop-database is unavailable; the menu may refresh later.' >&2
+    fi
+    echo "Installed $DESKTOP_PATH"
+    echo 'Verify with: xdg-mime query default x-scheme-handler/roblox'
+}
+
+uninstall_handler() {
+    rm -f -- "$DESKTOP_PATH" "$ICON_DIR/roblox-mac-port.svg"
+    if [ -f "$MIMEAPPS" ]; then
+        tmp=$MIMEAPPS.tmp.$$
+        sed -e 's/roblox-mac-port\.desktop;//g' \
+            -e 's/;roblox-mac-port\.desktop//g' \
+            -e 's/=roblox-mac-port\.desktop$/=/' \
+            -e '/^x-scheme-handler\/roblox=$/d' \
+            -e '/^x-scheme-handler\/roblox-player=$/d' "$MIMEAPPS" > "$tmp"
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f -- "$tmp" "$MIMEAPPS"
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+    fi
+    echo "Removed $DESKTOP_PATH and its own MIME entries"
+}
+
+case "${1:-install}" in
+    install) [ "$#" -le 1 ] || { echo 'Usage: install-uri-handler.sh [install|uninstall]' >&2; exit 2; }; install_handler;;
+    uninstall) [ "$#" -eq 1 ] || { echo 'Usage: install-uri-handler.sh [install|uninstall]' >&2; exit 2; }; uninstall_handler;;
+    *) echo 'Usage: install-uri-handler.sh [install|uninstall]' >&2; exit 2;;
+esac

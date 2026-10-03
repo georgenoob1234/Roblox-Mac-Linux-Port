@@ -37,6 +37,12 @@ def defined_by_hand():
     """Symbols our own shims implement properly. The generated stub must not shadow them: under
     DYLD_FORCE_FLAT_NAMESPACE the first inserted library wins, and fill is inserted first."""
     libs = [p for p in HERE.parent.glob("*/*.dylib") if p.parent.name != "fill"]
+    # The optimized CoreAudio framework is loaded through DYLD framework
+    # lookup rather than from a shims subdirectory. Include it here so the
+    # generated fallback never shadows its real host-clock exports.
+    audio = ROOT / "optimized/audio/build/CoreAudio.framework/Versions/A/CoreAudio"
+    if audio.is_file():
+        libs.append(audio)
     if not libs:
         return set()
     out = subprocess.run(["llvm-nm", "--defined-only", "--extern-only", "-j", *map(str, libs)],

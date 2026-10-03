@@ -37,6 +37,6 @@ clang++ --target=x86_64-apple-macos11 -D__DARWIN_ONLY_UNIX_CONFORMANCE=1 -DTARGE
  -I "$COMP" -I "$COMP/PublicUtility" -I "$COMP/AUPublic/AUBase" -I "$COMP/AUPublic/Utility" \
  -I "$A/src/darling/src/frameworks/CoreServices/include" \
  -framework CoreAudio -framework CoreFoundation -framework AudioToolbox -Wno-nullability-completeness \
- "$HERE/AUHAL.cpp" "$HERE/DefaultOutputAU.cpp" "$HERE/SystemOutputAU.cpp" "$@" \
+ "$HERE/AUHAL.cpp" "$HERE/DefaultOutputAU.cpp" "$HERE/SystemOutputAU.cpp" "$HERE/CoreAudio/HostTime.mm" "$@" \
  -o "$OUT/CoreAudio.component/Contents/MacOS/CoreAudio"
 cp "$COMP/Info.plist" "$OUT/CoreAudio.component/Contents/Info.plist"

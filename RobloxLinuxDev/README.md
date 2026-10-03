@@ -4,6 +4,12 @@ This folder contains the runtime, native renderer, browser, shims and packaging 
 
 - `runtime/`: launcher, compatibility shims, browser, profiler, shader preparation and packaging.
 - `native/`: x86_64 runtime libraries and Vulkan renderer.
+
+The release browser protocol registration is built from
+`runtime/package/install-uri-handler.sh`; it installs a visible user-local
+desktop entry for `roblox://` and `roblox-player:` and passes each URI as one
+opaque argument. `runtime/package/check-uri-handoff.py` exercises the private
+pending store and installer without launching Roblox.
 - `third_party/`: exact upstream revisions, archive checksums, source overlays and patches.
 - `bootstrap.py`: fetches dependencies into this folder, preserving existing dependency trees.
 - `build.sh`: builds the runtime and AppImage from those sources.

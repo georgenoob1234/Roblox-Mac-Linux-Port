@@ -10,6 +10,7 @@ stage=$(mktemp -d "$(dirname -- "$OUT")/.release.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 cp "$HERE/roblox-mac-x86_64.AppImage" "$stage/RobloxLinux.AppImage"
 cp "$HERE/update-roblox.sh" "$HERE/run.sh" "$stage/"
+cp "$HERE/install-uri-handler.sh" "$stage/install-uri-handler.sh"
 cp "$HERE/README.md" "$stage/README.md"
 cp "$HERE/.gitignore" "$stage/.gitignore"
 printf '{}\n' > "$stage/FFlags.json"

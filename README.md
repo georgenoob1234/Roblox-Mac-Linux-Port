@@ -2,7 +2,7 @@
 
 An experimental, unofficial runner for the Intel macOS Roblox client on x86_64 Linux, using Darling, Wayland and Vulkan.
 
-**[Download RobloxLinuxRelease.tar.gz](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/releases/tag/reupload)**, extract it, run `sh update-roblox.sh` inside `RobloxLinuxRelease`, then `sh run.sh`.
+**[Download RobloxLinuxRelease.tar.gz](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/releases/)**, extract it, run `sh update-roblox.sh` inside `RobloxLinuxRelease`, then `sh run.sh`.
 
 ```text
 RobloxLinuxDev/        Source, dependency pins, patches and build scripts

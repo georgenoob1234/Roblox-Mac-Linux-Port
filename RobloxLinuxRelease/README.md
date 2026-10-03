@@ -19,6 +19,7 @@ RobloxLinuxRelease/
 ├── update-roblox.sh
 ├── run.sh             (terminal launch with diagnostic logs)
 ├── install-uri-handler.sh (optional browser protocol registration)
+├── icon.png           (icon installed for the browser protocol handler)
 ├── FFlags.json
 ├── README.md
 ├── .gitignore

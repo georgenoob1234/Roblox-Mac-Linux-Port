@@ -37,6 +37,7 @@ with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
 
     release = Path(temp) / "release with spaces"; release.mkdir()
     shutil.copy2(Path(__file__).parents[2] / "../RobloxLinuxRelease/install-uri-handler.sh", release / "install-uri-handler.sh")
+    shutil.copy2(Path(__file__).parents[2] / "../RobloxLinuxRelease/icon.png", release / "icon.png")
     (release / "run.sh").write_text("#!/bin/sh\nexit 0\n"); (release / "run.sh").chmod(0o755)
     data = Path(temp) / "data"; config = Path(temp) / "config"; fakebin = Path(temp) / "bin"
     fakebin.mkdir(); calls = Path(temp) / "xdg-mime.calls"
@@ -49,6 +50,8 @@ with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
     text = desktop.read_text()
     assert "NoDisplay" not in text and "%u" in text and "MimeType=x-scheme-handler/roblox;" in text
     assert "Exec=" in text and "release\\ with\\ spaces/run.sh %u" in text
+    icon = data / "icons/hicolor/256x256/apps/roblox-mac-port.png"
+    assert icon.read_bytes() == (release / "icon.png").read_bytes()
     subprocess.run([release / "install-uri-handler.sh"], env=env, check=True, capture_output=True)
     assert len(calls.read_text().splitlines()) == 4
     mime = config / "mimeapps.list"; mime.parent.mkdir()
@@ -57,5 +60,6 @@ with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
                     "x-scheme-handler/other=other.desktop;\n")
     subprocess.run([release / "install-uri-handler.sh", "uninstall"], env=env, check=True, capture_output=True)
     assert not desktop.exists() and "roblox-mac-port.desktop" not in mime.read_text()
+    assert not icon.exists()
     assert "x-scheme-handler/other=other.desktop;" in mime.read_text()
 print("PASS URI opaque round-trip, atomic permissions, newest-click-wins, consumed-only clearing, desktop validation, installer idempotence/uninstall")

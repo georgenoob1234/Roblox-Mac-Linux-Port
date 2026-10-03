@@ -79,6 +79,8 @@ def pairs():
     # The O2 Foundation build breaks Roblox Home (its request returns HTTP 500).
     # Keep the working stock framework while optimizing the rest of the runtime.
     yield ROOT / FOUNDATION, original(ROOT / FOUNDATION)
+    # Also repair build trees where an earlier install replaced the loader.
+    yield ROOT / 'usr/lib/dyld', original(ROOT / 'usr/lib/dyld')
     yield A / 'darlingserver', STAGE / 'usr/bin/darlingserver'
     yield A / 'darling-cli', STAGE / 'usr/bin/darling'
 

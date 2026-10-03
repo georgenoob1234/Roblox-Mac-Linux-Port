@@ -10,6 +10,13 @@ BUILD=$A/src/darling-o2
 STAGE=$A/src/darling-o2-stage
 PORTABLE=${ROBLOX_MAC_PORTABLE_ROOT:-$(python3 -B "$A/package/portable_runtime.py")}
 mkdir -p "$BUILD"
+# Darling's dyld CMake file enables Apple chained fixups unconditionally. The
+# x86_64 ld64 used by this port does not implement chained binds; x86_64 uses
+# classic relocations, so remove that arm64-oriented flag before configuring.
+DYLD_CMAKE=$A/src/darling/src/external/dyld/CMakeLists.txt
+if grep -q -- '-Wl,-fixup_chains' "$DYLD_CMAKE"; then
+    sed -i 's/ -Wl,-fixup_chains//g' "$DYLD_CMAKE"
+fi
 if [ ! -f "$BUILD/build.ninja" ]; then
     # Same options as debian/rules, x86_64 only; -O2 without NDEBUG so the
     # runtime's assertions keep their stock behavior.

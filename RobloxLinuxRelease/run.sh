@@ -12,6 +12,8 @@ export TARGET_APPIMAGE=$HERE/RobloxLinux.AppImage
 unset APPIMAGE_TARGET_DIR
 export TMPDIR=$HERE/DO_NOT_SHARE/tmp TMP=$HERE/DO_NOT_SHARE/tmp TEMP=$HERE/DO_NOT_SHARE/tmp
 case "${1:-}" in
+    --uri) [ "$#" -eq 2 ] || { echo 'Usage: run.sh --uri URI' >&2; exit 2; }; exec "$HERE/RobloxLinux.AppImage" --uri "$2";;
+    roblox://*|roblox-player:*) [ "$#" -eq 1 ] || { echo 'Usage: run.sh URI' >&2; exit 2; }; exec "$HERE/RobloxLinux.AppImage" "$1";;
     --diagnose|--debug|--client-version|--download-client) exec "$HERE/RobloxLinux.AppImage" "$@";;
     *) exec "$HERE/RobloxLinux.AppImage" --debug "$@";;
 esac

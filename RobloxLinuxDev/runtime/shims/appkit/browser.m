@@ -145,6 +145,9 @@ static void sendMessage(NSDictionary *message) {
 - (void)application:(id)application openURLs:(NSArray*)urls;
 @end
 static BOOL deliverClientURL(id value) {
+    // A cold launch already carries the browser value as RobloxPlayer's
+    // native -protocolString argument. Do not inject a second Cocoa URL.
+    if(getenv("MACOBLOX_PROTOCOL_STRING_PRESENT"))return NO;
     if(![value isKindOfClass:[NSString class]] || !rbx_client_url([value UTF8String]))return NO;
     NSURL *url=[NSURL URLWithString:value];if(!url)return NO;
     if(![NSThread isMainThread]){dispatch_async(dispatch_get_main_queue(),^{deliverClientURL(value);});return YES;}

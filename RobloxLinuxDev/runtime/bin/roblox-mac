@@ -39,6 +39,14 @@ else
 fi
 # Before config parsing, so broken settings are captured too. Release logs must
 # survive the updater removing ROBLOX_MAC_DATA's temporary staging directory.
+LAUNCH_URI=
+if [ "${1:-}" = --uri ]; then
+    [ "$#" -eq 2 ] || { echo 'Usage: roblox-mac --uri URI' >&2; exit 2; }
+    LAUNCH_URI=$2; shift 2
+elif case "${1:-}" in roblox://*|roblox-player:*) true;; *) false;; esac; then
+    [ "$#" -eq 1 ] || { echo 'Usage: roblox-mac URI' >&2; exit 2; }
+    LAUNCH_URI=$1; shift
+fi
 case "${1:-}" in
     --diagnose|--debug)
         mode=$1; shift
@@ -87,6 +95,23 @@ if [ "${RELEASE:-0}" = 1 ]; then
     export ROBLOX_MAC_BROWSER_DATA=$DATA/browser PYTHONDONTWRITEBYTECODE=1 GSETTINGS_BACKEND=memory
     mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 fi
+export ROBLOX_MAC_DATA=$DATA
+URI_HELPER=$ROOT/scripts/uri_handoff.py
+if [ -n "$LAUNCH_URI" ]; then
+    meta=$(python3 - "$URI_HELPER" receive "$DATA" "$LAUNCH_URI" <<'PY'
+import importlib.util,sys
+s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print('%s %d' % m.receive(sys.argv[3],sys.argv[4]))
+PY
+    )
+    printf 'roblox URI received: scheme=%s length=%s\n' $meta >&2
+fi
+LAUNCH_URI=$(python3 - "$URI_HELPER" peek "$DATA" <<'PY'
+import importlib.util,sys
+s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.peek(sys.argv[3]) or '')
+PY
+)
 if [ "${1:-}" = --download-client ]; then
     ROBLOX_MAC_DATA=$DATA exec "$ROOT/scripts/fetch-client.sh"
 fi
@@ -152,6 +177,7 @@ case " $* " in *" --shell "*) ;; *)      # a guest shell needs no client
     }
 esac
 export ROBLOX_MAC_APP=$APP ROBLOX_MAC_DATA=$DATA SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-wayland,x11}
+export ROBLOX_MAC_LAUNCH_URI=$LAUNCH_URI
 
 if [ "${1:-}" = --prepare-shaders ]; then
     export PATH="$ROOT/usr/bin:$PATH"
@@ -182,7 +208,29 @@ if [ "${1:-}" != "--inside" ]; then
     trap 'rm -rf -- "$ROBLOX_MAC_STAGE"' EXIT
     # --kill-child below also tears down the guest namespace if its supervisor dies.
     run_inner() {
-        flock -n -E 73 -o "$DATA/instance.lock" "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@"
+        exec 9>"$DATA/instance.lock"
+        flock -n -E 73 9
+        rc=$?
+        [ "$rc" -eq 0 ] || { [ "$rc" -eq 73 ] && return 0; return "$rc"; }
+        "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@"
+        rc=$?
+        exec 9>&-
+        return "$rc"
+    }
+    retry_pending() {
+        rc=$1
+        [ "$rc" -eq 0 ] || return "$rc"
+        [ -n "$LAUNCH_URI" ] || return 0
+        pending=$(python3 - "$URI_HELPER" peek "$DATA" <<'PY'
+import importlib.util,sys
+s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(m.peek(sys.argv[3]) or '')
+PY
+)
+        if [ -n "$pending" ] && [ "$pending" != "$LAUNCH_URI" ]; then
+            exec "$0" --uri "$pending"
+        fi
+        return 0
     }
     # --pid --fork --mount-proc: launchd expects to own the process tree, and without a PID
     # namespace its daemons (opendirectoryd, shellspawn) never come up.
@@ -206,11 +254,11 @@ if [ "${1:-}" != "--inside" ]; then
         fi
         export ROBLOX_MAC_UI_SOCKET=/Volumes/SystemRoot$ROBLOX_MAC_STAGE/ui.sock
         unset DISPLAY
-        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"
+        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"; rc=$?; retry_pending "$rc"; exit "$rc"
     elif [ "${1:-}" = --shell ]; then
-        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"
+        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"; rc=$?; retry_pending "$rc"; exit "$rc"
     else
-        run_inner "$ROOT/browser/roblox-gtk" unshare -Urm --pid --fork --kill-child --mount-proc "$ROOT/bin/roblox-mac" --inside "$@"
+        run_inner "$ROOT/browser/roblox-gtk" unshare -Urm --pid --fork --kill-child --mount-proc "$ROOT/bin/roblox-mac" --inside "$@"; rc=$?; retry_pending "$rc"; exit "$rc"
     fi
     exit $?
 fi
@@ -324,7 +372,22 @@ if os.environ.get('DYLD_FRAMEWORK_PATH'): args.append('DYLD_FRAMEWORK_PATH='+os.
 # Match fetch-client's production build even when account preferences select a test channel.
 client=sys.argv[2:]
 if '-channel' not in client[1:]: client[1:1]=['-channel','production']
+launch_uri=os.environ.get('ROBLOX_MAC_LAUNCH_URI')
+if launch_uri:
+    client[1:1]=['-protocolString', launch_uri]
+    args.append('MACOBLOX_PROTOCOL_STRING_PRESENT=1')
 print(shlex.join(args+client))
 PYTHON
 )
-exec darling shell bash -c "$COMMAND"
+set +e
+darling shell bash -c "$COMMAND"
+status=$?
+set -e
+if [ -n "$LAUNCH_URI" ]; then
+    python3 - "$URI_HELPER" clear "$DATA" "$LAUNCH_URI" <<'PY'
+import importlib.util,sys
+s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+m.clear_if_consumed(sys.argv[3],sys.argv[4])
+PY
+fi
+exit "$status"

@@ -57,7 +57,9 @@ uninstall_handler() {
         tmp=$MIMEAPPS.tmp.$$
         sed -e 's/roblox-mac-port\.desktop;//g' \
             -e 's/;roblox-mac-port\.desktop//g' \
-            -e 's/=roblox-mac-port\.desktop$/=/' "$MIMEAPPS" > "$tmp"
+            -e 's/=roblox-mac-port\.desktop$/=/' \
+            -e '/^x-scheme-handler\/roblox=$/d' \
+            -e '/^x-scheme-handler\/roblox-player=$/d' "$MIMEAPPS" > "$tmp"
         chmod 600 "$tmp" 2>/dev/null || true
         mv -f -- "$tmp" "$MIMEAPPS"
     fi

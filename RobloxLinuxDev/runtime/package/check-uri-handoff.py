@@ -53,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
     assert len(calls.read_text().splitlines()) == 4
     mime = config / "mimeapps.list"; mime.parent.mkdir()
     mime.write_text("[Default Applications]\nx-scheme-handler/roblox=roblox-mac-port.desktop;other.desktop;\n"
+                    "x-scheme-handler/roblox-player=roblox-mac-port.desktop;\n"
                     "x-scheme-handler/other=other.desktop;\n")
     subprocess.run([release / "install-uri-handler.sh", "uninstall"], env=env, check=True, capture_output=True)
     assert not desktop.exists() and "roblox-mac-port.desktop" not in mime.read_text()

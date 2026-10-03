@@ -36,7 +36,10 @@ SKIP = (FOUNDATION, 'System/Library/Frameworks/CoreAudio.framework', 'System/Lib
         'usr/lib/system/libsystem_m.dylib',
         # ELF wrappers are regenerated against the build host's library
         # headers; keep the Debian ones, which match what the prefix expects.
-        'usr/lib/native/')
+        'usr/lib/native/',
+        # The x86_64 O2 system_loader does not pass mldr's elfcalls table
+        # through to the guest startup path; retain Darling's stock dyld.
+        'usr/lib/dyld')
 MACHO_KINDS = ('DYLIB', 'BUNDLE', 'DYLINKER')
 
 

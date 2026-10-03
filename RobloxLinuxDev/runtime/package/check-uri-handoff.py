@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+launcher_source = (ROOT / "bin/roblox-mac").read_text()
+assert "[ -z \"$LAUNCH_URI\" ] || [ \"$pending\" != \"$LAUNCH_URI\" ]" in launcher_source
 spec = importlib.util.spec_from_file_location("uri", ROOT / "scripts/uri_handoff.py")
 uri = importlib.util.module_from_spec(spec); spec.loader.exec_module(uri)
 

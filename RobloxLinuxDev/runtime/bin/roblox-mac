@@ -220,14 +220,13 @@ if [ "${1:-}" != "--inside" ]; then
     retry_pending() {
         rc=$1
         [ "$rc" -eq 0 ] || return "$rc"
-        [ -n "$LAUNCH_URI" ] || return 0
         pending=$(python3 - "$URI_HELPER" peek "$DATA" <<'PY'
 import importlib.util,sys
 s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
 print(m.peek(sys.argv[3]) or '')
 PY
 )
-        if [ -n "$pending" ] && [ "$pending" != "$LAUNCH_URI" ]; then
+        if [ -n "$pending" ] && { [ -z "$LAUNCH_URI" ] || [ "$pending" != "$LAUNCH_URI" ]; }; then
             exec "$0" --uri "$pending"
         fi
         return 0

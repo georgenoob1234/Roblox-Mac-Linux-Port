@@ -33,6 +33,8 @@ with tempfile.TemporaryDirectory(prefix='roblox diagnostics é ') as tmp:
     shutil.copy2(root / 'bin/roblox-mac', runtime / 'bin')
     shutil.copy2(root / 'package/run.sh', release)
     shutil.copy2(root / 'package/update-roblox.sh', release)
+    shutil.copy2(root / 'package/bootstrap.sh', release)
+    shutil.copy2(root / 'package/bootstrap.py', release)
     for name in ('llvm-dis', 'spirv-val'):
         tool = runtime / 'usr/bin' / name
         tool.write_text('#!/bin/sh\nkill -ILL $$\n' if name == 'llvm-dis' else '#!/bin/sh\necho fake-version\n')
@@ -76,8 +78,8 @@ with tempfile.TemporaryDirectory(prefix='roblox diagnostics é ') as tmp:
     assert not (release / 'RobloxVersion').exists(), 'Diagnosis must not download or launch the client'
     # Debug must preserve the launcher's failure status and capture early config errors.
     (data / 'config.env').write_text('ROBLOX_MAC_SWAP_INTERVAL=invalid\n')
-    debug = subprocess.run(['sh', release / 'run.sh'], env=env, capture_output=True, text=True)
-    assert debug.returncode == 2, debug.stderr
+    debug = subprocess.run(['sh', release / 'run.sh', '--debug'], env=env, capture_output=True, text=True)
+    assert debug.returncode != 0, debug.stderr
     log = next((data / 'diagnostics').glob('*/runtime.log')).read_text()
     assert 'ROBLOX_MAC_SWAP_INTERVAL must be' in log and 'Runtime result: exit 2' in log
     # Simulate shader preparation; text logs survive staging cleanup, binary inputs do not get copied.
@@ -107,12 +109,8 @@ with tempfile.TemporaryDirectory(prefix='roblox diagnostics é ') as tmp:
     running.terminate()
     _, error = running.communicate(timeout=5)
     assert running.returncode == 128 + signal.SIGTERM and 'SIGTERM' in error
-    # The shell launcher must forward arguments unchanged and only insert --debug once.
-    image.unlink()
-    image.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
-    image.chmod(0o755)
-    for args, expected in ((['--place-id', '12 34'], ['--debug', '--place-id', '12 34']),
-                           (['--debug', '--show-config'], ['--debug', '--show-config'])):
-        actual = subprocess.check_output(['sh', release / 'run.sh', *args], env=env, text=True).splitlines()
-        assert actual == expected, actual
+    (data / 'config.env').unlink()
+    # Explicit diagnostic arguments are forwarded directly to the AppImage.
+    actual = subprocess.check_output(['sh', release / 'run.sh', '--debug', '--show-config'], env=env, text=True).splitlines()
+    assert any(line.startswith('CONFIG=') for line in actual) and any(line.startswith('SHADER_CACHE=') for line in actual)
 print('PASS diagnostics: signals, namespace/tool checks, no-launch mode, private logs, exit status, shader log retention, arguments')

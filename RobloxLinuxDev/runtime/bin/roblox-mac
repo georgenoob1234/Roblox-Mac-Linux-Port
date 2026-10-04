@@ -39,7 +39,8 @@ else
 fi
 # Before config parsing, so broken settings are captured too. Release logs must
 # survive the updater removing ROBLOX_MAC_DATA's temporary staging directory.
-LAUNCH_URI=
+# Preserve the opaque value across the namespace re-exec (--inside).
+LAUNCH_URI=${ROBLOX_MAC_LAUNCH_URI:-}
 if [ "${1:-}" = --uri ]; then
     [ "$#" -eq 2 ] || { echo 'Usage: roblox-mac --uri URI' >&2; exit 2; }
     LAUNCH_URI=$2; shift 2

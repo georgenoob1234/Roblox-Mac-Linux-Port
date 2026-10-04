@@ -30,6 +30,72 @@ with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
     assert "scheme=roblox" in result.stderr and "length=" in result.stderr
     assert not (private / "pending-uri").exists()
 
+    # Exercise the actual outer launcher and --inside re-exec. The former test
+    # stopped at the missing-client check and could not catch URI loss there.
+    runtime = folder / "runtime"
+    (runtime / "bin").mkdir(parents=True)
+    (runtime / "scripts").mkdir()
+    launcher = runtime / "bin/roblox-mac"
+    shutil.copy2(ROOT / "bin/roblox-mac", launcher)
+    for name in ("launch-settings.sh", "runtime-limits.py"):
+        shutil.copy2(ROOT / "scripts" / name, runtime / "scripts" / name)
+    app.mkdir(parents=True)
+    (app / "Contents/MacOS").mkdir(parents=True)
+    client = app / "Contents/MacOS/RobloxPlayer"
+    client.touch(); client.chmod(0o755)
+    (private / "prefix").mkdir()
+    transport_bin = folder / "transport-bin"
+    transport_bin.mkdir()
+    fakes = {
+        "unshare": """#!/bin/sh
+if [ "$1" = -Ur ]; then exit 0; fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in -*) shift;; *) break;; esac
+done
+exec "$@"
+""",
+        "mount": "#!/bin/sh\nexit 0\n",
+        "darling": """#!/usr/bin/env python3
+import os, shlex, sys
+assert sys.argv[1:4] == ['shell', 'bash', '-c']
+args = shlex.split(sys.argv[4])
+expected = os.environ['TEST_EXPECTED_URI']
+assert args.count('-protocolString') == 1
+assert os.fsencode(args[args.index('-protocolString') + 1]) == os.fsencode(expected)
+assert 'MACOBLOX_PROTOCOL_STRING_PRESENT=1' in args
+print('PASS guest command received opaque URI')
+""",
+    }
+    for name, script in fakes.items():
+        path = transport_bin / name
+        path.write_text(script); path.chmod(0o755)
+    for uri in (first, 'roblox-player:opaque+%20%2B:ticket "quotes"',
+                os.fsdecode(b'roblox://opaque/%ff\xff')):
+        transport_env = {
+            **os.environ, "PATH": str(transport_bin) + ":" + os.environ["PATH"],
+            "ROBLOX_MAC_ROOT": str(runtime), "ROBLOX_MAC_CONFIG": "/dev/null",
+            "ROBLOX_MAC_DATA": str(private), "ROBLOX_MAC_APP": str(app),
+            "ROBLOX_MAC_OPTIMIZED": "0", "ROBLOX_MAC_RENDERER": "opengl",
+            "ROBLOX_MAC_WAYLAND": "1", "TEST_EXPECTED_URI": uri,
+        }
+        transport_env.pop("APPDIR", None)
+        transport_env.pop("ROBLOX_MAC_LAUNCH_URI", None)
+        transport_env.pop("ROBLOX_MAC_LOCK_HELD", None)
+        result = subprocess.run([launcher, "--uri", uri], env=transport_env,
+                                capture_output=True)
+        assert result.returncode == 0, 'outer/inner URI handoff failed'
+        assert b'PASS guest command received opaque URI' in result.stdout
+        assert os.fsencode(uri) not in result.stdout + result.stderr
+
+    # Prove this check detects the exact regression, rather than just accepting
+    # an outer receipt event. The fake Darling never prints the supplied value.
+    launcher.write_text(launcher_source.replace('LAUNCH_URI=${ROBLOX_MAC_LAUNCH_URI:-}',
+                                               'LAUNCH_URI=', 1))
+    broken = subprocess.run([launcher, '--uri', uri], env=transport_env,
+                            capture_output=True)
+    assert broken.returncode != 0, 'test did not detect namespace URI reset'
+    assert os.fsencode(uri) not in broken.stdout + broken.stderr
+
     release = Path(temp) / "release with spaces"
     release.mkdir()
     shutil.copy2(ROOT.parent.parent / "RobloxLinuxRelease/install-uri-handler.sh", release / "install-uri-handler.sh")
@@ -58,4 +124,4 @@ with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
     assert not desktop.exists() and "roblox-mac-port.desktop" not in mime.read_text()
     assert not icon.exists()
     assert "x-scheme-handler/other=other.desktop;" in mime.read_text()
-print("PASS opaque in-memory URI transport, no pending queue, lock/notification hooks, desktop validation, installer idempotence/uninstall")
+print("PASS opaque URI transport through namespace re-exec and guest command, no pending queue, lock/notification hooks, desktop validation, installer idempotence/uninstall")

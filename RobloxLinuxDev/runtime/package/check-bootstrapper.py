@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix="roblox bootstrap ") as tmp:
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
-  --shell) mkdir -p "$HERE/DO_NOT_SHARE/prefix"; exit 0;;
+  --shell) test ! -e /proc/$$/fd/9; mkdir -p "$HERE/DO_NOT_SHARE/prefix"; exit 0;;
   --client-version) echo version-abcd; exit 0;;
   --uri) printf '%s\n' launched-with-uri > "$HERE/uri-launch"; exit 0;;
   *) printf '%s\n' launched > "$HERE/launched"; sleep "${FAKE_LAUNCH_SLEEP:-0}"; exit 0;;

@@ -48,6 +48,7 @@
 !/runtime/profiler/
 !/runtime/optimized/
 !/runtime/package/
+!/runtime/package/icon.png
 /native/*
 # These sources are shared with the native x86 runner; the ARM runner is local.
 !/native/renderer/

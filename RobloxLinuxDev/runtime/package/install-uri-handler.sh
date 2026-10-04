@@ -6,7 +6,9 @@ RUN=$HERE/run.sh
 DATA_HOME=${XDG_DATA_HOME:-${HOME:?}/.local/share}
 CONFIG_HOME=${XDG_CONFIG_HOME:-${HOME:?}/.config}
 APP_DIR=$DATA_HOME/applications
-ICON_DIR=$DATA_HOME/icons/hicolor/scalable/apps
+ICON_DIR=$DATA_HOME/icons/hicolor/256x256/apps
+ICON_SOURCE=$HERE/icon.png
+ICON_PATH=$ICON_DIR/roblox-mac-port.png
 DESKTOP=roblox-mac-port.desktop
 DESKTOP_PATH=$APP_DIR/$DESKTOP
 MIMEAPPS=$CONFIG_HOME/mimeapps.list
@@ -17,6 +19,7 @@ escape_exec() {
 }
 
 install_handler() {
+    [ -f "$ICON_SOURCE" ] || { echo "Missing icon file: $ICON_SOURCE" >&2; exit 1; }
     mkdir -p "$APP_DIR" "$ICON_DIR"
     exec_path=$(escape_exec "$RUN")
     umask 022
@@ -32,10 +35,8 @@ StartupNotify=true
 Categories=Game;
 MimeType=x-scheme-handler/roblox;x-scheme-handler/roblox-player;
 EOF
-    cat > "$ICON_DIR/roblox-mac-port.svg" <<'EOF'
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><rect width="128" height="128" rx="18" fill="#e2231a"/><path fill="#fff" d="M32 32h64v64H32zm16 16v32h32V48z"/></svg>
-EOF
-    chmod 644 "$DESKTOP_PATH" "$ICON_DIR/roblox-mac-port.svg"
+    cp "$ICON_SOURCE" "$ICON_PATH"
+    chmod 644 "$DESKTOP_PATH" "$ICON_PATH"
     if command -v xdg-mime >/dev/null 2>&1; then
         xdg-mime default "$DESKTOP" x-scheme-handler/roblox || echo 'Warning: xdg-mime could not register roblox.' >&2
         xdg-mime default "$DESKTOP" x-scheme-handler/roblox-player || echo 'Warning: xdg-mime could not register roblox-player.' >&2
@@ -52,7 +53,7 @@ EOF
 }
 
 uninstall_handler() {
-    rm -f -- "$DESKTOP_PATH" "$ICON_DIR/roblox-mac-port.svg"
+    rm -f -- "$DESKTOP_PATH" "$ICON_PATH"
     if [ -f "$MIMEAPPS" ]; then
         tmp=$MIMEAPPS.tmp.$$
         sed -e 's/roblox-mac-port\.desktop;//g' \

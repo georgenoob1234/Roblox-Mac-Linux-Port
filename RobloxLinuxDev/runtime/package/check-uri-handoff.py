@@ -9,12 +9,20 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 launcher_source = (ROOT / "bin/roblox-mac").read_text()
 bootstrap_source = (ROOT / "package/bootstrap.sh").read_text()
+installer_source = (ROOT / "package/install-uri-handler.sh").read_text()
+release_builder_source = (ROOT / "package/build-release.sh").read_text()
+package_icon = ROOT / "package/icon.png"
+release_icon = ROOT.parent.parent / "RobloxLinuxRelease/icon.png"
 assert "roblox URI received: scheme=%s length=%s" in launcher_source
 assert "pending-uri" not in launcher_source and "retry_pending" not in launcher_source
 assert "flock -n -E 73 9" in launcher_source
 assert "flock -n -E 73 9" in bootstrap_source
 assert "notify-send" in bootstrap_source and "gdbus" in bootstrap_source
 assert "ROBLOX_MAC_LAUNCH_URI" in launcher_source
+assert 'ICON_SOURCE=$HERE/icon.png' in installer_source
+assert 'ICON_PATH=$ICON_DIR/roblox-mac-port.png' in installer_source
+assert 'cp "$HERE/icon.png" "$stage/icon.png"' in release_builder_source
+assert package_icon.read_bytes() == release_icon.read_bytes()
 
 with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
     folder = Path(temp)
@@ -98,8 +106,8 @@ print('PASS guest command received opaque URI')
 
     release = Path(temp) / "release with spaces"
     release.mkdir()
-    shutil.copy2(ROOT.parent.parent / "RobloxLinuxRelease/install-uri-handler.sh", release / "install-uri-handler.sh")
-    shutil.copy2(ROOT.parent.parent / "RobloxLinuxRelease/icon.png", release / "icon.png")
+    shutil.copy2(ROOT / "package/install-uri-handler.sh", release / "install-uri-handler.sh")
+    shutil.copy2(package_icon, release / "icon.png")
     (release / "run.sh").write_text("#!/bin/sh\nexit 0\n"); (release / "run.sh").chmod(0o755)
     data = folder / "data"; config = folder / "config"; fakebin = folder / "bin"
     fakebin.mkdir(); calls = folder / "xdg-mime.calls"

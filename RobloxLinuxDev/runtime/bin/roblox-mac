@@ -74,6 +74,7 @@ export ROBLOX_MAC_SWAP_INTERVAL=${ROBLOX_MAC_SWAP_INTERVAL:-0}
 export TRACKA_NATIVE_MEMORY=${TRACKA_NATIVE_MEMORY:-1}
 case "$ROBLOX_MAC_SWAP_INTERVAL" in ''|0|1) ;; *) echo 'ROBLOX_MAC_SWAP_INTERVAL must be 0 or 1' >&2; exit 2;; esac
 export ROBLOX_MAC_RENDERER=${ROBLOX_MAC_RENDERER:-metal}
+LOCK_HELD=${ROBLOX_MAC_LOCK_HELD:-0}
 OPTIMIZED=${ROBLOX_MAC_OPTIMIZED:-1}
 case "${1:-}:${2:-}" in --shell:*|--inside:--shell) OPTIMIZED=0;; esac
 if [ "$OPTIMIZED" = 1 ] && [ -f "$ROOT/optimized/ready" ]; then
@@ -186,6 +187,9 @@ fi
 
 # --- outside the namespace ------------------------------------------------------------------
 if [ "${1:-}" != "--inside" ]; then
+    # This is a host-launcher control flag. Do not expose it to Darling or the
+    # guest client after the outer lock decision has been made.
+    unset ROBLOX_MAC_LOCK_HELD
     command -v unshare >/dev/null || { echo "roblox-mac: needs util-linux's unshare" >&2; exit 1; }
     unshare -Ur true 2>/dev/null || {
         echo "roblox-mac: unprivileged user namespaces are disabled on this system." >&2
@@ -201,7 +205,7 @@ if [ "${1:-}" != "--inside" ]; then
     trap 'rm -rf -- "$ROBLOX_MAC_STAGE"' EXIT
     # --kill-child below also tears down the guest namespace if its supervisor dies.
     run_inner() {
-        if [ "${ROBLOX_MAC_LOCK_HELD:-0}" != 1 ]; then
+        if [ "$LOCK_HELD" != 1 ]; then
             exec 9>"$DATA/instance.lock"
             if ! flock -n -E 73 9; then
                 echo 'roblox-mac: Roblox is already running.' >&2

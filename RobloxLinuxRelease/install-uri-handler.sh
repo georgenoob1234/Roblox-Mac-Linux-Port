@@ -9,8 +9,12 @@ APP_DIR=$DATA_HOME/applications
 ICON_DIR=$DATA_HOME/icons/hicolor/256x256/apps
 ICON_SOURCE=$HERE/icon.png
 ICON_PATH=$ICON_DIR/roblox-mac-port.png
+SETTINGS_ICON_SOURCE=$HERE/icon_bw.png
+SETTINGS_ICON_PATH=$ICON_DIR/roblox-mac-port-settings.png
 DESKTOP=roblox-mac-port.desktop
 DESKTOP_PATH=$APP_DIR/$DESKTOP
+SETTINGS_DESKTOP=roblox-mac-port-settings.desktop
+SETTINGS_DESKTOP_PATH=$APP_DIR/$SETTINGS_DESKTOP
 MIMEAPPS=$CONFIG_HOME/mimeapps.list
 
 escape_exec() {
@@ -20,6 +24,7 @@ escape_exec() {
 
 install_handler() {
     [ -f "$ICON_SOURCE" ] || { echo "Missing icon file: $ICON_SOURCE" >&2; exit 1; }
+    [ -f "$SETTINGS_ICON_SOURCE" ] || { echo "Missing icon file: $SETTINGS_ICON_SOURCE" >&2; exit 1; }
     mkdir -p "$APP_DIR" "$ICON_DIR"
     exec_path=$(escape_exec "$RUN")
     umask 022
@@ -36,7 +41,19 @@ Categories=Game;
 MimeType=x-scheme-handler/roblox;x-scheme-handler/roblox-player;
 EOF
     cp "$ICON_SOURCE" "$ICON_PATH"
-    chmod 644 "$DESKTOP_PATH" "$ICON_PATH"
+    cat > "$SETTINGS_DESKTOP_PATH" <<EOF
+[Desktop Entry]
+Name=Roblox Settings
+Comment=Configure Roblox updates
+Type=Application
+Exec=$exec_path --settings
+Icon=roblox-mac-port-settings
+Terminal=false
+StartupNotify=true
+Categories=Game;
+EOF
+    cp "$SETTINGS_ICON_SOURCE" "$SETTINGS_ICON_PATH"
+    chmod 644 "$DESKTOP_PATH" "$ICON_PATH" "$SETTINGS_DESKTOP_PATH" "$SETTINGS_ICON_PATH"
     if command -v xdg-mime >/dev/null 2>&1; then
         xdg-mime default "$DESKTOP" x-scheme-handler/roblox || echo 'Warning: xdg-mime could not register roblox.' >&2
         xdg-mime default "$DESKTOP" x-scheme-handler/roblox-player || echo 'Warning: xdg-mime could not register roblox-player.' >&2
@@ -48,12 +65,12 @@ EOF
     else
         echo 'Note: update-desktop-database is unavailable; the menu may refresh later.' >&2
     fi
-    echo "Installed $DESKTOP_PATH"
+    echo "Installed $DESKTOP_PATH and $SETTINGS_DESKTOP_PATH"
     echo 'Verify with: xdg-mime query default x-scheme-handler/roblox'
 }
 
 uninstall_handler() {
-    rm -f -- "$DESKTOP_PATH" "$ICON_PATH"
+    rm -f -- "$DESKTOP_PATH" "$ICON_PATH" "$SETTINGS_DESKTOP_PATH" "$SETTINGS_ICON_PATH"
     if [ -f "$MIMEAPPS" ]; then
         tmp=$MIMEAPPS.tmp.$$
         sed -e 's/roblox-mac-port\.desktop;//g' \
@@ -67,7 +84,7 @@ uninstall_handler() {
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
     fi
-    echo "Removed $DESKTOP_PATH and its own MIME entries"
+    echo "Removed $DESKTOP_PATH, $SETTINGS_DESKTOP_PATH and its own MIME entries"
 }
 
 case "${1:-install}" in

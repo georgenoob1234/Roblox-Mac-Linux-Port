@@ -80,7 +80,7 @@ first_run() {
     say 'Setting up Roblox for the first time; this may take a minute.'
     # The warm-up does not own the instance lock. Close FD 9 before exec so a
     # Darling/AppImage child cannot strand the lock if timeout has to kill it.
-    if ! timeout --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
+    if ! timeout --foreground --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
         'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true; then
         say 'First-run setup failed or timed out; the client was not launched.'
         notify 'Roblox first-run setup failed; the client was not launched.' 'Roblox setup failed'
@@ -114,7 +114,7 @@ check_latest() {
 do_update() {
     event downloading 40 'Downloading Roblox'
     # The bootstrapper keeps FD 9; updater children must not inherit it.
-    if ! timeout --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
+    if ! timeout --foreground --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
         'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/update-roblox.sh"; then
         say 'Update failed or timed out; the installed client was kept.'
         notify 'Roblox update failed; the installed client was kept.' 'Roblox update failed'

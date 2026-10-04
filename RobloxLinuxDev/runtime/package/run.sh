@@ -23,6 +23,11 @@ esac
 if [ -n "$URI" ]; then
     export ROBLOX_MAC_LAUNCH_URI=$URI ROBLOX_MAC_URI_RECEIVED_AT=$(date +%s)
 fi
+if [ "${1:-}" = --settings ]; then
+    [ -z "$URI" ] && [ "$#" -eq 1 ] || { echo 'Usage: run.sh --settings' >&2; exit 2; }
+    exec "$TARGET_APPIMAGE" --bootstrapper-ui --settings "$HERE"
+fi
+export ROBLOX_MAC_UI_APP=$TARGET_APPIMAGE
 case "${1:-}" in
     --diagnose|--debug|--client-version|--download-client|--prepare-shaders|--shell|--inside)
         exec "$HERE/RobloxLinux.AppImage" "$@";;

@@ -57,7 +57,12 @@ RUNTIME=$HERE/tools/uruntime-x86_64
 mkdir -p "$HERE/tmp"
 export TMPDIR="$HERE/tmp"
 
+# The bootstrapper UI is a small GTK3 front end over bootstrap.sh. It shares
+# the host's already-bundled GTK3 stack and is kept out of the game process.
+sh "$HERE/build-ui.sh"
+
 rm -rf "$APPDIR"; mkdir -p "$APPDIR/usr/bin"
+cp "$HERE/bootstrapper-ui" "$APPDIR/usr/bin/roblox-bootstrapper-ui"
 mkdir -p "$APPDIR/usr/share/licenses/roblox-mac"
 cp "$ROOT/profiler/vendor/imgui-1.91.9b/LICENSE.txt" "$APPDIR/usr/share/licenses/roblox-mac/Dear-ImGui.txt"
 cp "$TOP/THIRD_PARTY.md" "$APPDIR/usr/share/licenses/roblox-mac/"

@@ -10,12 +10,43 @@ HELPER=$HERE/bootstrap.py
 MARKER=$DATA/first-run.initialized
 URI_MAX_AGE=${ROBLOX_MAC_URI_MAX_AGE:-600}
 EVENTS=${ROBLOX_MAC_EVENTS:-0}
+UI_APP=${ROBLOX_MAC_UI_APP:-}
+UI_FD=0
+UI_PID=
+UI_FIFO=
 
 say() { echo "roblox: $*" >&2; }
 event() {
+    payload=$(python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+print(json.dumps({"phase": sys.argv[1], "percent": int(sys.argv[2]), "message": sys.argv[3]}, separators=(",", ":")))
+PY
+    )
     if [ "$EVENTS" = 1 ]; then
-        python3 "$HELPER" event "$1" "$2" "$3"
+        printf '%s\n' "$payload"
     fi
+    if [ "$UI_FD" = 1 ]; then printf '%s\n' "$payload" >&8 2>/dev/null || true; fi
+}
+start_progress() {
+    [ -n "$UI_APP" ] || return 0
+    UI_FIFO=$DATA/.bootstrap-progress.$$
+    rm -f -- "$UI_FIFO"
+    mkfifo "$UI_FIFO" 2>/dev/null || { UI_FIFO=; return 0; }
+    # Read/write keeps startup non-blocking even when GTK is unavailable.
+    exec 8<>"$UI_FIFO"
+    "$UI_APP" --bootstrapper-ui --progress 8>&- <"$UI_FIFO" >/dev/null 2>&1 & UI_PID=$!
+    rm -f -- "$UI_FIFO"
+    UI_FD=1
+}
+finish_progress() {
+    [ "$UI_FD" = 1 ] || return 0
+    exec 8>&- 2>/dev/null || true
+    exec 8<&- 2>/dev/null || true
+    if [ -n "$UI_PID" ]; then
+        wait "$UI_PID" 2>/dev/null; ui_result=$?
+        [ "$ui_result" -eq 0 ] || notify 'Bootstrapper UI unavailable; launching without updating.' 'Roblox'
+    fi
+    UI_FD=0; UI_PID=; UI_FIFO=
 }
 notify() {
     title=${2:-Roblox}
@@ -56,6 +87,15 @@ launch() {
 ask_update() {
     latest=$1
     installed=$2
+    if [ -n "$UI_APP" ]; then
+        choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" >/dev/null 2>&1; printf '%s' "$?" )
+        case "$choice" in
+            0) return 0;;
+            2) settings_set skipped_version "$latest" >/dev/null 2>&1 || true;;
+        esac
+        if [ "$choice" -gt 2 ] 2>/dev/null; then notify 'Update prompt failed; launching without updating.' 'Roblox update'; fi
+        return 1
+    fi
     if [ -t 0 ] && [ -t 1 ]; then
         say "Roblox $latest is available (installed: ${installed:-none})."
         say 'Choose: 1) Update now  2) Launch without updating [2 in 30s]'
@@ -142,21 +182,25 @@ case "$command" in
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
-        first_run || exit 1
+        start_progress
+        first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest)
-        printf '%s\n' "$latest"; exit 0;;
+        finish_progress
+        exec 9>&-
+        status_json; exit 0;;
     update)
         EVENTS=1
         mkdir -p "$DATA"; exec 9>"$DATA/instance.lock"
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
-        first_run || exit 1
+        start_progress
+        first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest)
         [ -n "$latest" ] || { say 'No latest version is known; update check failed.'; exit 1; }
-        do_update; exit $?;;
+        do_update; result=$?; finish_progress; exit "$result";;
     launch)
         :;;
     *)
@@ -170,7 +214,8 @@ if ! flock -n -E 73 9; then
     notify 'Roblox is already running.' 'Roblox is already running'
     exit 0
 fi
-first_run || exit 1
+start_progress
+first_run || { finish_progress; exit 1; }
 installed=$(installed_version)
 event checking 25 'Checking for updates'
 latest=$(check_latest)
@@ -191,4 +236,5 @@ if [ -n "${ROBLOX_MAC_URI_RECEIVED_AT:-}" ] && [ -n "${ROBLOX_MAC_LAUNCH_URI:-}"
     fi
 fi
 event launching 100 'Launching Roblox'
+finish_progress
 launch "$@"

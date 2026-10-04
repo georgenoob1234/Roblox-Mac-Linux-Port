@@ -16,6 +16,8 @@ with tempfile.TemporaryDirectory(prefix="roblox bootstrap ") as tmp:
     private.mkdir()
     shutil.copy2(ROOT / "package/bootstrap.sh", release / "bootstrap.sh")
     shutil.copy2(ROOT / "package/bootstrap.py", release / "bootstrap.py")
+    (release / "run.sh").write_text("#!/bin/sh\nexec \"$(dirname -- \"$0\")/RobloxLinux.AppImage\" \"$@\"\n")
+    (release / "run.sh").chmod(0o755)
     (release / "RobloxVersion").mkdir()
     (release / "RobloxVersion/.version").write_text("version-old\n")
     (release / "RobloxLinux.AppImage").write_text("""#!/bin/sh

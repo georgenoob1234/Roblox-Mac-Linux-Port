@@ -81,7 +81,7 @@ first_run() {
     # The warm-up does not own the instance lock. Close FD 9 before exec so a
     # Darling/AppImage child cannot strand the lock if timeout has to kill it.
     if ! timeout --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
-        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 "$APP" --shell true; then
+        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true; then
         say 'First-run setup failed or timed out; the client was not launched.'
         notify 'Roblox first-run setup failed; the client was not launched.' 'Roblox setup failed'
         return 1

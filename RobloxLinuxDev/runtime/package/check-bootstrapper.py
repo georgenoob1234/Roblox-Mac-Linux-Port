@@ -75,12 +75,23 @@ printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
     assert '"phase":"first-run"' not in failed.stdout
 
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "off", "check_interval_hours": 24}))
+    notify_bin = Path(tmp) / "notify-bin"
+    notify_bin.mkdir()
+    calls = Path(tmp) / "notification.calls"
+    for name, status in (("gdbus", 1), ("notify-send", 1), ("kdialog", 1), ("zenity", 0)):
+        script = notify_bin / name
+        script.write_text(f"#!/bin/sh\necho {name} >> '{calls}'\nexit {status}\n")
+        script.chmod(0o755)
     running = subprocess.Popen([bootstrap], env={**env, "FAKE_LAUNCH_SLEEP": "2"},
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     time.sleep(.3)
-    second = subprocess.run([bootstrap], env={**env, "ROBLOX_MAC_LAUNCH_URI": uri},
+    second = subprocess.run([bootstrap], env={**env, "PATH": str(notify_bin) + ":" + env["PATH"],
+                                                "DBUS_SESSION_BUS_ADDRESS": "unix:fake",
+                                                "ROBLOX_MAC_LAUNCH_URI": uri},
                             capture_output=True, text=True)
     running.wait(timeout=5)
     assert second.returncode == 0 and "already running" in second.stderr
     assert uri not in second.stdout and uri not in second.stderr
+    assert calls.read_text().splitlines()[:4] == ["gdbus", "notify-send", "kdialog", "zenity"]
+    assert uri not in calls.read_text()
 print("PASS bootstrap settings/defaults/fake-clock scheduling, first-run marker, decision flow, rollback and one-lock launch")

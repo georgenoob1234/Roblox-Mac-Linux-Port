@@ -18,6 +18,8 @@ RobloxLinuxRelease/
 ├── RobloxVersion/     (created by update-roblox.sh)
 ├── update-roblox.sh
 ├── run.sh             (terminal launch with diagnostic logs)
+├── bootstrap.sh       (first-run, lock and update orchestration)
+├── bootstrap.py       (settings/status JSON helper)
 ├── install-uri-handler.sh (optional browser protocol registration)
 ├── icon.png           (icon installed for the browser protocol handler)
 ├── FFlags.json
@@ -46,14 +48,31 @@ xdg-mime query default x-scheme-handler/roblox
 ```
 
 The handler passes the complete `roblox://` or `roblox-player:` URI as one
-opaque argument. A second click while Roblox is starting or running replaces
-the pending link and is retried after the current client exits. If the client
-has not been downloaded yet, the link remains pending; run
-`sh update-roblox.sh` and launch again. Remove the registration with
-`sh install-uri-handler.sh uninstall`.
+opaque argument. If Roblox is already running, the second launch sends a
+desktop notification and exits; it never queues or writes the URI. Remove the
+registration with `sh install-uri-handler.sh uninstall`.
 
-Wait for the update to finish successfully before launching. On later launches,
-just run `sh run.sh`. Keep the generated **RobloxVersion** beside the AppImage.
+The first `sh run.sh` performs a separate `--shell true` warm-up when
+`DO_NOT_SHARE/first-run.initialized` is absent, waits for its exit status, and
+only then launches the client. On failure or timeout it stops before a known
+blank-window launch. Keep the generated **RobloxVersion** beside the AppImage.
+
+The headless interface is:
+
+```sh
+sh run.sh status
+sh run.sh check
+sh run.sh update                 # newline-delimited JSON progress
+sh run.sh get auto_update
+sh run.sh set auto_update auto|ask|off
+sh run.sh set check_interval_hours 24
+```
+
+`DO_NOT_SHARE/bootstrapper.json` stores the update mode (`ask` by default),
+check interval (24 hours by default), skipped version, last check and last
+known latest. Network checks have a short timeout and never prevent a launch;
+`0` checks every launch. Exit codes are `0` for success or a dropped second
+launch, `1` for setup/update/check failure, and `2` for invalid input.
 Use the scripts on systems with AppImageLauncher. They prevent it from moving
 the AppImage away from its client and keep temporary files in this release folder.
 Older releases could fail before Roblox started with `//DO_NOT_SHARE` permission

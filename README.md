@@ -26,12 +26,10 @@ Open a terminal in the extracted `RobloxLinuxRelease` folder, then run:
 
 ```sh
 chmod +x RobloxLinux.AppImage
-sh update-roblox.sh
 sh run.sh
 ```
 
-The update step downloads the official client and prepares its shaders; wait for it
-to finish successfully before launching. On later launches, just run `sh run.sh`.
+The first `sh run.sh` performs a separate `--shell true` warm-up, records a private marker only after it succeeds, and then starts the client. A failure or timeout stops before the client is launched. An explicit `sh update-roblox.sh` remains available; later launches use a bounded, scheduled update check.
 Keep `RobloxVersion` beside the AppImage. Use the scripts on systems with
 AppImageLauncher: they prevent relocation and keep temporary paths in the release
 folder, avoiding `//DO_NOT_SHARE` permission errors before Roblox starts.
@@ -51,6 +49,19 @@ details. Never upload the entire `DO_NOT_SHARE` folder.
 Close Roblox and run `sh update-roblox.sh` from the release folder to update the official LIVE client. Updates require curl and unzip. They replace only `RobloxVersion`, preserving your login and settings. Roblox can independently expire or revoke a session. Replace the AppImage with a new release to update the compatibility runtime.
 
 Edit `FFlags.json` to set flag overrides. It is applied on each launch; only flags supported by Roblox take effect.
+
+The launcher has a headless interface:
+
+```sh
+sh run.sh status
+sh run.sh check
+sh run.sh update                 # newline-delimited JSON progress
+sh run.sh get auto_update
+sh run.sh set auto_update auto|ask|off
+sh run.sh set check_interval_hours 24
+```
+
+Settings live in `DO_NOT_SHARE/bootstrapper.json`; defaults are `ask` and a 24-hour check interval, with `0` checking every launch. Exit status `0` means success (including a dropped second launch), `1` means setup/update/check failure, and `2` means invalid arguments or settings. Browser links are passed as opaque in-memory arguments; a launch received while Roblox is running sends a notification and exits without queueing.
 
 ## Private data
 

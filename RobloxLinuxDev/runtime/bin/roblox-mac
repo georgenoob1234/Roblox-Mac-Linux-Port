@@ -96,22 +96,15 @@ if [ "${RELEASE:-0}" = 1 ]; then
     mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 fi
 export ROBLOX_MAC_DATA=$DATA
-URI_HELPER=$ROOT/scripts/uri_handoff.py
 if [ -n "$LAUNCH_URI" ]; then
-    meta=$(python3 - "$URI_HELPER" receive "$DATA" "$LAUNCH_URI" <<'PY'
-import importlib.util,sys
-s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-print('%s %d' % m.receive(sys.argv[3],sys.argv[4]))
+    meta=$(python3 - "$LAUNCH_URI" <<'PY'
+import os,sys
+value=os.fsencode(sys.argv[1])
+print(value.split(b':', 1)[0].decode('ascii', 'replace'), len(value))
 PY
     )
     printf 'roblox URI received: scheme=%s length=%s\n' $meta >&2
 fi
-LAUNCH_URI=$(python3 - "$URI_HELPER" peek "$DATA" <<'PY'
-import importlib.util,sys
-s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-print(m.peek(sys.argv[3]) or '')
-PY
-)
 if [ "${1:-}" = --download-client ]; then
     ROBLOX_MAC_DATA=$DATA exec "$ROOT/scripts/fetch-client.sh"
 fi
@@ -208,28 +201,18 @@ if [ "${1:-}" != "--inside" ]; then
     trap 'rm -rf -- "$ROBLOX_MAC_STAGE"' EXIT
     # --kill-child below also tears down the guest namespace if its supervisor dies.
     run_inner() {
-        exec 9>"$DATA/instance.lock"
-        flock -n -E 73 9
-        rc=$?
-        [ "$rc" -eq 0 ] || { [ "$rc" -eq 73 ] && return 0; return "$rc"; }
-        "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@"
-        rc=$?
-        exec 9>&-
-        return "$rc"
-    }
-    retry_pending() {
-        rc=$1
-        [ "$rc" -eq 0 ] || return "$rc"
-        pending=$(python3 - "$URI_HELPER" peek "$DATA" <<'PY'
-import importlib.util,sys
-s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-print(m.peek(sys.argv[3]) or '')
-PY
-)
-        if [ -n "$pending" ] && { [ -z "$LAUNCH_URI" ] || [ "$pending" != "$LAUNCH_URI" ]; }; then
-            exec "$0" --uri "$pending"
+        if [ "${ROBLOX_MAC_LOCK_HELD:-0}" != 1 ]; then
+            exec 9>"$DATA/instance.lock"
+            if ! flock -n -E 73 9; then
+                echo 'roblox-mac: Roblox is already running.' >&2
+                if [ "${ROBLOX_MAC_NO_TERMINAL:-0}" = 1 ] && command -v notify-send >/dev/null 2>&1; then
+                    notify-send --app-name=Roblox 'Roblox is already running' 'Roblox is already running.' >/dev/null 2>&1 || true
+                fi
+                return 0
+            fi
         fi
-        return 0
+        "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@"
+        return $?
     }
     # --pid --fork --mount-proc: launchd expects to own the process tree, and without a PID
     # namespace its daemons (opendirectoryd, shellspawn) never come up.
@@ -253,11 +236,11 @@ PY
         fi
         export ROBLOX_MAC_UI_SOCKET=/Volumes/SystemRoot$ROBLOX_MAC_STAGE/ui.sock
         unset DISPLAY
-        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"; rc=$?; retry_pending "$rc"; exit "$rc"
+        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"; exit $?
     elif [ "${1:-}" = --shell ]; then
-        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"; rc=$?; retry_pending "$rc"; exit "$rc"
+        run_inner unshare -Urm --pid --fork --kill-child --mount-proc "$0" --inside "$@"; exit $?
     else
-        run_inner "$ROOT/browser/roblox-gtk" unshare -Urm --pid --fork --kill-child --mount-proc "$ROOT/bin/roblox-mac" --inside "$@"; rc=$?; retry_pending "$rc"; exit "$rc"
+        run_inner "$ROOT/browser/roblox-gtk" unshare -Urm --pid --fork --kill-child --mount-proc "$ROOT/bin/roblox-mac" --inside "$@"; exit $?
     fi
     exit $?
 fi
@@ -382,11 +365,4 @@ set +e
 darling shell bash -c "$COMMAND"
 status=$?
 set -e
-if [ -n "$LAUNCH_URI" ]; then
-    python3 - "$URI_HELPER" clear "$DATA" "$LAUNCH_URI" <<'PY'
-import importlib.util,sys
-s=importlib.util.spec_from_file_location('uri',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-m.clear_if_consumed(sys.argv[3],sys.argv[4])
-PY
-fi
 exit "$status"

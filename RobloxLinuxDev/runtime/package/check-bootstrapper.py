@@ -59,6 +59,27 @@ printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
     assert (release / "launched").read_text().strip() == "launched"
     assert "Setting up Roblox for the first time" in first.stderr
 
+    checked = json.loads(subprocess.check_output([bootstrap, "check"], env=env, text=True))
+    assert checked["latest_known"] == "version-abcd" and "settings" in checked
+
+    # The UI is only a decision/progress front end. A fake helper proves the
+    # core applies Skip this version and keeps the opaque URI out of output.
+    fake_ui = Path(tmp) / "fake-ui"
+    fake_ui.write_text("""#!/bin/sh
+case "${2:-}" in
+  --progress) cat >/dev/null; exit 0;;
+  --dialog) exit 2;;
+esac
+exit 3
+""")
+    fake_ui.chmod(0o755)
+    subprocess.run([bootstrap, "set", "auto_update", "ask"], env=env, check=True)
+    (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "ask", "check_interval_hours": 0}))
+    skipped = subprocess.run([bootstrap], env={**env, "ROBLOX_MAC_UI_APP": str(fake_ui)},
+                             capture_output=True, text=True, check=True)
+    assert json.loads((private / "bootstrapper.json").read_text())["skipped_version"] == "version-abcd"
+    assert "version-abcd" not in skipped.stdout
+
     subprocess.run([bootstrap, "set", "auto_update", "auto"], env=env, check=True)
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "auto", "check_interval_hours": 0}))
     uri = "roblox://place/+%2B:opaque"

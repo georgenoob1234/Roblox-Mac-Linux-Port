@@ -57,12 +57,20 @@ The launcher has a headless interface:
 sh run.sh status
 sh run.sh check
 sh run.sh update                 # newline-delimited JSON progress
+sh run.sh --settings             # open the update settings window
 sh run.sh get auto_update
 sh run.sh set auto_update auto    # choices: auto, ask, off
 sh run.sh set check_interval_hours 24
 ```
 
 Settings live in `DO_NOT_SHARE/bootstrapper.json`; defaults are `ask` and a 24-hour check interval, with `0` checking every launch. Exit status `0` means success (including a dropped second launch), `1` means setup/update/check failure, and `2` means invalid arguments or settings. Browser links are passed as opaque in-memory arguments; a launch received while Roblox is running sends a notification and exits without queueing.
+
+Normal launches and browser links use the bundled GTK3 bootstrapper window when a
+first-run setup or update has work to show. Ask mode offers Update now, Launch
+without updating, and Skip this version; a short timeout safely launches without
+updating. `sh run.sh --settings` opens the same release's settings without taking
+the Roblox instance lock. If a display or GTK is unavailable, the launcher
+notifies when possible and continues without updating.
 
 ## Private data
 

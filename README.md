@@ -26,6 +26,7 @@ Open a terminal in the extracted `RobloxLinuxRelease` folder, then run:
 
 ```sh
 chmod +x RobloxLinux.AppImage
+sh update-roblox.sh
 sh run.sh
 ```
 
@@ -57,7 +58,7 @@ sh run.sh status
 sh run.sh check
 sh run.sh update                 # newline-delimited JSON progress
 sh run.sh get auto_update
-sh run.sh set auto_update auto|ask|off
+sh run.sh set auto_update auto    # choices: auto, ask, off
 sh run.sh set check_interval_hours 24
 ```
 

@@ -18,6 +18,8 @@ RobloxLinuxRelease/
 ├── RobloxVersion/     (created by update-roblox.sh)
 ├── update-roblox.sh
 ├── run.sh             (terminal launch with diagnostic logs)
+├── bootstrap.sh       (first-run, lock and update orchestration)
+├── bootstrap.py       (settings/status JSON helper)
 ├── FFlags.json
 ├── README.md
 ├── .gitignore
@@ -35,21 +37,7 @@ sh update-roblox.sh
 sh run.sh
 ```
 
-Wait for the update to finish successfully before launching. On later launches,
-just run `sh run.sh`. Keep the generated **RobloxVersion** beside the AppImage.
-Use the scripts on systems with AppImageLauncher. They prevent it from moving
-the AppImage away from its client and keep temporary files in this release folder.
-Older releases could fail before Roblox started with `//DO_NOT_SHARE` permission
-errors and Qt plugin warnings; replace the AppImage, `run.sh` and updater together.
-Linux needs x86_64, glibc 2.39 or newer (the Ubuntu 24.04 baseline), a Wayland
-desktop, compatible Vulkan drivers, Python 3, util-linux and unprivileged user
-namespaces. X11-only sessions, other CPU architectures and musl-based systems are
-not supported. The updater also requires curl and unzip.
-FUSE is optional.
-The native UI and media libraries are built or packaged in Ubuntu 24.04. Release
-checks reject bundled ELF files requiring AVX-512 or glibc newer than 2.39 and
-test native UI loading on the baseline. The host still supplies glibc, Wayland/XCB libraries and GPU
-drivers; full gameplay compatibility on every system is not guaranteed.
+The first launch runs a separate `--shell true` warm-up and records `DO_NOT_SHARE/first-run.initialized` only after it succeeds. The bootstrapper then checks for updates at most once per configured interval and preserves the installed client when staging or shader preparation fails.
 
 For troubleshooting, run `sh run.sh`.
 For a system check without launching Roblox, run `sh run.sh --diagnose`

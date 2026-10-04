@@ -11,9 +11,21 @@ export APPIMAGELAUNCHER_DISABLE=1 _FORCE_HEADLESS=1
 export TARGET_APPIMAGE=$HERE/RobloxLinux.AppImage
 unset APPIMAGE_TARGET_DIR
 export TMPDIR=$HERE/DO_NOT_SHARE/tmp TMP=$HERE/DO_NOT_SHARE/tmp TEMP=$HERE/DO_NOT_SHARE/tmp
+# Capture the session bus before the runtime redirects HOME/XDG_* inside its private prefix.
+export ROBLOX_MAC_NOTIFY_DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}
+export ROBLOX_MAC_NOTIFY_XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}
+export ROBLOX_MAC_NOTIFY_HOME=${HOME:-}
+URI=
 case "${1:-}" in
-    --uri) [ "$#" -eq 2 ] || { echo 'Usage: run.sh --uri URI' >&2; exit 2; }; exec "$HERE/RobloxLinux.AppImage" --uri "$2";;
-    roblox://*|roblox-player:*) [ "$#" -eq 1 ] || { echo 'Usage: run.sh URI' >&2; exit 2; }; exec "$HERE/RobloxLinux.AppImage" "$1";;
-    --diagnose|--debug|--client-version|--download-client) exec "$HERE/RobloxLinux.AppImage" "$@";;
-    *) exec "$HERE/RobloxLinux.AppImage" --debug "$@";;
+    --uri) [ "$#" -eq 2 ] || { echo 'Usage: run.sh --uri URI' >&2; exit 2; }; URI=$2; shift 2;;
+    roblox://*|roblox-player:*) [ "$#" -eq 1 ] || { echo 'Usage: run.sh URI' >&2; exit 2; }; URI=$1; shift;;
 esac
+if [ -n "$URI" ]; then
+    export ROBLOX_MAC_LAUNCH_URI=$URI ROBLOX_MAC_URI_RECEIVED_AT=$(date +%s)
+fi
+case "${1:-}" in
+    --diagnose|--debug|--client-version|--download-client|--prepare-shaders|--shell|--inside)
+        exec "$HERE/RobloxLinux.AppImage" "$@";;
+esac
+[ -t 2 ] || export ROBLOX_MAC_NO_TERMINAL=1
+exec "$HERE/bootstrap.sh" "$@"

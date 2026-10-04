@@ -9,6 +9,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 launcher_source = (ROOT / "bin/roblox-mac").read_text()
 bootstrap_source = (ROOT / "package/bootstrap.sh").read_text()
+run_source = (ROOT / "package/run.sh").read_text()
 installer_source = (ROOT / "package/install-uri-handler.sh").read_text()
 release_builder_source = (ROOT / "package/build-release.sh").read_text()
 package_icon = ROOT / "package/icon.png"
@@ -21,6 +22,7 @@ assert "flock -n -E 73 9" in launcher_source
 assert "flock -n -E 73 9" in bootstrap_source
 assert "notify-send" in bootstrap_source and "gdbus" in bootstrap_source
 assert "ROBLOX_MAC_LAUNCH_URI" in launcher_source
+assert 'exec "$TARGET_APPIMAGE" --bootstrapper-ui --settings "$HERE"' in run_source
 assert 'ICON_SOURCE=$HERE/icon.png' in installer_source
 assert 'ICON_PATH=$ICON_DIR/roblox-mac-port.png' in installer_source
 assert 'SETTINGS_ICON_SOURCE=$HERE/icon_bw.png' in installer_source

@@ -54,14 +54,20 @@ typedef struct {
 
 typedef struct { GtkWidget *window; int result; } DialogState;
 
-static gboolean spawn_sync(char **argv, char **out, int *status) {
-    GError *error = NULL;
+static gchar **host_environment(void) {
     gchar **environment = g_get_environ();
     const char *paths[] = {"LD_LIBRARY_PATH", "GIO_MODULE_DIR", "GDK_PIXBUF_MODULE_FILE",
         "GSETTINGS_SCHEMA_DIR", "WEBKIT_INJECTED_BUNDLE_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
-        "GST_PLUGIN_PATH_1_0", "GST_PLUGIN_SCANNER_1_0", NULL};
+        "GST_PLUGIN_PATH_1_0", "GST_PLUGIN_SCANNER_1_0", "APPDIR", "APPIMAGE",
+        "APPIMAGE_EXTRACT_AND_RUN", "APPIMAGE_COMMAND", "APPIMAGE_SILENT_INSTALL", NULL};
     for (const char **path = paths; *path; ++path)
         environment = g_environ_unsetenv(environment, *path);
+    return environment;
+}
+
+static gboolean spawn_sync(char **argv, char **out, int *status) {
+    GError *error = NULL;
+    gchar **environment = host_environment();
     gboolean ok = g_spawn_sync(NULL, argv, environment, G_SPAWN_SEARCH_PATH,
                                NULL, NULL, out, NULL, status, &error);
     g_strfreev(environment);
@@ -191,7 +197,7 @@ static void settings_check(GtkButton *button, gpointer data) { LauncherState *st
 static void settings_update(GtkButton *button, gpointer data) { LauncherState *state = data; if (state->running || !state->update_available) return; settings_message(state, "Updating Roblox…"); if (run_release(state->root, "update", NULL, NULL, NULL)) settings_message(state, "Update complete."); else settings_message(state, "Update failed or cancelled; the installed client was kept."); settings_refresh(state); }
 static void settings_reset(GtkButton *button, gpointer data) { LauncherState *state = data; setting_set(state, "skipped_version", ""); settings_refresh(state); }
 static gboolean play_handoff(gpointer data) { LauncherState *state = data; state->launch_check_id = 0; if (state->launch_pid > 0 && (kill(state->launch_pid, 0) == 0 || errno == EPERM)) { gtk_widget_destroy(state->window); return G_SOURCE_REMOVE; } state->launch_pid = 0; label_text(state->play_status, "Roblox did not start. Open last log for details."); return G_SOURCE_REMOVE; }
-static void play_launch(GtkButton *button, gpointer data) { LauncherState *state = data; char *run = g_build_filename(state->root, "run.sh", NULL); gchar *argv[] = {(gchar *)"setsid", (gchar *)"sh", run, NULL}; GError *error = NULL; if (!g_spawn_async(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, &state->launch_pid, &error)) { label_text(state->play_status, error->message); g_clear_error(&error); state->launch_pid = 0; } else { state->launch_check_id = g_timeout_add(1500, play_handoff, state); } g_free(run); }
+static void play_launch(GtkButton *button, gpointer data) { LauncherState *state = data; char *run = g_build_filename(state->root, "run.sh", NULL); gchar *argv[] = {(gchar *)"setsid", (gchar *)"sh", run, NULL}; gchar **environment = host_environment(); GError *error = NULL; if (!g_spawn_async(state->root, argv, environment, G_SPAWN_SEARCH_PATH, NULL, NULL, &state->launch_pid, &error)) { label_text(state->play_status, error->message); g_clear_error(&error); state->launch_pid = 0; } else { state->launch_check_id = g_timeout_add(1500, play_handoff, state); } g_strfreev(environment); g_free(run); }
 static void find_newest_log(const char *dir, gchar **newest, time_t *latest) {
     GDir *entries = g_dir_open(dir, 0, NULL); if (!entries) return;
     const char *name;

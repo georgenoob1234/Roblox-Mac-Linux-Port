@@ -117,6 +117,9 @@ fi
 if [ "${1:-}" = --client-version ]; then
     exec "$ROOT/scripts/fetch-client.sh" --version
 fi
+if [ "${1:-}" = --client-version-display ]; then
+    exec "$ROOT/scripts/fetch-client.sh" --version-display
+fi
 PREFIX=$DATA/prefix
 if [ -n "${APPDIR:-}" ]; then
     if [ "$RELEASE" = 1 ]; then

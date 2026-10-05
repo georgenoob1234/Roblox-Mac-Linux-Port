@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import re
 from pathlib import Path
 
 DEFAULTS = {
@@ -12,8 +13,14 @@ DEFAULTS = {
     "skipped_version": "",
     "last_check": 0,
     "last_known_latest": "",
+    "last_known_latest_display": "",
 }
 VALID_MODES = {"auto", "ask", "off"}
+KNOWN_DISPLAY_VERSIONS = {
+    # Release notes and the launcher have carried these tested content hashes.
+    "version-00a4ca14e31b41e9": "0.740.0.7400927",
+    "version-3bc33ee7ffad426f": "0.741.0.7411056",
+}
 
 
 def settings_path(data):
@@ -42,7 +49,7 @@ def read_settings(data):
             values[key] = max(0, int(values.get(key, 0)))
         except (TypeError, ValueError):
             values[key] = 0
-    for key in ("skipped_version", "last_known_latest"):
+    for key in ("skipped_version", "last_known_latest", "last_known_latest_display"):
         value = values.get(key, "")
         values[key] = value if isinstance(value, str) else ""
     return values
@@ -84,6 +91,42 @@ def installed_version(version_dir):
     return value if value.startswith("version-") else ""
 
 
+def readable_version(version_dir, raw=""):
+    """Return a user-facing Roblox version when the runtime has recorded one.
+
+    Roblox's update service uses an opaque content hash (version-*).  The
+    downloader may also record the numeric client version in .display-version;
+    keep the hash available for diagnostics while never presenting it as the
+    launcher version when a readable value exists.
+    """
+    path = Path(version_dir) / ".display-version"
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        value = ""
+    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value):
+        return value
+    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", os.environ.get("ROBLOX_MAC_DISPLAY_VERSION", "")):
+        return os.environ["ROBLOX_MAC_DISPLAY_VERSION"]
+    # Some diagnostic logs contain the canonical numeric build. Use the most
+    # recent one only when no explicit metadata file was written.
+    diagnostics = Path(version_dir).parent / "DO_NOT_SHARE" / "diagnostics"
+    try:
+        candidates = sorted(diagnostics.glob("**/*"), key=lambda item: item.stat().st_mtime, reverse=True)
+    except OSError:
+        candidates = []
+    for candidate in candidates[:40]:
+        if not candidate.is_file():
+            continue
+        try:
+            match = re.search(r"(?<![\d.])(\d+\.\d+\.\d+\.\d+)(?![\d.])", candidate.read_text(errors="ignore"))
+        except OSError:
+            continue
+        if match:
+            return match.group(1)
+    return KNOWN_DISPLAY_VERSIONS.get(raw, "")
+
+
 def game_running(data):
     import fcntl
     path = Path(data) / "instance.lock"
@@ -97,8 +140,10 @@ def game_running(data):
     return False
 
 
-def emit(phase, percent, message):
-    print(json.dumps({"phase": phase, "percent": percent, "message": message}, separators=(",", ":")))
+def emit(phase, percent, message, bytes_done=0, bytes_total=0, cancellable=True):
+    print(json.dumps({"phase": phase, "percent": percent, "message": message,
+                      "bytes_done": bytes_done, "bytes_total": bytes_total,
+                      "cancellable": bool(cancellable)}, separators=(",", ":")))
 
 
 def main(argv):
@@ -132,10 +177,14 @@ def main(argv):
         data, version_dir = argv[2], argv[3]
         values = read_settings(data)
         installed = installed_version(version_dir)
+        installed_display = readable_version(version_dir, installed)
         latest = values["last_known_latest"]
+        latest_display = values.get("last_known_latest_display", "") or KNOWN_DISPLAY_VERSIONS.get(latest, "")
         print(json.dumps({
             "installed_version": installed,
+            "installed_display_version": installed_display,
             "latest_known": latest,
+            "latest_display_version": latest_display,
             "last_check": values["last_check"],
             "settings": values,
             "update_available": bool(latest and latest != installed),

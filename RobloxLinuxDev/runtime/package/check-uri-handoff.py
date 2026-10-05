@@ -22,7 +22,8 @@ assert "flock -n -E 73 9" in launcher_source
 assert "flock -n -E 73 9" in bootstrap_source
 assert "notify-send" in bootstrap_source and "gdbus" in bootstrap_source
 assert "ROBLOX_MAC_LAUNCH_URI" in launcher_source
-assert 'exec "$TARGET_APPIMAGE" --bootstrapper-ui --settings "$HERE"' in run_source
+assert 'open_launcher_ui --settings' in run_source
+assert 'open_launcher_ui --launcher' in run_source
 assert 'ICON_SOURCE=$HERE/icon.png' in installer_source
 assert 'ICON_PATH=$ICON_DIR/roblox-mac-port.png' in installer_source
 assert 'SETTINGS_ICON_SOURCE=$HERE/icon_bw.png' in installer_source
@@ -135,7 +136,7 @@ print('PASS guest command received opaque URI')
     subprocess.run(["desktop-file-validate", settings_desktop], check=True)
     settings_text = settings_desktop.read_text()
     assert "Name=Roblox Settings" in settings_text and "MimeType=" not in settings_text
-    assert "--settings" in settings_text and "Categories=Game;" in settings_text
+    assert "--launcher" in settings_text and "Categories=Game;" in settings_text
     settings_icon = data / "icons/hicolor/256x256/apps/roblox-mac-port-settings.png"
     assert settings_icon.read_bytes() == (release / "icon_bw.png").read_bytes()
     subprocess.run([release / "install-uri-handler.sh"], env=env, check=True, capture_output=True, text=True)

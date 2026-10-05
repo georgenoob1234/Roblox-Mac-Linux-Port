@@ -11,6 +11,11 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 ui_source = (ROOT / "package/bootstrapper-ui.c").read_text()
 assert "g_environ_unsetenv" in ui_source and '"LD_LIBRARY_PATH"' in ui_source
+assert "bytes_done" in ui_source and "cancellable" in ui_source and "Cancel" in ui_source
+assert ".nav:checked" in ui_source and "@theme_selected_bg_color" in ui_source
+fetch_source = (ROOT / "scripts/fetch-client.sh").read_text()
+assert "Content-Length" in fetch_source or "content-length" in fetch_source
+assert "ROBLOX_MAC_CANCEL_FILE" in fetch_source and "exit 125" in fetch_source
 with tempfile.TemporaryDirectory(prefix="roblox bootstrap ") as tmp:
     release = Path(tmp) / "release"
     release.mkdir()
@@ -22,6 +27,7 @@ with tempfile.TemporaryDirectory(prefix="roblox bootstrap ") as tmp:
     (release / "run.sh").chmod(0o755)
     (release / "RobloxVersion").mkdir()
     (release / "RobloxVersion/.version").write_text("version-old\n")
+    (release / "RobloxVersion/.display-version").write_text("0.740.0.7400927\n")
     (release / "RobloxLinux.AppImage").write_text("""#!/bin/sh
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -46,6 +52,12 @@ printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
     status = json.loads(subprocess.check_output([bootstrap, "status"], env=env, text=True))
     assert status["settings"]["auto_update"] == "ask"
     assert status["settings"]["check_interval_hours"] == 24
+    assert status["installed_display_version"] == "0.740.0.7400927"
+    (private / "bootstrapper.json").write_text(json.dumps({"last_known_latest": "version-3bc33ee7ffad426f"}))
+    mapped = json.loads(subprocess.check_output([bootstrap, "status"], env=env, text=True))
+    assert mapped["latest_display_version"] == "0.741.0.7411056"
+    event = json.loads(subprocess.check_output([ROOT / "package/bootstrap.py", "event", "downloading", "42", "Downloading",], text=True))
+    assert event["percent"] == 42 and event["cancellable"] is True and event["bytes_done"] == 0
     subprocess.run([bootstrap, "set", "check_interval_hours", "0"], env=env, check=True)
     settings = json.loads((private / "bootstrapper.json").read_text())
     assert settings["check_interval_hours"] == 0
@@ -98,6 +110,23 @@ exit 3
     assert failed.returncode != 0
     assert (release / "RobloxVersion/.version").read_text().strip() == "version-old"
     assert '"phase":"first-run"' not in failed.stdout
+
+    # A progress helper can cancel through the shared marker. The staged
+    # update is removed and the previous client remains launchable.
+    cancel_ui = Path(tmp) / "cancel-ui"
+    cancel_ui.write_text("""#!/bin/sh
+case "${2:-}" in
+  --progress) touch "$ROBLOX_MAC_CANCEL_FILE"; cat >/dev/null; exit 4;;
+esac
+exit 3
+""")
+    cancel_ui.chmod(0o755)
+    (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "auto", "check_interval_hours": 0}))
+    (release / "RobloxVersion/.version").write_text("version-old\n")
+    cancelled = subprocess.run([bootstrap], env={**env, "ROBLOX_MAC_UI_APP": str(cancel_ui)}, capture_output=True, text=True)
+    assert cancelled.returncode == 125
+    assert (release / "RobloxVersion/.version").read_text().strip() == "version-old"
+    assert not list(private.glob(".update.*"))
 
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "off", "check_interval_hours": 24}))
     notify_bin = Path(tmp) / "notify-bin"

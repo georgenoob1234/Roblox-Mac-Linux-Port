@@ -57,7 +57,7 @@ The launcher has a headless interface:
 sh run.sh status
 sh run.sh check
 sh run.sh update                 # newline-delimited JSON progress
-sh run.sh --settings             # open the update settings window
+sh run.sh --settings             # open the full launcher on Settings
 sh run.sh get auto_update
 sh run.sh set auto_update auto    # choices: auto, ask, off
 sh run.sh set check_interval_hours 24

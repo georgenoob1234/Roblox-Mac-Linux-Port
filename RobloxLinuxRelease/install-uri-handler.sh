@@ -46,7 +46,7 @@ EOF
 Name=Roblox Settings
 Comment=Configure Roblox updates
 Type=Application
-Exec=$exec_path --settings
+Exec=$exec_path --launcher
 Icon=roblox-mac-port-settings
 Terminal=false
 StartupNotify=true

@@ -79,7 +79,7 @@ args = shlex.split(sys.argv[4])
 expected = os.environ['TEST_EXPECTED_URI']
 assert args.count('-protocolString') == 1
 assert os.fsencode(args[args.index('-protocolString') + 1]) == os.fsencode(expected)
-assert 'MACOBLOX_PROTOCOL_STRING_PRESENT=1' in args
+assert 'ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1' in args
 print('PASS guest command received opaque URI')
 """,
     }

@@ -369,7 +369,7 @@ if '-channel' not in client[1:]: client[1:1]=['-channel','production']
 launch_uri=os.environ.get('ROBLOX_MAC_LAUNCH_URI')
 if launch_uri:
     client[1:1]=['-protocolString', launch_uri]
-    args.append('MACOBLOX_PROTOCOL_STRING_PRESENT=1')
+    args.append('ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1')
 print(shlex.join(args+client))
 PYTHON
 )

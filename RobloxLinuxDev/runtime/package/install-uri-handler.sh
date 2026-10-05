@@ -44,7 +44,7 @@ EOF
     cat > "$SETTINGS_DESKTOP_PATH" <<EOF
 [Desktop Entry]
 Name=Roblox Launcher
-Comment=Open the Mac O’ Blox launcher
+Comment=Open the Roblox Mac Linux Port launcher
 Type=Application
 Exec=$exec_path --launcher
 Icon=roblox-mac-port-settings

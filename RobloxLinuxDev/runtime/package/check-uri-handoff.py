@@ -135,7 +135,7 @@ print('PASS guest command received opaque URI')
     settings_desktop = data / "applications/roblox-mac-port-settings.desktop"
     subprocess.run(["desktop-file-validate", settings_desktop], check=True)
     settings_text = settings_desktop.read_text()
-    assert "Name=Roblox Settings" in settings_text and "MimeType=" not in settings_text
+    assert "Name=Roblox Launcher" in settings_text and "MimeType=" not in settings_text
     assert "--launcher" in settings_text and "Categories=Game;" in settings_text
     settings_icon = data / "icons/hicolor/256x256/apps/roblox-mac-port-settings.png"
     assert settings_icon.read_bytes() == (release / "icon_bw.png").read_bytes()

@@ -11,6 +11,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 ui_source = (ROOT / "package/bootstrapper-ui.c").read_text()
 assert "g_environ_unsetenv" in ui_source and '"LD_LIBRARY_PATH"' in ui_source
+assert '"APPDIR"' in ui_source and 'g_spawn_async(state->root' in ui_source
+assert '"setsid"' in ui_source and 'host_environment()' in ui_source
 assert "bytes_done" in ui_source and "cancellable" in ui_source and "Cancel" in ui_source
 assert ".nav:checked" in ui_source and "@theme_selected_bg_color" in ui_source
 fetch_source = (ROOT / "scripts/fetch-client.sh").read_text()

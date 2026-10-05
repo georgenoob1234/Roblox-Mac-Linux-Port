@@ -22,7 +22,7 @@ RobloxLinuxRelease/
 ├── bootstrap.py       (settings/status JSON helper)
 ├── install-uri-handler.sh (optional browser protocol registration)
 ├── icon.png           (icon installed for the browser protocol handler)
-├── icon_bw.png        (icon installed for the settings menu entry)
+├── icon_bw.png        (icon installed for the launcher menu entry)
 ├── FFlags.json
 ├── README.md
 ├── .gitignore
@@ -64,6 +64,7 @@ The headless interface is:
 sh run.sh status
 sh run.sh check
 sh run.sh update                 # newline-delimited JSON progress
+sh run.sh --launcher             # open the full launcher on Play
 sh run.sh --settings             # open the full launcher on Settings
 sh run.sh get auto_update
 sh run.sh set auto_update auto    # choices: auto, ask, off
@@ -74,7 +75,8 @@ sh run.sh set check_interval_hours 24
 check interval (24 hours by default), skipped version, last check and last
 known latest. Network checks have a short timeout and never prevent a launch;
 `0` checks every launch. Exit codes are `0` for success or a dropped second
-launch, `1` for setup/update/check failure, and `2` for invalid input.
+launch, `1` for setup/update/check failure, `2` for invalid input, and `125`
+for cancellation.
 Use the scripts on systems with AppImageLauncher. They prevent it from moving
 the AppImage away from its client and keep temporary files in this release folder.
 Older releases could fail before Roblox started with `//DO_NOT_SHARE` permission

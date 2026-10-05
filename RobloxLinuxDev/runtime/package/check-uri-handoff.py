@@ -9,20 +9,29 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 launcher_source = (ROOT / "bin/roblox-mac").read_text()
 bootstrap_source = (ROOT / "package/bootstrap.sh").read_text()
+run_source = (ROOT / "package/run.sh").read_text()
 installer_source = (ROOT / "package/install-uri-handler.sh").read_text()
 release_builder_source = (ROOT / "package/build-release.sh").read_text()
 package_icon = ROOT / "package/icon.png"
+package_settings_icon = ROOT / "package/icon_bw.png"
 release_icon = ROOT.parent.parent / "RobloxLinuxRelease/icon.png"
-assert "roblox URI received: scheme=%s length=%s" in launcher_source
+release_settings_icon = ROOT.parent.parent / "RobloxLinuxRelease/icon_bw.png"
+assert "roblox URI received" not in launcher_source
 assert "pending-uri" not in launcher_source and "retry_pending" not in launcher_source
 assert "flock -n -E 73 9" in launcher_source
 assert "flock -n -E 73 9" in bootstrap_source
 assert "notify-send" in bootstrap_source and "gdbus" in bootstrap_source
 assert "ROBLOX_MAC_LAUNCH_URI" in launcher_source
+assert 'open_launcher_ui --settings' in run_source
+assert 'open_launcher_ui --launcher' in run_source
 assert 'ICON_SOURCE=$HERE/icon.png' in installer_source
 assert 'ICON_PATH=$ICON_DIR/roblox-mac-port.png' in installer_source
+assert 'SETTINGS_ICON_SOURCE=$HERE/icon_bw.png' in installer_source
+assert 'SETTINGS_DESKTOP=roblox-mac-port-settings.desktop' in installer_source
 assert 'cp "$HERE/icon.png" "$stage/icon.png"' in release_builder_source
+assert 'cp "$HERE/icon_bw.png" "$stage/icon_bw.png"' in release_builder_source
 assert package_icon.read_bytes() == release_icon.read_bytes()
+assert package_settings_icon.read_bytes() == release_settings_icon.read_bytes()
 
 with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
     folder = Path(temp)
@@ -35,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="roblox uri ") as temp:
                                  "ROBLOX_MAC_DATA": str(private), "ROBLOX_MAC_APP": str(app)},
                             capture_output=True, text=True)
     assert first not in result.stdout and first not in result.stderr
-    assert "scheme=roblox" in result.stderr and "length=" in result.stderr
+    assert "scheme=roblox" not in result.stderr and "length=" not in result.stderr
     assert not (private / "pending-uri").exists()
 
     # Exercise the actual outer launcher and --inside re-exec. The former test
@@ -70,7 +79,7 @@ args = shlex.split(sys.argv[4])
 expected = os.environ['TEST_EXPECTED_URI']
 assert args.count('-protocolString') == 1
 assert os.fsencode(args[args.index('-protocolString') + 1]) == os.fsencode(expected)
-assert 'MACOBLOX_PROTOCOL_STRING_PRESENT=1' in args
+assert 'ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1' in args
 print('PASS guest command received opaque URI')
 """,
     }
@@ -108,6 +117,7 @@ print('PASS guest command received opaque URI')
     release.mkdir()
     shutil.copy2(ROOT / "package/install-uri-handler.sh", release / "install-uri-handler.sh")
     shutil.copy2(package_icon, release / "icon.png")
+    shutil.copy2(package_settings_icon, release / "icon_bw.png")
     (release / "run.sh").write_text("#!/bin/sh\nexit 0\n"); (release / "run.sh").chmod(0o755)
     data = folder / "data"; config = folder / "config"; fakebin = folder / "bin"
     fakebin.mkdir(); calls = folder / "xdg-mime.calls"
@@ -122,6 +132,13 @@ print('PASS guest command received opaque URI')
     assert "Exec=" in text and "release\\ with\\ spaces/run.sh %u" in text
     icon = data / "icons/hicolor/256x256/apps/roblox-mac-port.png"
     assert icon.read_bytes() == (release / "icon.png").read_bytes()
+    settings_desktop = data / "applications/roblox-mac-port-settings.desktop"
+    subprocess.run(["desktop-file-validate", settings_desktop], check=True)
+    settings_text = settings_desktop.read_text()
+    assert "Name=Roblox Launcher" in settings_text and "MimeType=" not in settings_text
+    assert "--launcher" in settings_text and "Categories=Game;" in settings_text
+    settings_icon = data / "icons/hicolor/256x256/apps/roblox-mac-port-settings.png"
+    assert settings_icon.read_bytes() == (release / "icon_bw.png").read_bytes()
     subprocess.run([release / "install-uri-handler.sh"], env=env, check=True, capture_output=True, text=True)
     assert len(calls.read_text().splitlines()) == 4
     mime = config / "mimeapps.list"; mime.parent.mkdir()
@@ -129,7 +146,7 @@ print('PASS guest command received opaque URI')
                     "x-scheme-handler/roblox-player=roblox-mac-port.desktop;\n"
                     "x-scheme-handler/other=other.desktop;\n")
     subprocess.run([release / "install-uri-handler.sh", "uninstall"], env=env, check=True, capture_output=True, text=True)
-    assert not desktop.exists() and "roblox-mac-port.desktop" not in mime.read_text()
-    assert not icon.exists()
+    assert not desktop.exists() and not settings_desktop.exists() and "roblox-mac-port.desktop" not in mime.read_text()
+    assert not icon.exists() and not settings_icon.exists()
     assert "x-scheme-handler/other=other.desktop;" in mime.read_text()
 print("PASS opaque URI transport through namespace re-exec and guest command, no pending queue, lock/notification hooks, desktop validation, installer idempotence/uninstall")

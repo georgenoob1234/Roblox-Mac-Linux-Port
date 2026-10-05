@@ -11,6 +11,9 @@ import tempfile
 import zipfile
 
 root = Path(__file__).resolve().parents[1]
+update_source = (root / 'package/update-roblox.sh').read_text()
+assert 'ROBLOX_MAC_PROGRESS_FD' in update_source and 'ROBLOX_MAC_CANCEL_FILE' in update_source
+assert 'spv-cache-v1' in update_source and 'previous' in update_source
 env = {k: v for k, v in os.environ.items() if not k.startswith(('ROBLOX_', 'APPIMAGE', 'APPDIR', 'TRACKA_NATIVE_MEMORY'))}
 with tempfile.TemporaryDirectory(prefix='roblox release ') as tmp:
     folder = Path(tmp)

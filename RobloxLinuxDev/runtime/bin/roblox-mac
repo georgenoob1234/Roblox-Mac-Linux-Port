@@ -16,6 +16,19 @@ umask 077
 
 ROOT=${ROBLOX_MAC_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 
+# The release bootstrapper UI is a separate GTK3 process. Keep this dispatch
+# before client configuration so settings can open while Roblox is running.
+if [ "${1:-}" = --bootstrapper-ui ]; then
+    shift
+    if [ -d "$ROOT/browser/lib" ]; then
+        export LD_LIBRARY_PATH="$ROOT/browser/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export GIO_MODULE_DIR="$ROOT/browser/lib/gio/modules"
+        export GDK_PIXBUF_MODULE_FILE="$ROOT/browser/lib/gdk-pixbuf-2.0/loaders.cache"
+        export GSETTINGS_SCHEMA_DIR="$ROOT/browser/share/glib-2.0/schemas"
+    fi
+    exec "$ROOT/usr/bin/roblox-bootstrapper-ui" "$@"
+fi
+
 # Config: plain KEY=value lines, shell syntax. Copy config.env.example to config.env and edit.
 # Environment variables of the same name win over the file, so one-off overrides need no edit.
 # Use the original AppImage's directory, never its temporary read-only mount.
@@ -98,20 +111,14 @@ if [ "${RELEASE:-0}" = 1 ]; then
     mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 fi
 export ROBLOX_MAC_DATA=$DATA
-if [ -n "$LAUNCH_URI" ]; then
-    meta=$(python3 - "$LAUNCH_URI" <<'PY'
-import os,sys
-value=os.fsencode(sys.argv[1])
-print(value.split(b':', 1)[0].decode('ascii', 'replace'), len(value))
-PY
-    )
-    printf 'roblox URI received: scheme=%s length=%s\n' $meta >&2
-fi
 if [ "${1:-}" = --download-client ]; then
     ROBLOX_MAC_DATA=$DATA exec "$ROOT/scripts/fetch-client.sh"
 fi
 if [ "${1:-}" = --client-version ]; then
     exec "$ROOT/scripts/fetch-client.sh" --version
+fi
+if [ "${1:-}" = --client-version-display ]; then
+    exec "$ROOT/scripts/fetch-client.sh" --version-display
 fi
 PREFIX=$DATA/prefix
 if [ -n "${APPDIR:-}" ]; then
@@ -362,7 +369,7 @@ if '-channel' not in client[1:]: client[1:1]=['-channel','production']
 launch_uri=os.environ.get('ROBLOX_MAC_LAUNCH_URI')
 if launch_uri:
     client[1:1]=['-protocolString', launch_uri]
-    args.append('MACOBLOX_PROTOCOL_STRING_PRESENT=1')
+    args.append('ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1')
 print(shlex.join(args+client))
 PYTHON
 )

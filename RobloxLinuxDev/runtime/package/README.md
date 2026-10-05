@@ -20,6 +20,9 @@ RobloxLinuxRelease/
 ├── run.sh             (terminal launch with diagnostic logs)
 ├── bootstrap.sh       (first-run, lock and update orchestration)
 ├── bootstrap.py       (settings/status JSON helper)
+├── install-uri-handler.sh (optional browser protocol registration)
+├── icon.png           (icon installed for the browser protocol handler)
+├── icon_bw.png        (icon installed for the launcher menu entry)
 ├── FFlags.json
 ├── README.md
 ├── .gitignore
@@ -37,7 +40,70 @@ sh update-roblox.sh
 sh run.sh
 ```
 
-The first launch runs a separate `--shell true` warm-up and records `DO_NOT_SHARE/first-run.initialized` only after it succeeds. The bootstrapper then checks for updates at most once per configured interval and preserves the installed client when staging or shader preparation fails.
+To open browser Play, friend, private-server and other Roblox links in this
+release, install the user-local protocol handler once:
+
+```sh
+sh install-uri-handler.sh
+xdg-mime query default x-scheme-handler/roblox
+```
+
+The handler passes the complete `roblox://` or `roblox-player:` URI as one
+opaque argument. If Roblox is already running, the second launch sends a
+desktop notification and exits; it never queues or writes the URI. Remove the
+registration with `sh install-uri-handler.sh uninstall`.
+
+The first `sh run.sh` performs a separate `--shell true` warm-up when
+`DO_NOT_SHARE/first-run.initialized` is absent, waits for its exit status, and
+only then launches the client. On failure or timeout it stops before a known
+blank-window launch. Keep the generated **RobloxVersion** beside the AppImage.
+
+The headless interface is:
+
+```sh
+sh run.sh status
+sh run.sh check
+sh run.sh update                 # newline-delimited JSON progress
+sh run.sh --launcher             # open the full launcher on Play
+sh run.sh --settings             # open the full launcher on Settings
+sh run.sh get auto_update
+sh run.sh set auto_update auto    # choices: auto, ask, off
+sh run.sh set check_interval_hours 24
+```
+
+`DO_NOT_SHARE/bootstrapper.json` stores the update mode (`ask` by default),
+check interval (24 hours by default), skipped version, last check and last
+known latest. Network checks have a short timeout and never prevent a launch;
+`0` checks every launch. Exit codes are `0` for success or a dropped second
+launch, `1` for setup/update/check failure, `2` for invalid input, and `125`
+for cancellation.
+Use the scripts on systems with AppImageLauncher. They prevent it from moving
+the AppImage away from its client and keep temporary files in this release folder.
+Older releases could fail before Roblox started with `//DO_NOT_SHARE` permission
+errors and Qt plugin warnings; replace the AppImage, `run.sh` and updater together.
+Linux needs x86_64, glibc 2.39 or newer (the Ubuntu 24.04 baseline), a Wayland
+desktop, compatible Vulkan drivers, Python 3, util-linux and unprivileged user
+namespaces. X11-only sessions, other CPU architectures and musl-based systems are
+not supported. The updater also requires curl and unzip.
+FUSE is optional.
+
+The bundled GTK3 bootstrapper shows delayed first-run/update progress and the
+ask-mode decision dialog. Its full launcher has Play, Settings and Info pages;
+the installed menu entry opens Play, while `sh run.sh --settings` opens
+Settings. Settings can be opened while Roblox is running; its Update now action
+is disabled with a reason until the game closes. Update events include byte
+counts when the download exposes Content-Length; verification and shader
+preparation use a pulsing bar. Cancel during checking, downloading,
+verification or shader preparation removes staging data, keeps the previous
+client, and returns without launching a browser link. A timeout or an ask-mode
+decline launches without updating. If GTK or a display is not available,
+launches continue without updating and a desktop notification is attempted.
+The Play page's Open last log action opens the newest diagnostics file; logs can
+contain account details and should not be shared blindly.
+The native UI and media libraries are built or packaged in Ubuntu 24.04. Release
+checks reject bundled ELF files requiring AVX-512 or glibc newer than 2.39 and
+test native UI loading on the baseline. The host still supplies glibc, Wayland/XCB libraries and GPU
+drivers; full gameplay compatibility on every system is not guaranteed.
 
 For troubleshooting, run `sh run.sh`.
 For a system check without launching Roblox, run `sh run.sh --diagnose`

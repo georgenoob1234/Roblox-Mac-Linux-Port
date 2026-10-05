@@ -16,11 +16,11 @@ static const char *UI_CSS =
     ".sidebar { background-color: @theme_base_color; padding: 18px 12px; }"
     ".brand { font-weight: 700; font-size: 15px; padding: 4px 8px 18px; }"
     ".nav { min-height: 38px; border-radius: 9px; padding: 7px 12px; margin: 2px 0; }"
-    ".nav:checked { background-color: @theme_selected_bg_color; color: @theme_selected_fg_color; }"
+    ".nav:checked { background-color: @theme_selected_bg_color; color: @theme_fg_color; }"
     ".content { padding: 30px 42px; }"
     ".title { font-size: 25px; font-weight: 700; padding: 5px 0; }"
     ".subtitle { font-size: 14px; color: @theme_unfocused_fg_color; }"
-    ".accent { background-color: @theme_selected_bg_color; color: @theme_selected_fg_color; border-radius: 10px; padding: 9px 20px; font-weight: 700; }"
+    ".accent { background-color: @theme_selected_bg_color; color: @theme_fg_color; border-radius: 10px; padding: 9px 20px; font-weight: 700; }"
     ".muted { color: @theme_unfocused_fg_color; }"
     "progressbar trough { min-height: 10px; border-radius: 6px; }"
     "progressbar progress { min-height: 10px; border-radius: 6px; }";

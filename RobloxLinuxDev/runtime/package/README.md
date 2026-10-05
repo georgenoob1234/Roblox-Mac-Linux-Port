@@ -5,12 +5,7 @@ using Darling and a Vulkan renderer. This is an unofficial compatibility layer.
 
 Download **[RobloxLinuxRelease.tar.gz from Releases](https://github.com/spidercraft/Roblox-Mac-Linux-Port/releases/latest)**
 and extract it before launching. Build sources are in `RobloxLinuxDev` in the
-same repository. The release includes the AppImage and updater. Run
-`sh update-roblox.sh` from the extracted folder to download the official client
-and prepare its shaders before launching. GitHub's automatic source-code ZIP
-is for developers.
-If needed, make the AppImage
-executable with `chmod +x RobloxLinux.AppImage`.
+same repository. GitHub's automatic source-code ZIP is for developers.
 
 ```text
 RobloxLinuxRelease/
@@ -32,26 +27,26 @@ RobloxLinuxRelease/
 ## How to run
 
 Download and extract the release archive above, then open a terminal in the
-extracted `RobloxLinuxRelease` folder. For first-time setup:
+extracted `RobloxLinuxRelease` folder and install the desktop entries once:
 
 ```sh
-chmod +x RobloxLinux.AppImage
-sh update-roblox.sh
-sh run.sh
+./install-uri-handler.sh
 ```
+
+Then open **Roblox (Mac Linux Port)** from your desktop application menu. The
+launcher handles first-run setup, client downloads, updates and shader preparation.
 
 To open browser Play, friend, private-server and other Roblox links in this
 release, install the user-local protocol handler once:
 
 ```sh
-sh install-uri-handler.sh
-xdg-mime query default x-scheme-handler/roblox
+./install-uri-handler.sh
 ```
 
 The handler passes the complete `roblox://` or `roblox-player:` URI as one
 opaque argument. If Roblox is already running, the second launch sends a
 desktop notification and exits; it never queues or writes the URI. Remove the
-registration with `sh install-uri-handler.sh uninstall`.
+registration with `./install-uri-handler.sh uninstall`.
 
 The first `sh run.sh` performs a separate `--shell true` warm-up when
 `DO_NOT_SHARE/first-run.initialized` is absent, waits for its exit status, and

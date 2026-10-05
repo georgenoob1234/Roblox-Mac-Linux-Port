@@ -2,7 +2,7 @@
 
 An experimental, unofficial runner for the Intel macOS Roblox client on x86_64 Linux, using Darling, Wayland and Vulkan.
 
-**[Download RobloxLinuxRelease.tar.gz](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/releases/)**, extract it, run `sh update-roblox.sh` inside `RobloxLinuxRelease`, then `sh run.sh`.
+**[Download RobloxLinuxRelease.tar.gz](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/releases/)**, extract it, run `./install-uri-handler.sh` once from `RobloxLinuxRelease`, then open Roblox from your desktop application menu.
 
 ```text
 RobloxLinuxDev/        Source, dependency pins, patches and build scripts
@@ -22,13 +22,15 @@ supplies glibc, Wayland/XCB libraries and GPU drivers. These checks do not estab
 on every distribution or GPU.
 
 Download and extract **RobloxLinuxRelease.tar.gz** from the release link above.
-Open a terminal in the extracted `RobloxLinuxRelease` folder, then run:
+Open a terminal in the extracted `RobloxLinuxRelease` folder, then install the
+desktop and browser-link entries once:
 
 ```sh
-chmod +x RobloxLinux.AppImage
-sh update-roblox.sh
-sh run.sh
+./install-uri-handler.sh
 ```
+
+After that, open **Roblox (Mac Linux Port)** from the desktop application menu.
+The launcher performs first-run setup and client updates when needed.
 
 The first `sh run.sh` performs a separate `--shell true` warm-up, records a private marker only after it succeeds, and then starts the client. A failure or timeout stops before the client is launched. An explicit `sh update-roblox.sh` remains available; later launches use a bounded, scheduled update check.
 Keep `RobloxVersion` beside the AppImage. Use the scripts on systems with

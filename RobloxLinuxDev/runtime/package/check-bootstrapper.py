@@ -9,6 +9,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+ui_source = (ROOT / "package/bootstrapper-ui.c").read_text()
+assert "g_environ_unsetenv" in ui_source and '"LD_LIBRARY_PATH"' in ui_source
 with tempfile.TemporaryDirectory(prefix="roblox bootstrap ") as tmp:
     release = Path(tmp) / "release"
     release.mkdir()

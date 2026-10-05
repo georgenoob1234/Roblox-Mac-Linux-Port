@@ -43,8 +43,19 @@ typedef struct {
 
 static gboolean spawn_sync(char **argv, char **out, int *status) {
     GError *error = NULL;
-    gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+    gchar **environment = g_get_environ();
+    /* The helper itself runs from the AppImage and needs its bundled GTK
+       libraries. Release commands must instead use host curl/OpenSSL and
+       host Python, so do not leak the AppImage loader paths into them. */
+    const char *paths[] = {"LD_LIBRARY_PATH", "GIO_MODULE_DIR", "GDK_PIXBUF_MODULE_FILE",
+                           "GSETTINGS_SCHEMA_DIR", "WEBKIT_INJECTED_BUNDLE_PATH",
+                           "GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_PATH_1_0",
+                           "GST_PLUGIN_SCANNER_1_0", NULL};
+    for (const char **path = paths; *path; ++path)
+        environment = g_environ_unsetenv(environment, *path);
+    gboolean ok = g_spawn_sync(NULL, argv, environment, G_SPAWN_SEARCH_PATH,
                                NULL, NULL, out, NULL, status, &error);
+    g_strfreev(environment);
     if (!ok) {
         g_clear_error(&error);
         if (out) *out = NULL;

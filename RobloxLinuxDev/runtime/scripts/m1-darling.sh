@@ -19,6 +19,13 @@ if [ ! -d "$HERE/darling-root" ]; then
     mv "$tmp/usr/libexec/darling" "$HERE/darling-root"
     cp "$tmp/usr/bin/darlingserver" "$HERE/darlingserver"
     cp "$tmp/usr/bin/darling"       "$HERE/darling-cli"
+    # Keep the runtime's own copies in sync with the top-level binaries that
+    # roblox-mac overlays onto /usr/bin inside the namespace, so packaging and
+    # the optimized install step always look at the same server binary.
+    mkdir -p "$HERE/darling-root/usr/bin"
+    cp "$HERE/darlingserver" "$HERE/darling-root/usr/bin/darlingserver"
+    chmod +w "$HERE/darling-root/usr/bin/darlingserver"
+    [ ! -f "$HERE/darling-cli" ] || { cp "$HERE/darling-cli" "$HERE/darling-root/usr/bin/darling"; chmod +w "$HERE/darling-root/usr/bin/darling"; }
     chmod u+s "$HERE/darling-cli"   # setuid bit is a no-op inside the user namespace; kept so darling's own check passes
     # The stub frameworks live inside the root: rebuild them after regenerating it.
     # fill last: it skips whatever the hand-written shims already define.

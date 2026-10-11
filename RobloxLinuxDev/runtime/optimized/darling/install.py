@@ -67,6 +67,12 @@ def sha256(path):
 
 def pairs():
     """(installed path, rebuilt path) for everything this script manages."""
+    # Repair trees created before m1-darling.sh mirrored the server binary
+    # into darling-root/usr/bin; install() copies the top-level file below.
+    mirror = ROOT / 'usr/bin/darlingserver'
+    if not mirror.is_file() and (A / 'darlingserver').is_file():
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(A / 'darlingserver', mirror)
     for built in sorted(GUEST.rglob('*')):
         if not built.is_file() or built.is_symlink():
             continue
@@ -83,6 +89,11 @@ def pairs():
     yield ROOT / 'usr/lib/dyld', original(ROOT / 'usr/lib/dyld')
     yield A / 'darlingserver', STAGE / 'usr/bin/darlingserver'
     yield A / 'darling-cli', STAGE / 'usr/bin/darling'
+    # Keep the copy inside darling-root byte-identical to the top-level
+    # binary that roblox-mac overlays onto /usr/bin and build-appimage.sh
+    # checks; otherwise packaging sees the old stock server ("no symbols").
+    yield ROOT / 'usr/bin/darlingserver', STAGE / 'usr/bin/darlingserver'
+    yield ROOT / 'usr/bin/darling', STAGE / 'usr/bin/darling'
 
 
 def original(installed):

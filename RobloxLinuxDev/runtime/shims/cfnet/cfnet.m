@@ -31,16 +31,16 @@ static void loadCookies(void *unused) {
 }
 static NSArray *call(NSMutableDictionary *request) {
     static dispatch_once_t once;dispatch_once_f(&once,NULL,loadCookies);
-    if(!nativeCall || !nativeFree){fprintf(stderr,"roblox-mac: native cookie helper unavailable\n");return @[];}
+    if(!nativeCall || !nativeFree){fprintf(stderr,"roblox-mac: native cookie helper unavailable\n");return [NSArray array];}
     const char *data=getenv("ROBLOX_MAC_DATA");
     if(data)request[@"directory"]=[[NSString stringWithUTF8String:data] stringByAppendingString:@"/cookies"];
     NSData *json=[NSJSONSerialization dataWithJSONObject:request options:0 error:NULL];
     NSString *text=[[[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] autorelease];
-    char *response=nativeCall([text UTF8String]);if(!response)return @[];
+    char *response=nativeCall([text UTF8String]);if(!response)return [NSArray array];
     NSData *bytes=[NSData dataWithBytes:response length:strlen(response)];nativeFree(response);
     NSDictionary *reply=[NSJSONSerialization JSONObjectWithData:bytes options:0 error:NULL];
     if(reply[@"error"])fprintf(stderr,"roblox-mac: cookie storage operation failed\n");
-    return reply[@"cookies"]?:@[];
+    return reply[@"cookies"]?:[NSArray array];
 }
 static NSArray *decoded(NSArray *values) {
     NSMutableArray *cookies=[NSMutableArray array];
@@ -58,18 +58,18 @@ static NSArray *encoded(NSArray *cookies) {
     for(NSHTTPCookie *c in cookies) {
         NSDictionary *p=[c properties];
         if(![c name] || ![c value] || ![c domain] || ![c path])continue;
-        NSMutableDictionary *v=[NSMutableDictionary dictionaryWithDictionary:@{@"Name":[c name],@"Value":[c value],@"Domain":[c domain],@"Path":[c path],@"Secure":@([p[@"Secure"] boolValue]),@"HTTPOnly":@([p[@"HTTPOnly"] boolValue]),@"Discard":@([p[@"Discard"] boolValue])}];
-        if([c expiresDate])v[@"Expires"]=@([[c expiresDate] timeIntervalSince1970]);
-        if(p[@"Max-Age"])v[@"Max-Age"]=@([p[@"Max-Age"] longLongValue]);
-        if(p[@"SameSite"])v[@"SameSite"]=@([p[@"SameSite"] intValue]);
+        NSMutableDictionary *v=[NSMutableDictionary dictionaryWithDictionary:[NSDictionary dictionaryWithObjectsAndKeys:[c name],@"Name",[c value],@"Value",[c domain],@"Domain",[c path],@"Path",[NSNumber numberWithBool:[p[@"Secure"] boolValue]],@"Secure",[NSNumber numberWithBool:[p[@"HTTPOnly"] boolValue]],@"HTTPOnly",[NSNumber numberWithBool:[p[@"Discard"] boolValue]],@"Discard",nil]];
+        if([c expiresDate])v[@"Expires"]=[NSNumber numberWithDouble:[[c expiresDate] timeIntervalSince1970]];
+        if(p[@"Max-Age"])v[@"Max-Age"]=[NSNumber numberWithLongLong:[p[@"Max-Age"] longLongValue]];
+        if(p[@"SameSite"])v[@"SameSite"]=[NSNumber numberWithInt:[p[@"SameSite"] intValue]];
         [values addObject:v];
     }
     return values;
 }
 @implementation NSHTTPCookie (RobloxMac)
 + (NSArray *)cookiesWithResponseHeaderFields:(NSDictionary *)fields forURL:(NSURL *)url {
-    if(!fields || !url)return @[];
-    return decoded(call([NSMutableDictionary dictionaryWithDictionary:@{@"op":@"parse",@"headers":fields,@"url":[url absoluteString]}]));
+    if(!fields || !url)return [NSArray array];
+    return decoded(call([NSMutableDictionary dictionaryWithDictionary:[NSDictionary dictionaryWithObjectsAndKeys:@"parse",@"op",fields,@"headers",[url absoluteString],@"url",nil]]));
 }
 // Darling calls CFBooleanGetValue even when these optional properties are absent.
 - (BOOL)isSecure {return [[[self properties] objectForKey:@"Secure"] boolValue];}
@@ -86,16 +86,16 @@ static NSArray *encoded(NSArray *cookies) {
 @implementation RbxPersistentCookieStorage
 - (NSArray *)cookies {return decoded(call([NSMutableDictionary dictionaryWithObject:@"get" forKey:@"op"]));}
 - (NSArray *)cookiesForURL:(NSURL *)url {
-    if(!url)return @[];
-    return decoded(call([NSMutableDictionary dictionaryWithDictionary:@{@"op":@"get",@"url":[url absoluteString]}]));
+    if(!url)return [NSArray array];
+    return decoded(call([NSMutableDictionary dictionaryWithDictionary:[NSDictionary dictionaryWithObjectsAndKeys:@"get",@"op",[url absoluteString],@"url",nil]]));
 }
 - (void)setCookies:(NSArray *)cookies forURL:(NSURL *)url mainDocumentURL:(NSURL *)main {
-    NSMutableDictionary *r=[NSMutableDictionary dictionaryWithDictionary:@{@"op":@"set",@"cookies":encoded(cookies),@"policy":@([self cookieAcceptPolicy])}];
+    NSMutableDictionary *r=[NSMutableDictionary dictionaryWithDictionary:[NSDictionary dictionaryWithObjectsAndKeys:@"set",@"op",encoded(cookies),@"cookies",[NSNumber numberWithUnsignedLong:[self cookieAcceptPolicy]],@"policy",nil]];
     if(url)r[@"url"]=[url absoluteString];if(main)r[@"first"]=[main absoluteString];call(r);
 }
-- (void)setCookie:(NSHTTPCookie *)cookie {if(cookie)[self setCookies:@[cookie] forURL:nil mainDocumentURL:nil];}
+- (void)setCookie:(NSHTTPCookie *)cookie {if(cookie)[self setCookies:[NSArray arrayWithObject:cookie] forURL:nil mainDocumentURL:nil];}
 - (void)deleteCookie:(NSHTTPCookie *)cookie {
-    if(cookie)call([NSMutableDictionary dictionaryWithDictionary:@{@"op":@"delete",@"cookies":encoded(@[cookie])}]);
+    if(cookie)call([NSMutableDictionary dictionaryWithDictionary:[NSDictionary dictionaryWithObjectsAndKeys:@"delete",@"op",encoded([NSArray arrayWithObject:cookie]),@"cookies",nil]]);
 }
 - (NSArray *)sortedCookiesUsingDescriptors:(NSArray *)order {return [[self cookies] sortedArrayUsingDescriptors:order];}
 @end

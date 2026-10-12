@@ -277,7 +277,7 @@ static void cancelCapture(void) {
 - (NSInteger)clearContents{[values removeAllObjects];if([self general] && api){void (^clear)(void)=^{api->clipboard("");};if([NSThread isMainThread])clear();else dispatch_sync(dispatch_get_main_queue(),clear);}return ++changes;}
 - (NSInteger)declareTypes:(NSArray*)types owner:(id)owner{return [self clearContents];}
 - (NSInteger)addTypes:(NSArray*)types owner:(id)owner{return ++changes;}
-- (NSArray*)types{return [self general]?@[@"NSStringPboardType",@"public.utf8-plain-text"]:[values allKeys];}
+- (NSArray*)types{return [self general]?[NSArray arrayWithObjects:@"NSStringPboardType",@"public.utf8-plain-text",nil]:[values allKeys];}
 - (NSData*)dataForType:(NSString*)type {
     if(![self general] || ![self textType:type] || !api)return [values objectForKey:type];
     __block NSData *result=nil;
@@ -338,7 +338,7 @@ static int pollInput(struct RbxWaylandEvent *event,BOOL queueBusy) {
         NSBundle *bundle=[NSBundle bundleForClass:[NSDisplay class]];
         for(NSString *path in [bundle pathsForResourcesOfType:@"backend" inDirectory:@"Backends"])[[NSBundle bundleWithPath:path] load];
         Class source=objc_getClass("X11Display"),target=[RbxWaylandDisplay class];
-        for(NSString *name in @[@"allFontFamilyNames",@"fontTypefacesForFamilyName:",@"substituteFamilyName:",@"colorWithName:"]) {
+        for(NSString *name in [NSArray arrayWithObjects:@"allFontFamilyNames",@"fontTypefacesForFamilyName:",@"substituteFamilyName:",@"colorWithName:",nil]) {
             SEL selector=NSSelectorFromString(name);Method method=class_getInstanceMethod(source,selector);
             if(method)class_addMethod(target,selector,method_getImplementation(method),method_getTypeEncoding(method));
         }
@@ -357,16 +357,16 @@ static int pollInput(struct RbxWaylandEvent *event,BOOL queueBusy) {
 - (NSArray*)screens {
     int w=1920,h=1080;double hz=60;if(api)api->screen(&w,&h,&hz);
     NSRect rect=NSMakeRect(0,0,w,h);NSScreen *screen=[[[NSScreen alloc] initWithFrame:rect visibleFrame:rect] autorelease];
-    return @[screen];
+    return [NSArray arrayWithObject:screen];
 }
-- (NSDictionary*)currentModeForScreen:(int)index {int w=1920,h=1080;double hz=60;if(api)api->screen(&w,&h,&hz);return @{@"Width":@(w),@"Height":@(h),@"Depth":@32,@"RefreshRate":@(hz)};}
-- (NSArray*)modesForScreen:(int)index{return @[[self currentModeForScreen:index]];}
+- (NSDictionary*)currentModeForScreen:(int)index {int w=1920,h=1080;double hz=60;if(api)api->screen(&w,&h,&hz);return [NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithInt:w],@"Width",[NSNumber numberWithInt:h],@"Height",[NSNumber numberWithInt:32],@"Depth",[NSNumber numberWithDouble:hz],@"RefreshRate",nil];}
+- (NSArray*)modesForScreen:(int)index{return [NSArray arrayWithObject:[self currentModeForScreen:index]];}
 - (BOOL)setMode:(NSDictionary*)mode forScreen:(int)index{return NO;}
 - (CGRect)insetRect:(CGRect)rect forNativeWindowBorderWithStyle:(NSUInteger)style{return rect;}
 - (CGRect)outsetRect:(CGRect)rect forNativeWindowBorderWithStyle:(NSUInteger)style{return rect;}
 - (NSPoint)mouseLocation{return gameWindow?[gameWindow mouseLocationOutsideOfEventStream]:NSZeroPoint;}
 - (NSUInteger)currentModifierFlags{return modifiers;}
-- (NSArray*)orderedWindowNumbers{return gameWindow?@[@([gameWindow->owner windowNumber])]:@[];}
+- (NSArray*)orderedWindowNumbers{return gameWindow?[NSArray arrayWithObject:[NSNumber numberWithInteger:[gameWindow->owner windowNumber]]]:[NSArray array];}
 - (NSTimeInterval)textCaretBlinkInterval{return 0.5;}
 - (CGFloat)scrollerWidth{return 15;}
 - (CGFloat)doubleClickInterval{return 0.5;}

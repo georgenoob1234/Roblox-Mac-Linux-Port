@@ -26,11 +26,26 @@ cp runtime/optimized/audio/build/CoreAudio.component/Contents/MacOS/CoreAudio ru
 # Inventory the final framework exports; earlier fill generation shadows the
 # real CoreAudio clock with a zero-returning placeholder in the flat namespace.
 sh runtime/shims/fill/build.sh
+# Clang >= 23 lowers Objective-C literals at -mmacosx-version-min >= 10.16 onto
+# Apple-only symbols (__NSArray0__struct, OBJC_CLASS_$_NSConstantIntegerNumber)
+# that Darling's GNUstep-based runtime does not export. Darling's CMake compiles
+# .m and .mm sources under the plain C and C++ rules, so lowering only the ObjC
+# language flags (as an earlier attempt did) does not cover them: the whole
+# runtime must compile at 10.15, which keeps clang's classic lowering
+# (__NSArray0__/__NSDictionary0__ singletons plus plain +numberWithX:
+# messaging) that Darling's CoreFoundation provides and which the stock Debian
+# binaries already rely on. Targets that set their own -mmacosx-version-min
+# (Foundation and the Cocotron frameworks at 10.10, csu at 10.4-10.6) append it
+# later on the command line and are unaffected. The one 10.16-annotated symbol
+# the runtime references (os_variant_is_basesystem, see the overlay change to
+# libc's os/variant_private.h) is annotated 10.15 instead, so it stays a strong
+# import and every recorded load command matches the stock runtime exactly.
 CFLAGS= CXXFLAGS= CPPFLAGS= LDFLAGS= cmake -S runtime/src/darling -B runtime/src/darling-o2 -G Ninja \
     -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DDEBIAN_PACKAGING=ON -DJSC_UNIFIED_BUILD=ON -DTARGET_i386=OFF \
     -DCOMPONENTS=gui_frameworks,gui_stubs,cli -DENABLE_METAL=ON -DDARLING_NO_CCACHE=ON \
-    -DCMAKE_BUILD_TYPE=O2 -DCMAKE_C_FLAGS_O2=-O2 -DCMAKE_CXX_FLAGS_O2=-O2 \
+    -DCMAKE_BUILD_TYPE=O2 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+    -DCMAKE_C_FLAGS_O2=-O2 -DCMAKE_CXX_FLAGS_O2=-O2 \
     "-DCMAKE_EXE_LINKER_FLAGS=-B\"$ROBLOX_MAC_PORTABLE_ROOT/usr/lib/\"" \
     -DCMAKE_OBJC_FLAGS_O2=-O2 -DCMAKE_OBJCXX_FLAGS_O2=-O2 \
     -DCMAKE_ASM_FLAGS_O2= -DCMAKE_ASM-ATT_FLAGS_O2= \

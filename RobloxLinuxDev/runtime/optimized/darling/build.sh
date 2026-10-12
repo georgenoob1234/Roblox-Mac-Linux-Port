@@ -30,19 +30,30 @@ fi
 if [ ! -f "$BUILD/build.ninja" ]; then
     # Same options as debian/rules, x86_64 only; -O2 without NDEBUG so the
     # runtime's assertions keep their stock behavior.
+    # Version-min must match the top-level build.sh: clang >= 23 lowers
+    # Objective-C literals at >= 10.16 onto Apple-only symbols Darling's
+    # GNUstep runtime lacks, and Darling's CMake compiles .m/.mm sources under
+    # the plain C/C++ rules, so the deployment target covers every language;
+    # 10.15 keeps the classic __NSArray0__/__NSDictionary0__ ABI. See the
+    # comment in the top-level build.sh for the full story.
     run_logged "$BUILD/configure.log" env CFLAGS= CXXFLAGS= CPPFLAGS= LDFLAGS= \
         cmake -G Ninja -S "$A/src/darling" -B "$BUILD" \
         -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DDEBIAN_PACKAGING=ON -DJSC_UNIFIED_BUILD=ON -DTARGET_i386=OFF \
         -DCOMPONENTS=gui_frameworks,gui_stubs,cli -DENABLE_METAL=ON -DDARLING_NO_CCACHE=ON \
-        -DCMAKE_BUILD_TYPE=O2 -DCMAKE_C_FLAGS_O2=-O2 -DCMAKE_CXX_FLAGS_O2=-O2 \
+        -DCMAKE_BUILD_TYPE=O2 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+        -DCMAKE_C_FLAGS_O2=-O2 -DCMAKE_CXX_FLAGS_O2=-O2 \
         "-DCMAKE_EXE_LINKER_FLAGS=-B\"$PORTABLE/usr/lib/\"" \
         -DCMAKE_OBJC_FLAGS_O2=-O2 -DCMAKE_OBJCXX_FLAGS_O2=-O2 \
         "-DCMAKE_ASM_FLAGS_O2=" "-DCMAKE_ASM-ATT_FLAGS_O2=" \
         -DVulkan_INCLUDE_DIR="$A/src/Vulkan-Headers-1.3.290/include" \
         -DVulkan_LIBRARY=/usr/lib/libvulkan.so.1
 else
+    # Keep the deployment target pinned when reconfiguring an existing tree:
+    # its CMake cache keeps whatever value it was configured with, and an
+    # unpinned re-run would silently restore 11.0 (clang 23 literal lowering).
     run_logged "$BUILD/configure.log" cmake -S "$A/src/darling" -B "$BUILD" \
+        -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
         "-DCMAKE_EXE_LINKER_FLAGS=-B\"$PORTABLE/usr/lib/\""
 fi
 run_logged "$BUILD/build.log" ninja -C "$BUILD" -j "${BUILD_JOBS:-4}"

@@ -170,7 +170,7 @@
 }
 - (void)getTasksWithCompletionHandler:(void (^)(NSArray *,NSArray *,NSArray *))completion {
     NSArray *tasks;@synchronized(self){tasks=[_tasks copy];}
-    [_queue addOperationWithBlock:^{completion(tasks,@[],@[]);}];[tasks release];
+    [_queue addOperationWithBlock:^{completion(tasks,[NSArray array],[NSArray array]);}];[tasks release];
 }
 - (void)dealloc {[_config release];[_queue release];[_tasks release];[_description release];[super dealloc];}
 @end

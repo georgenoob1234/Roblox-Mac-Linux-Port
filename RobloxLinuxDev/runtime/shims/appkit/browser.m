@@ -38,46 +38,14 @@ extern NSApplication *NSApp;
 - (void)setTitle:(NSString *)title; - (void)setImage:(NSImage *)image;
 - (void)setTarget:(id)target; - (void)setAction:(SEL)action; - (void)setBordered:(BOOL)bordered;
 @end
-// The vendored Foundation does not export the private classes the Objective-C
-// literal syntax bakes in (OBJC_CLASS_$_NSConstantArray/Dictionary/IntegerNumber,
-// __NSArray0__struct, __NSDictionary0__struct), so every @[]/@{}/@(...) below is
-// built with explicit messaging instead.
-@interface NSNumber:NSObject
-+ (id)numberWithChar:(signed char)value; + (id)numberWithUnsignedChar:(unsigned char)value;
-+ (id)numberWithShort:(short)value; + (id)numberWithUnsignedShort:(unsigned short)value;
-+ (id)numberWithInt:(int)value; + (id)numberWithUnsignedInt:(unsigned int)value;
-+ (id)numberWithLong:(long)value; + (id)numberWithUnsignedLong:(unsigned long)value;
-+ (id)numberWithLongLong:(long long)value; + (id)numberWithUnsignedLongLong:(unsigned long long)value;
-+ (id)numberWithFloat:(float)value; + (id)numberWithDouble:(double)value;
-+ (id)numberWithBool:(signed char)value;
-@end
-static id rbxObj(id object) { return [object autorelease]; }
-static NSString *rbxStr(const char *text) { return [NSString stringWithUTF8String:text]; }
-static inline NSArray *rbxArray(id first,...) { va_list arguments;va_start(arguments,first);NSMutableArray *items=[NSMutableArray array];for(id item=first;item;item=va_arg(arguments,id))[items addObject:item];va_end(arguments);return items; }
-static inline NSMutableDictionary *rbxDict(id first,...) { va_list arguments;va_start(arguments,first);NSMutableDictionary *entries=[NSMutableDictionary dictionary];for(id key=first;key;key=va_arg(arguments,id))[entries setObject:va_arg(arguments,id) forKey:key];va_end(arguments);return entries; }
-#define RBX_ARRAY_NULL [NSArray array]
-#define RBX_DICT_NULL [NSDictionary dictionary]
-#define RBX_EMPTY_ARRAY rbxObj(RBX_ARRAY_NULL)
-#define RBX_EMPTY_DICTIONARY rbxObj(RBX_DICT_NULL)
-#define RBX_NUM(value) rbxObj(_Generic((value),\
-    BOOL: [NSNumber numberWithBool:(signed char)(value)],\
-    char: [NSNumber numberWithChar:(char)(value)],\
-    signed char: [NSNumber numberWithChar:(char)(value)],\
-    unsigned char: [NSNumber numberWithUnsignedChar:(unsigned char)(value)],\
-    short: [NSNumber numberWithShort:(short)(value)],\
-    unsigned short: [NSNumber numberWithUnsignedShort:(unsigned short)(value)],\
-    int: [NSNumber numberWithInt:(int)(value)],\
-    unsigned int: [NSNumber numberWithUnsignedInt:(unsigned int)(value)],\
-    long: [NSNumber numberWithLong:(long)(value)],\
-    unsigned long: [NSNumber numberWithUnsignedLong:(unsigned long)(value)],\
-    long long: [NSNumber numberWithLongLong:(long long)(value)],\
-    unsigned long long: [NSNumber numberWithUnsignedLongLong:(unsigned long long)(value)],\
-    float: [NSNumber numberWithFloat:(float)(value)],\
-    double: [NSNumber numberWithDouble:(double)(value)]))
-#define RBX_STR(text) rbxObj(rbxStr("" text ""))
-#define RBX_PAIR(key,value) RBX_STR(key),value,
-#define RBX_ITEMS(...) rbxArray(__VA_ARGS__,nil)
-#define RBX_ENTRIES(...) rbxDict(__VA_ARGS__,nil)
+// The vendored Foundation is GNUstep Base. When targeting the Apple runtime,
+// clang lowers the @[]/@{}/@() literal syntax onto private Apple classes
+// (OBJC_CLASS_$_NSConstantArray/NSConstantDictionary/NSConstantIntegerNumber,
+// __NSArray0__struct, __NSDictionary0__struct) that GNUstep Base does not
+// export, so every collection and boxed number in this file is built with the
+// public +arrayWithObjects:/+dictionaryWithObjectsAndKeys:/+numberWithX: class
+// methods instead. Those return autoreleased (+0) objects, matching the
+// ownership semantics of the literals they replace.
 @interface NSWindow (NativeHost)
 - (id)platformWindow; - (void)setMenu:(id)menu;
 + (BOOL)hasMainMenuForStyleMask:(unsigned long)style;
@@ -137,7 +105,7 @@ static void sendMessage(NSDictionary *message) {
         for(NSWindow *w in [NSApp windows]) {
             if([w isVisible] && ![w isKindOfClass:[NSPanel class]] && [w frame].size.width>400 && [w frame].size.height>300) {
                 gameWindow=[w retain];[w setMenu:nil];
-                sendMessage(RBX_ENTRIES RBX_PAIR("op",RBX_STR("attach")) RBX_PAIR("window",RBX_NUM([[w platformWindow] windowHandle])));break;
+                sendMessage([NSDictionary dictionaryWithObjectsAndKeys:@"attach",@"op",[NSNumber numberWithUnsignedLong:[[w platformWindow] windowHandle]],@"window",nil]);break;
             }
         }
     }
@@ -194,7 +162,7 @@ static BOOL deliverClientURL(id value) {
     if(![NSThread isMainThread]){dispatch_async(dispatch_get_main_queue(),^{deliverClientURL(value);});return YES;}
     id delegate=[NSApp delegate];
     if(![delegate respondsToSelector:@selector(application:openURLs:)])return NO;
-    [delegate application:NSApp openURLs:RBX_ITEMS(url)];return YES;
+    [delegate application:NSApp openURLs:[NSArray arrayWithObject:url]];return YES;
 }
 @interface MacWorkspace:NSWorkspace @end
 @implementation MacWorkspace (RbxEmbeddedLinks)
@@ -202,7 +170,7 @@ static BOOL deliverClientURL(id value) {
     if(deliverClientURL([url absoluteString]))return YES;
     NSString *scheme=[[url scheme] lowercaseString];
     if(!getenv("ROBLOX_MAC_UI_SOCKET") || !([scheme isEqual:@"https"] || [scheme isEqual:@"http"]) || ![[url host] length])return NO;
-    sendMessage(RBX_ENTRIES RBX_PAIR("op",RBX_STR("load")) RBX_PAIR("view",RBX_NUM(0)) RBX_PAIR("url",[url absoluteString])));return YES;
+    sendMessage([NSDictionary dictionaryWithObjectsAndKeys:@"load",@"op",[NSNumber numberWithInt:0],@"view",[url absoluteString],@"url",nil]);return YES;
 }
 @end
 
@@ -241,7 +209,7 @@ static BOOL deliverClientURL(id value) {
     // Darling's animator applies properties immediately; still execute the completion.
     id context=[[[self alloc] init] autorelease];if(changes)changes(context);if(completion)completion();
 }
-- (void)setDuration:(double)duration {stateFor(self)[@"duration"]=RBX_NUM(duration);}
+- (void)setDuration:(double)duration {stateFor(self)[@"duration"]=[NSNumber numberWithDouble:duration];}
 - (double)duration {return [stateFor(self)[@"duration"] doubleValue];}
 - (void)setTimingFunction:(id)function {stateFor(self)[@"timing"]=function;}
 @end

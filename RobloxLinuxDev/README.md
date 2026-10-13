@@ -236,9 +236,46 @@ python3 runtime/package/check-egl.py runtime/package/AppDir --surfaceless --vulk
 # URI handler registration and pending store
 python3 runtime/package/check-uri-handoff.py
 
-# Bootstrapper UI
+# Bootstrapper UI and appearance settings
 python3 runtime/package/check-bootstrapper.py
+
+# Wayland backend, IME, profiler overlay and desktop cursor tests
+sh runtime/optimized/ui-build.sh
 ```
+
+### Desktop appearance and window decorations
+
+The runtime supports modern desktop integration with native window decorations and system cursor themes, configurable through the bootstrapper UI (Settings), CLI (`sh run.sh set ...`), or environment variables:
+
+| Setting | Values | Default | Description |
+|---------|--------|---------|-------------|
+| `window_decoration` | `auto`, `system`, `gtk`, `legacy` | `auto` | Decoration mode (`ROBLOX_MAC_DECORATIONS` overrides) |
+| `cursor_appearance` | `system`, `legacy` | `system` | Cursor theme mode (`ROBLOX_MAC_CURSOR_APPEARANCE` overrides) |
+
+- **Decoration Modes**:
+  - `auto`: Dynamically requests server-side decorations (SSD via Wayland `zxdg_toplevel_decoration_v1`) through `gdk_wayland_window_announce_ssd`. On compositors supporting SSD (such as KDE Plasma / KWin), the native window frame with desktop titlebar and buttons is rendered by the window manager.
+  - `system`: Directly requests SSD from the compositor.
+  - `gtk`: Renders modern GTK client-side decorations (CSD) matching the desktop GTK theme and button layout.
+  - `legacy`: Preserves the original header bar with custom text buttons (`←`, `→`, `↻`, `Back to Roblox`, `×`, `□`, `−`), providing an explicit fallback.
+- **Cursor Appearance Modes**:
+  - `system`: Queries the host cursor theme and size (from `~/.config/gtk-3.0/settings.ini` or `XCURSOR_THEME`/`XCURSOR_SIZE`) and maps Cocoa/game cursor shapes to native desktop cursors. Shift Lock software cursor overlay and relative pointer capture are fully preserved.
+  - `legacy`: Uses the bundled Roblox PNG textures for standard cursor shapes.
+- **Host Theme Isolation**: In sandboxed releases, host appearance settings are parsed via `GKeyFile` from `$ROBLOX_MAC_HOST_CONFIG/gtk-3.0/settings.ini` to read theme names and dark mode preferences without mounting or exposing private host directories.
+
+### Manual verification guidelines
+
+Unit tests and offline checks verify compilation, ABI compatibility, event queues, and fallback generation, but cannot verify compositor-specific visual rendering. The following requires manual testing on live desktop sessions:
+
+1. **KDE Plasma (KWin Wayland)**:
+   - Launch with `auto` or `system` decorations (`ROBLOX_MAC_DECORATIONS=auto`). Confirm KWin renders the native Breeze titlebar with window buttons, shadows, and window snapping.
+   - Confirm cursor matches the KDE system cursor theme (e.g. Breeze) and scales with configured cursor size.
+2. **GNOME (Mutter Wayland)**:
+   - Mutter does not support SSD for Wayland clients. In `auto` mode, confirm graceful fallback. Launch with `ROBLOX_MAC_DECORATIONS=gtk` to verify GTK client-side decorations with Adwaita styling.
+3. **Legacy Fallback**:
+   - Launch with `ROBLOX_MAC_DECORATIONS=legacy ROBLOX_MAC_CURSOR_APPEARANCE=legacy`. Confirm original text-based buttons and Roblox cursor textures appear.
+4. **Shift Lock & Input Capture**:
+   - In-game, enable Shift Lock (e.g., Shift key in supported experiences). Confirm pointer locks to center, relative camera motion works without jumping, and the Shift Lock reticle renders cleanly.
+   - Toggle fullscreen (F11 / Alt+Enter). Confirm window decoration hides in fullscreen and restores properly on exit.
 
 ### Compiler / ABI verification
 

@@ -64,11 +64,29 @@ sh run.sh --settings             # open the full launcher on Settings
 sh run.sh get auto_update
 sh run.sh set auto_update auto    # choices: auto, ask, off
 sh run.sh set check_interval_hours 24
+sh run.sh get window_decoration
+sh run.sh set window_decoration auto   # choices: auto, system, gtk, legacy
+sh run.sh get cursor_appearance
+sh run.sh set cursor_appearance system # choices: system, legacy
+sh run.sh reset-appearance             # restores appearance defaults
 ```
 
 `DO_NOT_SHARE/bootstrapper.json` stores the update mode (`ask` by default),
-check interval (24 hours by default), skipped version, last check and last
-known latest. Network checks have a short timeout and never prevent a launch;
+check interval (24 hours by default), appearance settings (`window_decoration: "auto"`,
+`cursor_appearance: "system"`), skipped version, last check and last
+known latest.
+
+### Appearance and Desktop Integration
+- **Window Decorations (`window_decoration` / `ROBLOX_MAC_DECORATIONS`)**:
+  - `auto` (default): Prefers native server-side decorations (SSD via Wayland `zxdg_toplevel_decoration_v1`) on compositors that support it (e.g. KWin on KDE Plasma).
+  - `system`: Directly requests compositor-managed server-side decorations (SSD).
+  - `gtk`: Clean modern GTK client-side decorations (CSD) with desktop theme buttons.
+  - `legacy`: Original header bar with custom text buttons (`←`, `→`, `↻`, `Back to Roblox`, `×`, `□`, `−`), preserved for complete backwards compatibility.
+- **Cursor Appearance (`cursor_appearance` / `ROBLOX_MAC_CURSOR_APPEARANCE`)**:
+  - `system` (default): Uses the desktop cursor theme and size (e.g. Breeze or Adwaita from `~/.config/gtk-3.0/settings.ini` or `XCURSOR_THEME`/`XCURSOR_SIZE`). Maps standard cursor shapes (pointer, text I-beam, crosshair, hand) to native desktop cursors while preserving Shift Lock and input capture.
+  - `legacy`: Uses the bundled Roblox PNG textures for standard cursors.
+- **Environment Overrides**: `ROBLOX_MAC_DECORATIONS` and `ROBLOX_MAC_CURSOR_APPEARANCE` can be set in the shell to override saved preferences without modifying `bootstrapper.json`.
+- **Reset**: Run `sh run.sh reset-appearance` or click "Restore appearance defaults" in the Settings UI. Network checks have a short timeout and never prevent a launch;
 `0` checks every launch. Exit codes are `0` for success or a dropped second
 launch, `1` for setup/update/check failure, `2` for invalid input, and `125`
 for cancellation.

@@ -303,8 +303,10 @@ sha256sum -c RobloxLinuxRelease.tar.gz.sha256
 | Workflow | Trigger | Runner | Purpose |
 |----------|---------|--------|---------|
 | `ci.yml` → `lint` | Every push, PRs to `main` | `ubuntu-latest` | Shell/Python/JSON/YAML syntax, Darling overlay consistency |
-| `ci.yml` → `build` | Pushes to `main` only, when enabled | `[self-hosted, linux, x64, roblox-builder]` | Full build + AppImage verification |
-| `release.yml` | `workflow_dispatch` (manual) | Self-hosted build → `ubuntu-latest` publish | Build, package, tag, publish GitHub Release |
+| `ci.yml` → `build` | Pushes to `main` only, when enabled | `[self-hosted, linux, x64, roblox-builder]` | Full build + AppImage verification from `/home/runner/r` |
+| `build-release.yml` | `workflow_dispatch` (manual) | Self-hosted build → `ubuntu-latest` publish (publish mode only) | Full build, verified `RobloxLinuxRelease.tar.gz` artifact; optionally tag + publish a GitHub Release |
+
+The older always-publish `release.yml` and the one-off `runner-smoke.yml` were removed; `build-release.yml` replaces them.
 
 ### Enable self-hosted builds
 
@@ -316,9 +318,18 @@ The build job is **disabled by default** until the CachyOS VM is ready. To enabl
 
 Until this variable is set to `true`, only the `lint` job runs on pushes. The build job is skipped.
 
-### Short checkout paths
+### Persistent short checkout (`/home/runner/r`)
 
-The CI uses `actions/checkout` with `path: r` to keep the working directory shallow. This is required because the runtime derives Unix-domain socket paths from the data directory, and Linux limits socket paths to 107 bytes. The default GitHub Actions workspace path (`/home/runner/actions-runner/_work/repo/repo`) is too deep.
+The runtime derives Unix-domain socket paths from the data directory (`RobloxLinuxDev/.build/profile`), and Linux limits socket paths to 107 bytes. The default GitHub Actions workspace path (`/home/runner/actions-runner/_work/repo/repo`) is too deep, so all self-hosted builds use the dedicated short checkout `/home/runner/r`.
+
+That checkout persists between runs. Before every build, `.github/scripts/sync-checkout.sh` synchronizes it to the exact commit being built:
+
+- It fetches the pinned commit SHA and checks it out detached — never a moving branch ref — so the build, packaging and any release always use the same commit.
+- It preserves ignored dependency trees and build outputs (`RobloxLinuxDev/.build`, `.downloads`, `metal2vulkan`, ...): no `git reset --hard`, no `git clean`, no symlink relocation. Cached state survives between runs, and a timed-out or failed build is resumed incrementally by re-running the workflow.
+- It aborts if the working tree has unexpected tracked modifications instead of overwriting them.
+- It refuses to use a checkout whose `origin` points anywhere but this repository.
+
+Because CI and release builds share the persistent checkout, the self-hosted build jobs of `ci.yml` and `build-release.yml` share one concurrency group (`roblox-builder-vm`): only one build runs on the VM at a time, in-progress builds are never cancelled, and queued runs wait (superseding older still-pending runs only).
 
 ### Self-hosted runner setup
 
@@ -355,22 +366,22 @@ The CI uses `actions/checkout` with `path: r` to keep the working directory shal
 - The CI build job runs **only on trusted pushes to `main`**, never on untrusted PRs.
 - Keep the VM isolated from ZimaOS/NAS shares and private networks.
 - The CI working directory must be **dedicated to CI** — do not share it with personal development checkouts, login profiles, or private data.
-- The runner's `clean: false` checkout strategy preserves build caches between runs. Ensure the CI directory contains only CI-related data.
+- The runner's persistent `/home/runner/r` checkout preserves build caches between runs (see above). Ensure it contains only CI-related data.
 
-### Manual release
+### Manual build and release (Build Release workflow)
 
-1. Go to **Actions → Release → Run workflow**.
-2. Enter a version tag (e.g., `v1.0.0`). The tag must not already exist.
-3. The workflow:
-   - Validates the tag format and uniqueness.
-   - Builds on the self-hosted runner (same configuration as CI).
-   - Packages `RobloxLinuxRelease` using `runtime/package/build-release.sh`.
-   - Creates `RobloxLinuxRelease.tar.gz` (excluding `DO_NOT_SHARE`, `.build`, `.downloads`, and other private paths).
-   - Generates a SHA-256 checksum.
-   - Uploads artifacts and publishes a GitHub Release from an `ubuntu-latest` job with `contents: write`.
-   - Creates an annotated tag pointing to the exact commit that produced the release.
+Go to **Actions → Build Release → Run workflow** (main branch only) and choose a mode:
 
-> **Optional safeguard:** Create a GitHub Environment (e.g., `release`) with required reviewers in **Settings → Environments**. Add `environment: release` to the `publish` job in `release.yml` for an extra approval step before publishing.
+- **Artifact only (default):** leave `publish` unchecked and the tag empty. The workflow validates the inputs, runs the full build on the self-hosted runner, packages and verifies `RobloxLinuxRelease.tar.gz` plus its SHA-256 checksum, and uploads it as a workflow artifact named `RobloxLinuxRelease-<short SHA>` (14-day retention). **No tag and no GitHub Release are created.** Download the artifact from the workflow run page under **Artifacts** (after unzipping, `sha256sum -c RobloxLinuxRelease.tar.gz.sha256`).
+- **Build and publish:** check `publish` and enter a version tag (e.g., `v0.2.0`). The tag is required, must match `vX.Y.Z` (optional `-suffix`), and must not already exist — the workflow refuses to overwrite existing tags or releases. Once the build, packaging, archive validation and artifact upload have all succeeded, a separate GitHub-hosted job with only `contents: write` re-verifies the artifact checksum, creates an annotated tag pointing at the exact built commit, and publishes a GitHub Release with `RobloxLinuxRelease.tar.gz` and its checksum. The release URL is printed at the end of the run and in the run summary. Published releases appear under **Releases** on the repository page.
+
+Notes:
+
+- Tag format and availability are validated before the long self-hosted build starts; a stray tag with `publish` unchecked is rejected.
+- Publishing happens immediately after verification, without an extra approval prompt. For an optional approval step, create a GitHub Environment with required reviewers in **Settings → Environments** and add `environment: <name>` to the `publish` job.
+- The first full build on the N100 VM bootstraps everything (Darling sysroot, dependencies, Roblox client download) and can take many hours; the job timeout is 12 hours. Build state persists in `/home/runner/r`, so re-running the workflow after a timeout or failure resumes incrementally instead of starting over.
+- Runner prerequisites are those of section 2 (CachyOS packages, Docker access for the `runner` user, ~25 GiB free disk); the runner must never run as root. `BUILD_JOBS=2`. Expected limitations: 4 vCPUs mean long compile times, and only one build runs on the VM at a time.
+- Only the original repository's `main` branch can dispatch the self-hosted build; pull requests and forks never run on the VM.
 
 ---
 

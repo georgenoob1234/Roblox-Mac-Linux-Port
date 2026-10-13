@@ -22,7 +22,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -50,41 +50,55 @@ jobs:
       github.ref == 'refs/heads/main' &&
       vars.ENABLE_SELF_HOSTED_BUILDS == 'true'
     runs-on: [self-hosted, linux, x64, roblox-builder]
-    timeout-minutes: 240
+    # Self-hosted runners are not subject to the 6-hour hosted-job cap;
+    # the first full build on the N100 can take many hours.  If it times
+    # out, the next push resumes from the preserved build state.
+    timeout-minutes: 720
     permissions:
       contents: read
     env:
       BUILD_JOBS: '2'
+      PERSISTENT_CHECKOUT: /home/runner/r
     concurrency:
-      group: ci-build-self-hosted
-      cancel-in-progress: true
+      # Shared with the build-release.yml build job: the persistent
+      # /home/runner/r checkout and the builder VM must only be used by
+      # one build at a time.  In-progress builds are never cancelled; a
+      # queued run waits and replaces older still-pending runs only.
+      group: roblox-builder-vm
+      cancel-in-progress: false
     steps:
-      # Short checkout path: the runtime derives Unix-domain socket paths from
-      # the data directory (sun_path limit 107 bytes).  The default GitHub
-      # Actions workspace (/home/.../actions-runner/_work/repo/repo) is too
-      # deep.  A single-character relative path keeps the effective data path
-      # well under the limit.
-      - name: Checkout (short path)
-        uses: actions/checkout@v4
+      # The build itself runs from the persistent short checkout
+      # /home/runner/r, synchronized to this push's exact commit by
+      # .github/scripts/sync-checkout.sh.  The runtime derives
+      # Unix-domain socket paths from the data directory (sun_path limit
+      # 107 bytes); the default GitHub Actions workspace
+      # (/home/.../actions-runner/_work/repo/repo) is too deep.  This
+      # ephemeral checkout only provides the trusted workflow scripts.
+      - name: Checkout (trusted workflow scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: r
           fetch-depth: 1
-          # Preserve ignored build caches between runs on the persistent runner
-          # (downloaded dependencies, compiled objects).  The CI working
-          # directory must be dedicated to CI — never shared with personal data.
-          clean: false
+          # Read-only build job: never leave a job token in the ephemeral
+          # workspace checkout on the VM.
+          persist-credentials: false
+
+      - name: Sync persistent checkout (/home/runner/r)
+        run: |
+          set -eu
+          sh .github/scripts/sync-checkout.sh \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            "$GITHUB_SHA" \
+            "$PERSISTENT_CHECKOUT"
 
       - name: Verify Unix socket path budget
-        working-directory: r
         run: |
-          # Replicate roblox-mac's socket path calculation to fail fast if the
-          # checkout path is too deep for Linux Unix-domain sockets.  The build
-          # data directory lives inside RobloxLinuxDev/ (build.sh sets
-          # ROBLOX_MAC_DATA to $HERE/.build/profile with HERE=RobloxLinuxDev).
-          HERE=$(pwd)
-          DATA="$HERE/RobloxLinuxDev/.build/profile"
-          PREFIX="$DATA/prefix"
-          ss_sock="$PREFIX/var/run/shellspawn.sock"
+          set -eu
+          # Replicate roblox-mac's socket path calculation to fail fast if
+          # the checkout path is too deep for Linux Unix-domain sockets.
+          # The build data directory lives inside the persistent checkout
+          # (build.sh sets ROBLOX_MAC_DATA to RobloxLinuxDev/.build/profile).
+          DATA="$PERSISTENT_CHECKOUT/RobloxLinuxDev/.build/profile"
+          ss_sock="$DATA/prefix/var/run/shellspawn.sock"
           ui_sock="/Volumes/SystemRoot$DATA/launch.123456/ui.sock"
           ss_len=$(LC_ALL=C printf '%s' "$ss_sock" | wc -c)
           ui_len=$(LC_ALL=C printf '%s' "$ui_sock" | wc -c)
@@ -97,12 +111,13 @@ jobs:
           echo 'Socket path budget OK.'
 
       - name: Full build
-        working-directory: r/RobloxLinuxDev
+        working-directory: /home/runner/r/RobloxLinuxDev
         run: sh build.sh
 
       - name: Verify AppImage exists
-        working-directory: r/RobloxLinuxDev
+        working-directory: /home/runner/r/RobloxLinuxDev
         run: |
+          set -eu
           test -f runtime/package/roblox-mac-x86_64.AppImage || {
             echo '::error::Build did not produce runtime/package/roblox-mac-x86_64.AppImage'
             exit 1

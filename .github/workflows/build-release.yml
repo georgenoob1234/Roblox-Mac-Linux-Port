@@ -1,0 +1,383 @@
+name: Build Release
+
+# Manual build-and-release workflow.
+#
+#   publish=false (default): full build on the self-hosted CachyOS VM,
+#     verified packaging, and a downloadable workflow artifact.  No tag,
+#     no draft, no GitHub Release.
+#   publish=true: everything above plus an immediately published GitHub
+#     Release (tag required) created by a separate GitHub-hosted job
+#     whose only elevated permission is contents:write.
+#
+# The self-hosted build never runs PR or fork code: workflow_dispatch can
+# only be triggered manually, the workflow refuses any ref other than
+# refs/heads/main, and the build job is additionally gated on repository
+# and ref below.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          false (default): build and upload a workflow artifact only.
+          true: build, upload the artifact, and immediately publish a
+          GitHub Release from the exact built commit.
+        required: false
+        type: boolean
+        default: false
+      tag:
+        description: >-
+          Version tag, e.g. v0.2.0. Required (and must not already exist)
+          when publish=true; must be empty otherwise.
+        required: false
+        type: string
+        default: ''
+
+# Default for every job: read-only.  Only the GitHub-hosted publish job
+# overrides this with contents:write.  No credentials of any kind are
+# stored permanently on the self-hosted VM.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate — GitHub-hosted, read-only.  Fail before consuming any
+  # self-hosted runner time.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.inputs.outputs.publish }}
+      tag: ${{ steps.inputs.outputs.tag }}
+    steps:
+      - name: Checkout (tag-check helper)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require original repository and main branch
+        run: |
+          set -eu
+          if [ "$GITHUB_REPOSITORY" != 'georgenoob1234/Roblox-Mac-Linux-Port' ]; then
+            echo "::error::This workflow must only run in the original repository."
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            echo "::error::Run this workflow from the main branch (selected ref: $GITHUB_REF)."
+            exit 1
+          fi
+
+      - name: Validate publish/tag combination
+        id: inputs
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ "$PUBLISH" = 'true' ]; then
+            [ -n "$TAG" ] || {
+              echo '::error::publish=true requires a version tag (e.g. v0.2.0).'
+              exit 1
+            }
+            sh .github/scripts/check-tag.sh "$TAG"
+          else
+            # Artifact-only mode: an empty tag is accepted; a stray tag is
+            # rejected so a release is never expected but silently skipped.
+            [ -z "$TAG" ] || {
+              echo "::error::Tag '$TAG' given with publish=false. The tag input only applies to publish=true; enable publish or clear the tag."
+              exit 1
+            }
+          fi
+          {
+            echo "publish=$PUBLISH"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISH" = 'true' ]; then
+            echo "Mode: build and publish GitHub Release $TAG"
+          else
+            echo 'Mode: artifact only (no tag, no release)'
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build — self-hosted CachyOS VM, read-only token, exact pinned commit.
+  #
+  # Uses the persistent short checkout /home/runner/r (Unix-domain socket
+  # path limit); see .github/scripts/sync-checkout.sh for how it is kept
+  # safe and in sync.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build on self-hosted runner
+    needs: validate
+    if: >-
+      github.repository == 'georgenoob1234/Roblox-Mac-Linux-Port' &&
+      github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64, roblox-builder]
+    # Self-hosted runners are not subject to the 6-hour hosted-job cap;
+    # the first full build on the N100 can take many hours.  If it times
+    # out, re-run the workflow: the preserved build state resumes.
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    concurrency:
+      # Shared with the ci.yml build job: the persistent /home/runner/r
+      # checkout and the builder VM must only be used by one build at a
+      # time.  In-progress builds are never cancelled; a queued run waits
+      # and replaces older still-pending runs only.
+      group: roblox-builder-vm
+      cancel-in-progress: false
+    env:
+      BUILD_JOBS: '2'
+      PERSISTENT_CHECKOUT: /home/runner/r
+      # Per-run staging directory name (unique per run and attempt),
+      # resolved under the runner's temp directory via $RUNNER_TEMP.
+      RELEASE_STAGING: release-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      sha: ${{ steps.info.outputs.sha }}
+      short_sha: ${{ steps.info.outputs.short_sha }}
+      artifact_name: ${{ steps.info.outputs.artifact_name }}
+      archive_sha256: ${{ steps.checksum.outputs.digest }}
+    steps:
+      - name: Preflight (identity, disk space, memory)
+        run: |
+          set -eu
+          [ "$(id -u)" -ne 0 ] || { echo '::error::Refusing to run as root.'; exit 1; }
+          echo "Runner user: $(id -un) ($(uname -m), $(nproc) CPUs)"
+          free -h || true
+          # A full build needs ~25 GiB free (README section 2).  The
+          # persistent checkout and the staging area both hold large
+          # intermediates; fail early and clearly instead of mid-build.
+          need_kb=$((25 * 1024 * 1024))
+          for p in /home/runner "$RUNNER_TEMP"; do
+            avail_kb=$(df -Pk "$p" | awk 'NR==2 {print $4}')
+            if [ "$avail_kb" -lt "$need_kb" ]; then
+              echo "::error::Insufficient disk space at $p: $((avail_kb / 1024 / 1024)) GiB free, ~25 GiB required."
+              exit 1
+            fi
+          done
+          df -h /home/runner "$RUNNER_TEMP"
+
+      - name: Checkout (trusted workflow scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          # Read-only build job: never leave a job token in the ephemeral
+          # workspace checkout on the VM.
+          persist-credentials: false
+
+      - name: Sync persistent checkout (/home/runner/r)
+        run: |
+          set -eu
+          sh .github/scripts/sync-checkout.sh \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            "$GITHUB_SHA" \
+            "$PERSISTENT_CHECKOUT"
+
+      - name: Record build metadata
+        id: info
+        run: |
+          set -eu
+          sha=$(git -C "$PERSISTENT_CHECKOUT" rev-parse HEAD)
+          [ "$sha" = "$GITHUB_SHA" ] || {
+            echo "::error::Persistent checkout is at $sha, expected $GITHUB_SHA."
+            exit 1
+          }
+          short_sha=$(printf '%s' "$sha" | cut -c1-7)
+          {
+            echo "sha=$sha"
+            echo "short_sha=$short_sha"
+            echo "artifact_name=RobloxLinuxRelease-$short_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building release from commit $sha"
+
+      - name: Verify Unix socket path budget
+        run: |
+          set -eu
+          # The build data directory lives inside the persistent checkout
+          # (build.sh sets ROBLOX_MAC_DATA to RobloxLinuxDev/.build/profile).
+          DATA="$PERSISTENT_CHECKOUT/RobloxLinuxDev/.build/profile"
+          ss_sock="$DATA/prefix/var/run/shellspawn.sock"
+          ui_sock="/Volumes/SystemRoot$DATA/launch.123456/ui.sock"
+          ss_len=$(LC_ALL=C printf '%s' "$ss_sock" | wc -c)
+          ui_len=$(LC_ALL=C printf '%s' "$ui_sock" | wc -c)
+          echo "shellspawn socket: $ss_sock ($ss_len bytes)"
+          echo "UI socket:         $ui_sock ($ui_len bytes)"
+          if [ "$ss_len" -gt 107 ] || [ "$ui_len" -gt 107 ]; then
+            echo '::error::Checkout path too deep for Unix-domain sockets (max 107 bytes).'
+            exit 1
+          fi
+          echo 'Socket path budget OK.'
+
+      - name: Full build
+        working-directory: /home/runner/r/RobloxLinuxDev
+        run: sh build.sh
+
+      - name: Verify AppImage exists
+        working-directory: /home/runner/r/RobloxLinuxDev
+        run: |
+          set -eu
+          test -f runtime/package/roblox-mac-x86_64.AppImage || {
+            echo '::error::Build did not produce runtime/package/roblox-mac-x86_64.AppImage'
+            exit 1
+          }
+          ls -lh runtime/package/roblox-mac-x86_64.AppImage
+
+      - name: Package release folder
+        working-directory: /home/runner/r/RobloxLinuxDev
+        run: |
+          set -eu
+          # Fresh output path: build-release.sh refuses to overwrite an
+          # existing destination, and this workflow never deletes state.
+          # Note that build-release.sh re-runs build-appimage.sh before
+          # staging.  $RUNNER_TEMP is unique per job and run attempt.
+          OUT="$RUNNER_TEMP/$RELEASE_STAGING/RobloxLinuxRelease"
+          if [ -e "$OUT" ]; then
+            echo "::error::Release output path already exists: $OUT"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/$RELEASE_STAGING"
+          sh runtime/package/build-release.sh "$OUT"
+          ls -la "$OUT"
+
+      - name: Create release archive and checksum
+        run: |
+          set -eu
+          REL="$RUNNER_TEMP/$RELEASE_STAGING/RobloxLinuxRelease"
+          test -d "$REL" || { echo '::error::Release directory missing.'; exit 1; }
+          # Guard against surprises before archiving (build-release.sh
+          # never stages this, but check anyway).
+          if [ -e "$REL/DO_NOT_SHARE" ]; then
+            echo '::error::DO_NOT_SHARE found in the release folder — aborting.'
+            exit 1
+          fi
+          STAGING="$RUNNER_TEMP/$RELEASE_STAGING"
+          tar -czf "$STAGING/RobloxLinuxRelease.tar.gz" \
+            -C "$STAGING" RobloxLinuxRelease
+          (
+            cd "$STAGING"
+            sha256sum RobloxLinuxRelease.tar.gz > RobloxLinuxRelease.tar.gz.sha256
+          )
+          ls -lh "$STAGING"
+
+      - name: Verify archive
+        run: |
+          set -eu
+          echo '--- Archive contents ---'
+          tar -tzf "$RUNNER_TEMP/$RELEASE_STAGING/RobloxLinuxRelease.tar.gz"
+          sh .github/scripts/verify-release-archive.sh \
+            "$RUNNER_TEMP/$RELEASE_STAGING/RobloxLinuxRelease.tar.gz"
+
+      - name: Verify checksum
+        id: checksum
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/$RELEASE_STAGING"
+          sha256sum -c RobloxLinuxRelease.tar.gz.sha256
+          digest=$(sha256sum RobloxLinuxRelease.tar.gz | cut -d' ' -f1)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Archive SHA-256: $digest"
+
+      # Always uploaded, in both modes.  In artifact-only mode
+      # (publish=false) the workflow stops here: no tag, no release.
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.info.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/${{ env.RELEASE_STAGING }}/RobloxLinuxRelease.tar.gz
+            ${{ runner.temp }}/${{ env.RELEASE_STAGING }}/RobloxLinuxRelease.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+          # The archive is already gzip-compressed; skip Zlib re-compression.
+          compression-level: 0
+          # .gitignore is a required release component and is hidden.
+          include-hidden-files: true
+          # Re-running the same commit replaces its artifact instead of
+          # failing on the name collision.
+          overwrite: true
+
+  # ---------------------------------------------------------------------------
+  # Publish — GitHub-hosted, contents:write, only in publish mode and only
+  # after a successful build, verified packaging, archive validation and
+  # artifact upload.  Runs immediately (no extra approval prompt unless a
+  # repository Environment protection rule is configured).
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, build]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.validate.outputs.tag }}
+      COMMIT_SHA: ${{ needs.build.outputs.sha }}
+      ARTIFACT_NAME: ${{ needs.build.outputs.artifact_name }}
+      ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
+    steps:
+      # Pin to the exact commit the build job produced the release from,
+      # so the tag created below always points to that SHA.
+      - name: Checkout the exact build commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Download the build artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+
+      - name: Verify artifact checksum
+        run: |
+          set -eu
+          sha256sum -c RobloxLinuxRelease.tar.gz.sha256
+          got=$(sha256sum RobloxLinuxRelease.tar.gz | cut -d' ' -f1)
+          [ "$got" = "$ARCHIVE_SHA256" ] || {
+            echo "::error::Downloaded artifact digest mismatch: expected $ARCHIVE_SHA256, got $got."
+            exit 1
+          }
+
+      - name: Re-check tag availability (never overwrite)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh .github/scripts/check-tag.sh "$TAG"
+
+      - name: Tag the exact build commit
+        run: |
+          set -eu
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Annotated tag at the pinned SHA; the push fails if the tag
+          # appeared in the meantime (never forced).
+          git tag -a "$TAG" -m "Release $TAG" "$COMMIT_SHA"
+          git push origin "$TAG"
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$TAG" \
+            --target "$COMMIT_SHA" \
+            --title "Release $TAG" \
+            --generate-notes \
+            RobloxLinuxRelease.tar.gz \
+            RobloxLinuxRelease.tar.gz.sha256
+
+      - name: Report release URL
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          url=$(gh release view "$TAG" --json url -q .url)
+          {
+            echo "### Published release"
+            echo
+            echo "GitHub Release: $url"
+            echo "Tag \`$TAG\` at commit \`$COMMIT_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "GitHub Release published: $url"

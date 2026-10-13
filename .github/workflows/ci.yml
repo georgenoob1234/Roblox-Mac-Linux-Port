@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs of the same workflow on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint — fast syntax / static checks, GitHub-hosted, read-only.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install PyYAML (fallback YAML validator)
+        run: pip install --no-cache-dir pyyaml
+
+      - name: Run CI lint
+        run: sh .github/scripts/ci-lint.sh
+
+  # ---------------------------------------------------------------------------
+  # Full build — self-hosted CachyOS VM, gated by repository variable.
+  #
+  # Enable: Settings → Secrets and variables → Actions → Variables
+  #         New repository variable:  ENABLE_SELF_HOSTED_BUILDS = true
+  #
+  # Until that variable exists and is "true", only the lint job runs.
+  # The build NEVER runs on untrusted PR code.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Full build (self-hosted)
+    needs: lint
+    # Only on trusted pushes to main, and only when explicitly enabled.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_SELF_HOSTED_BUILDS == 'true'
+    runs-on: [self-hosted, linux, x64, roblox-builder]
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      BUILD_JOBS: '2'
+    concurrency:
+      group: ci-build-self-hosted
+      cancel-in-progress: true
+    steps:
+      # Short checkout path: the runtime derives Unix-domain socket paths from
+      # the data directory (sun_path limit 107 bytes).  The default GitHub
+      # Actions workspace (/home/.../actions-runner/_work/repo/repo) is too
+      # deep.  A single-character relative path keeps the effective data path
+      # well under the limit.
+      - name: Checkout (short path)
+        uses: actions/checkout@v4
+        with:
+          path: r
+          fetch-depth: 1
+          # Preserve ignored build caches between runs on the persistent runner
+          # (downloaded dependencies, compiled objects).  The CI working
+          # directory must be dedicated to CI — never shared with personal data.
+          clean: false
+
+      - name: Verify Unix socket path budget
+        working-directory: r
+        run: |
+          # Replicate roblox-mac's socket path calculation to fail fast if the
+          # checkout path is too deep for Linux Unix-domain sockets.
+          HERE=$(pwd)
+          DATA="$HERE/.build/profile"
+          PREFIX="$DATA/prefix"
+          ss_sock="$PREFIX/var/run/shellspawn.sock"
+          ui_sock="/Volumes/SystemRoot$DATA/launch.123456/ui.sock"
+          ss_len=$(LC_ALL=C printf '%s' "$ss_sock" | wc -c)
+          ui_len=$(LC_ALL=C printf '%s' "$ui_sock" | wc -c)
+          echo "shellspawn socket: $ss_sock ($ss_len bytes)"
+          echo "UI socket:         $ui_sock ($ui_len bytes)"
+          if [ "$ss_len" -gt 107 ] || [ "$ui_len" -gt 107 ]; then
+            echo '::error::Checkout path too deep for Unix-domain sockets (max 107 bytes).'
+            exit 1
+          fi
+          echo 'Socket path budget OK.'
+
+      - name: Full build
+        working-directory: r/RobloxLinuxDev
+        run: sh build.sh
+
+      - name: Verify AppImage exists
+        working-directory: r/RobloxLinuxDev
+        run: |
+          test -f runtime/package/roblox-mac-x86_64.AppImage || {
+            echo '::error::Build did not produce runtime/package/roblox-mac-x86_64.AppImage'
+            exit 1
+          }
+          ls -lh runtime/package/roblox-mac-x86_64.AppImage

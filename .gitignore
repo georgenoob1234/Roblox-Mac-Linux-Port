@@ -1,6 +1,8 @@
 /*
 !/.gitignore
 !/README.md
+!/.actionlint.yaml
+!/.github/
 !/RobloxLinuxDev/
 !/RobloxLinuxRelease/
 **/DO_NOT_SHARE/

@@ -15,8 +15,8 @@ This directory contains the runtime, native renderer, browser, shims and packagi
 | Component | Details |
 |-----------|---------|
 | **Host OS** | CachyOS or Arch Linux, x86_64 |
-| **Compiler** | Clang/LLVM (tested with 22.1.8; LLVM 23 supported with deployment-target fix) |
-| **Build system** | CMake 4.4+, Ninja |
+| **Compiler** | Clang/LLVM 23.1.1 used for the recent successful build; LLVM 21+ headers required by the Indium branch-opcode fix (older configurations are not guaranteed) |
+| **Build system** | CMake and Ninja (recent build used CMake 4.4.3; this is a tested version, not a proven minimum) |
 | **Rust** | Cargo (tested with 1.98.1) |
 | **Python** | 3.11+ |
 | **Container** | Docker — Ubuntu 24.04 baseline for native UI/media dependency packaging |
@@ -39,32 +39,32 @@ This directory contains the runtime, native renderer, browser, shims and packagi
 
 ### Required packages (Arch/CachyOS)
 
+Update Arch/CachyOS first, then install the host build toolchain and headers. Run package management as an administrator, but **run the project build as a normal user**:
+
 ```sh
+sudo pacman -Syu
 sudo pacman -S --needed \
-  git curl unzip \
-  libarchive \
-  binutils patch \
-  clang lld llvm \
-  cmake ninja \
-  rust cargo \
-  pkgconf \
-  glslang spirv-tools \
+  base-devel git curl unzip libarchive binutils patch python \
+  clang llvm lld cmake ninja rust cargo pkgconf \
+  bison flex automake \
+  glslang spirv-tools vulkan-headers vulkan-icd-loader vulkan-tools \
   wayland wayland-protocols \
-  gtk3 \
-  webkit2gtk-4.1 \
-  json-glib \
-  sdl3 \
-  ffmpeg \
-  libpulse \
-  libxcursor libx11 libegl libgl \
+  gtk3 webkit2gtk-4.1 json-glib sdl3 \
+  ffmpeg libpulse \
+  libx11 libxext libxrandr libxkbfile libxcursor libxkbcommon \
+  libglvnd mesa glu \
+  fuse2 libbsd cairo fontconfig freetype2 \
+  libpng libtiff libjpeg-turbo giflib \
+  libedit ncurses libcap libelf \
+  openssl dbus icu libxml2 \
   docker
 ```
 
-> **Note:** Package names are based on the standard Arch repositories. If a package name has changed or is unavailable, check `pacman -Ss <name>` or the Arch Package Search. The `sdl3` package name should be verified — the Dockerfile builds SDL 3.4.2 from source if the system package is unavailable.
+**Why `fuse2` and `libxkbfile` matter:** A clean CachyOS CI VM encountered `Package 'fuse' not found` in Darling's `darling-dmg` CMake configuration, followed by `Xkbfile not found` in Cocotron AppKit. Both are **host build dependencies**, even when the finished AppImage can run without FUSE. `fuse2` supplies the legacy **`fuse`** pkg-config module (FUSE 3 is not interchangeable); `libxkbfile` supplies `xkbfile.pc`, `/usr/lib/libxkbfile.so` and `/usr/include/X11/extensions/XKBfile.h`. Cocotron checks CMake's `X11_Xkbfile_FOUND`, not merely package installation.
 
-### Additional Darling build dependencies
+`libglvnd` supplies `libEGL.so`, `libGL.so`, headers and `egl`/`gl` pkg-config files on Arch; use the concrete package instead of relying on the virtual names `libegl` and `libgl`. `sdl3` and `webkit2gtk-4.1` are available in Arch's `extra` repository. The pinned Ubuntu 24.04 Docker baseline separately builds SDL3 for packaged host libraries.
 
-Darling's CMake configuration checks for its own upstream development dependencies and reports missing packages. Common ones already covered above include `libedit` and `ncurses`. If CMake reports a missing package, install the corresponding Arch package and re-run.
+**Additional Darling dependencies:** The pinned Darling CMake configuration may check more tools or system libraries depending on enabled components. The package list above includes the libraries that caused the initial CI failures and the common X11, font, image, and build-tool dependencies. It has not been proven exhaustive on every Arch/CachyOS snapshot. If an unfamiliar dependency fails, identify the exact CMake variable/library and package before changing source code or deleting build caches. Package names can change; use `pacman -Ss <name>` and [Arch Linux package search](https://archlinux.org/packages/) if necessary.
 
 ### Docker setup
 
@@ -81,29 +81,67 @@ sudo usermod -aG docker "$USER"
 
 > **Security warning:** Docker group membership grants root-equivalent access to the host. Only add trusted users. Do not run Docker on a shared or untrusted machine without understanding the implications.
 
-### Pre-build checks
+### Pre-build checks (no Darling compilation)
+
+Run these **before** starting a cold `sh build.sh` or a long GitHub Actions job. This self-contained check reports missing programs, pkg-config modules, and the Xkbfile header without modifying your checkout. Run as the same non-root user that will build (e.g. `runner`):
+
+```bash
+bash <<'PREFLIGHT'
+missing=0
+for tool in git curl bsdtar clang clang++ llvm-config ld64.lld \
+            cmake ninja cargo python3 pkg-config bison flex; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'MISSING tool: %s\n' "$tool"
+    missing=1
+  fi
+done
+for module in fuse xkbfile x11 xext xrandr xcursor \
+              cairo fontconfig freetype2 libpng libtiff-4 libjpeg \
+              libpulse libavcodec libavutil libswscale \
+              gtk+-3.0 webkit2gtk-4.1 json-glib-1.0 sdl3 \
+              wayland-client wayland-egl egl gl; do
+  if ! pkg-config --exists "$module"; then
+    printf 'MISSING pkg-config module: %s\n' "$module"
+    missing=1
+  fi
+done
+for header in /usr/include/X11/extensions/XKBfile.h \
+              /usr/include/X11/Xlib.h; do
+  if [ ! -r "$header" ]; then
+    printf 'MISSING header: %s\n' "$header"
+    missing=1
+  fi
+done
+if [ "$missing" -ne 0 ]; then
+  echo 'Install the missing host dependencies before starting the build.' >&2
+  exit 1
+fi
+echo 'Basic build dependency preflight: PASS'
+PREFLIGHT
+```
+
+The Xkbfile check above verifies the installed files; the definitive CMake check is `find_package(X11)` setting `X11_Xkbfile_FOUND` (see troubleshooting below). Also verify the toolchain, namespace support, Docker access and free space:
 
 ```sh
-# Verify required tools
-command -v clang cmake ninja cargo python3 docker bsdtar git curl
-
-# Verify user namespaces are enabled (required by the runtime)
-unshare -U true && echo 'User namespaces: OK'
-
-# Verify Docker works without sudo
-docker run --rm hello-world
-
-# Check available disk space (need ~25 GB free)
+clang --version
+llvm-config --version
+ld64.lld --version
+unshare -Ur true && echo 'User namespaces: OK'
+docker info >/dev/null && echo 'Docker access: OK'
 df -h .
 ```
+
+Budget at least **~25 GB free** (estimate; a full Darling build and Docker layers can need more). On the N100 CI VM, keep `BUILD_JOBS=2` initially. Docker group access is root-equivalent and should only be granted inside an isolated build VM.
 
 ---
 
 ## 3. Fresh clone and dependency bootstrap
 
+Use a short checkout path: Darling derives Unix-domain socket names from the data directory. For example, clone as `~/r` (choose a different short name if it already exists):
+
 ```sh
-git clone https://github.com/georgenoob1234/Roblox-Mac-Linux-Port.git
-cd Roblox-Mac-Linux-Port/RobloxLinuxDev
+git clone https://github.com/georgenoob1234/Roblox-Mac-Linux-Port.git ~/r
+cd ~/r/RobloxLinuxDev
 python3 -B bootstrap.py
 ```
 
@@ -115,14 +153,15 @@ python3 -B bootstrap.py
 - Extracts Darling Debian packages from the noble amd64 archive.
 - Copies source overlays from `third_party/darling-overlay/` onto the extracted Darling source.
 
-**Important:** Bootstrap preserves existing dependency checkouts. If a dependency directory already exists, it is skipped (overlays are still reapplied). Bootstrap does not refresh or repair a stale previously populated tree. To re-fetch a specific dependency, remove its directory first.
+**Important:** Bootstrap preserves existing dependency checkouts. If a dependency directory already exists, it is skipped (overlays are still reapplied). Bootstrap does not refresh or repair a stale previously populated tree. Before intentionally replacing a dependency tree, preserve any local work or caches it contains; never delete the whole checkout or `.build/` just to retry a failed configure.
 
 ---
 
 ## 4. Complete build
 
+From inside `RobloxLinuxDev` (as reached in section 3):
+
 ```sh
-cd RobloxLinuxDev
 sh build.sh
 ```
 
@@ -176,7 +215,7 @@ These commands rebuild specific components. They require a prior complete build 
 
 ### Offline / static checks
 
-These run without a GPU, network, or running Roblox client:
+The following checks do not launch the Roblox client. Requirements differ: some need prebuilt artifacts, helper binaries or a working EGL/Vulkan driver, and should not be treated as pure syntax checks:
 
 ```sh
 # Release path validation, flag checks, updater rollback, download safety
@@ -232,8 +271,9 @@ sh runtime/optimized/compat-build.sh --check
 ### Renderer / video checks
 
 ```sh
-# Video compat check (isolated, no client launch)
+# Crash-report test only (isolated guest shell, no Roblox client)
 sh runtime/optimized/compat-build.sh --check-crash
+# For crash + video + compatibility checks, use --check (see above).
 ```
 
 ### Gameplay verification
@@ -249,7 +289,40 @@ The runtime derives two Unix-domain socket paths from `ROBLOX_MAC_DATA`:
 
 Linux `sockaddr_un.sun_path` is 108 bytes (107 usable + NUL). If the data directory is too deep, the runtime refuses to start. **Keep `ROBLOX_MAC_DATA` shallow** — for example, `~/rbx-data` or `~/RobloxLinuxRelease/DO_NOT_SHARE`.
 
-> **Do not** wipe `.build/`, runtime profiles, or Darling prefixes as a generic troubleshooting step. These contain downloaded dependencies, compiled artifacts, and login state. Only remove them if you intend to start over from scratch.
+#### Darling CMake reports missing FUSE or Xkbfile
+
+On a fresh Arch/CachyOS VM, install `fuse2` and `libxkbfile` as in section 2. Confirm the **host** can find them:
+
+```sh
+pkg-config --modversion fuse xkbfile
+ls -l /usr/lib/libxkbfile.so /usr/include/X11/extensions/XKBfile.h
+```
+
+If `Xkbfile not found` persists, inspect the relevant CMake cache **without deleting it**:
+
+```sh
+grep -Ei 'X11_.*(xkbfile|xlib)' runtime/src/darling-o2/CMakeCache.txt
+```
+
+`X11_xkbfile_INCLUDE_PATH` should locate the headers and `X11_xkbfile_LIB` should locate `libxkbfile.so`. Cocotron actually tests `X11_Xkbfile_FOUND` (a CMake result, not necessarily a saved cache entry). To independently test CMake detection without compiling Darling:
+
+```sh
+probe=$(mktemp -d /tmp/rbx-x11.XXXXXX)
+cat > "$probe/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.20)
+project(XkbProbe LANGUAGES C)
+find_package(X11 REQUIRED)
+message(STATUS "X11_Xkbfile_FOUND=${X11_Xkbfile_FOUND}")
+if(NOT X11_Xkbfile_FOUND)
+  message(FATAL_ERROR "Xkbfile detection failed")
+endif()
+CMAKE
+cmake -S "$probe" -B "$probe/build"
+```
+
+If this passes after you installed missing libraries, **retry the failed GitHub Actions build** or rerun CMake normally: the old failed run's log will not change retroactively. Persistent CI checkout data and downloaded dependencies are reused. Do not remove `runtime/src/darling-o2` or purge caches unless you have diagnosed a specific stale cache problem and backed up what you need.
+
+> **Do not** wipe `.build/`, runtime profiles, or Darling prefixes as a generic troubleshooting step. These contain downloaded dependencies, compiled artifacts, and login state. Only remove them intentionally with backups.
 
 ---
 
@@ -329,7 +402,7 @@ That checkout persists between runs. Before every build, `.github/scripts/sync-c
 - It aborts if the working tree has unexpected tracked modifications instead of overwriting them.
 - It refuses to use a checkout whose `origin` points anywhere but this repository.
 
-Because CI and release builds share the persistent checkout, the self-hosted build jobs of `ci.yml` and `build-release.yml` share one concurrency group (`roblox-builder-vm`): only one build runs on the VM at a time, in-progress builds are never cancelled, and queued runs wait (superseding older still-pending runs only).
+Because CI and release builds share the persistent checkout, the self-hosted build jobs of `ci.yml` and `build-release.yml` share one concurrency group (`roblox-builder-vm`): only one build runs on the VM at a time. **Also verify that workflow-level `cancel-in-progress` in `ci.yml` does not cancel a running `main` build**; job-level `cancel-in-progress: false` by itself cannot override cancellation of its parent workflow. Queued runs can supersede other pending runs.
 
 ### Self-hosted runner setup
 
@@ -346,19 +419,23 @@ Because CI and release builds share the persistent checkout, the self-hosted bui
 
 1. Create a dedicated non-root user on the CachyOS VM (e.g., `runner`).
 2. Download the runner package from **Settings → Actions → Runners → New self-hosted runner**.
-3. Extract and configure:
+3. Install system prerequisites from section 2 using an administrator account; **do not run `pacman` as an unprivileged `runner`**. Ensure the `runner` user has Docker access if packaging is enabled (an administrator may use `sudo usermod -aG docker runner`; a new login session is needed).
+4. As the `runner` user, create a user-owned runner directory and follow GitHub's **current** Linux x64 installation, SHA-256 verification and registration commands. GitHub generates a temporary registration token; never copy it into documentation or commits:
    ```sh
-   sudo -u runner mkdir -p /opt/github-runner && cd /opt/github-runner
-   sudo -u runner tar xzf actions-runner-linux-x64-*.tar.gz
-   sudo -u runner ./config.sh --url https://github.com/georgenoob1234/Roblox-Mac-Linux-Port --labels linux,x64,roblox-builder
+   # In a runner login shell (e.g. sudo -iu runner from an admin shell):
+   mkdir -p ~/actions
+   cd ~/actions
+   # Run GitHub's displayed download, checksum and extraction commands here.
+   # Run GitHub's displayed ./config.sh command, adding --labels roblox-builder.
    ```
-4. Install and start the service (or run interactively for testing):
+5. From an administrator shell, install the service using the actual runner directory and service account:
    ```sh
+   cd /home/runner/actions
    sudo ./svc.sh install runner
    sudo ./svc.sh start
+   sudo ./svc.sh status
    ```
-5. Install the build prerequisites (section 2) as the `runner` user.
-6. Ensure Docker is accessible to the `runner` user (`usermod -aG docker runner`).
+6. Confirm the runner appears **Online** with label `roblox-builder`, and that it can access Docker without root. Keep the persistent source checkout separately at `/home/runner/r`.
 
 **Security:**
 

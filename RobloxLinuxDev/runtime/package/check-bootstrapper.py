@@ -15,6 +15,8 @@ assert '"APPDIR"' in ui_source and 'g_spawn_async(state->root' in ui_source
 assert '"setsid"' in ui_source and 'host_environment()' in ui_source
 assert "bytes_done" in ui_source and "cancellable" in ui_source and "Cancel" in ui_source
 assert ".nav:checked" in ui_source and "@theme_selected_bg_color" in ui_source
+assert "window_decoration" in ui_source and "cursor_appearance" in ui_source
+assert "Restore appearance defaults" in ui_source
 fetch_source = (ROOT / "scripts/fetch-client.sh").read_text()
 assert "Content-Length" in fetch_source or "content-length" in fetch_source
 assert "ROBLOX_MAC_CANCEL_FILE" in fetch_source and "exit 125" in fetch_source
@@ -37,7 +39,7 @@ case "${1:-}" in
   --shell) test ! -e /proc/$$/fd/9; mkdir -p "$HERE/DO_NOT_SHARE/prefix"; exit 0;;
   --client-version) echo version-abcd; exit 0;;
   --uri) printf '%s\n' launched-with-uri > "$HERE/uri-launch"; exit 0;;
-  *) printf '%s\n' launched > "$HERE/launched"; sleep "${FAKE_LAUNCH_SLEEP:-0}"; exit 0;;
+  *) printf '%s %s %s\n' launched "${ROBLOX_MAC_DECORATIONS:-}" "${ROBLOX_MAC_CURSOR_APPEARANCE:-}" > "$HERE/launched"; sleep "${FAKE_LAUNCH_SLEEP:-0}"; exit 0;;
 esac
 """)
     (release / "RobloxLinux.AppImage").chmod(0o755)
@@ -54,6 +56,8 @@ printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
     status = json.loads(subprocess.check_output([bootstrap, "status"], env=env, text=True))
     assert status["settings"]["auto_update"] == "ask"
     assert status["settings"]["check_interval_hours"] == 24
+    assert status["settings"]["window_decoration"] == "auto"
+    assert status["settings"]["cursor_appearance"] == "system"
     assert status["installed_display_version"] == "0.740.0.7400927"
     (private / "bootstrapper.json").write_text(json.dumps({"last_known_latest": "version-3bc33ee7ffad426f"}))
     mapped = json.loads(subprocess.check_output([bootstrap, "status"], env=env, text=True))
@@ -69,10 +73,33 @@ printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
     due = subprocess.check_output([ROOT / "package/bootstrap.py", "due", private, "86500"], text=True).strip()
     assert due == "1"
 
+    # Test setting appearance settings
+    subprocess.run([bootstrap, "set", "window_decoration", "legacy"], env=env, check=True)
+    assert subprocess.check_output([bootstrap, "get", "window_decoration"], env=env, text=True).strip() == "legacy"
+    subprocess.run([bootstrap, "set", "cursor_appearance", "legacy"], env=env, check=True)
+    assert subprocess.check_output([bootstrap, "get", "cursor_appearance"], env=env, text=True).strip() == "legacy"
+
+    # Test invalid values rejected
+    assert subprocess.run([bootstrap, "set", "window_decoration", "invalid_dec"], env=env).returncode != 0
+    assert subprocess.run([bootstrap, "set", "cursor_appearance", "invalid_cur"], env=env).returncode != 0
+
+    # Test reset-appearance
+    subprocess.run([bootstrap, "reset-appearance"], env=env, check=True)
+    assert subprocess.check_output([bootstrap, "get", "window_decoration"], env=env, text=True).strip() == "auto"
+    assert subprocess.check_output([bootstrap, "get", "cursor_appearance"], env=env, text=True).strip() == "system"
+
+    # Test backward compatibility: old settings file without appearance keys
+    (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "ask", "check_interval_hours": 12}))
+    status_compat = json.loads(subprocess.check_output([bootstrap, "status"], env=env, text=True))
+    assert status_compat["settings"]["window_decoration"] == "auto"
+    assert status_compat["settings"]["cursor_appearance"] == "system"
+    assert status_compat["settings"]["check_interval_hours"] == 12
+
     subprocess.run([bootstrap, "set", "auto_update", "off"], env=env, check=True)
-    first = subprocess.run([bootstrap], env=env, capture_output=True, text=True, check=True)
+    first = subprocess.run([bootstrap], env={**env, "ROBLOX_MAC_DECORATIONS": "gtk", "ROBLOX_MAC_CURSOR_APPEARANCE": "legacy"},
+                           capture_output=True, text=True, check=True)
     assert (private / "first-run.initialized").exists()
-    assert (release / "launched").read_text().strip() == "launched"
+    assert (release / "launched").read_text().strip() == "launched gtk legacy"
     assert "Setting up Roblox for the first time" in first.stderr
 
     checked = json.loads(subprocess.check_output([bootstrap, "check"], env=env, text=True))

@@ -130,6 +130,7 @@ print('PASS guest command received opaque URI')
     text = desktop.read_text()
     assert "NoDisplay" not in text and "%u" in text and "MimeType=x-scheme-handler/roblox;" in text
     assert "Exec=" in text and "release\\ with\\ spaces/run.sh %u" in text
+    assert "StartupWMClass=roblox-mac-port" in text and "Icon=roblox-mac-port" in text
     icon = data / "icons/hicolor/256x256/apps/roblox-mac-port.png"
     assert icon.read_bytes() == (release / "icon.png").read_bytes()
     settings_desktop = data / "applications/roblox-mac-port-settings.desktop"
@@ -137,6 +138,7 @@ print('PASS guest command received opaque URI')
     settings_text = settings_desktop.read_text()
     assert "Name=Roblox Launcher" in settings_text and "MimeType=" not in settings_text
     assert "--launcher" in settings_text and "Categories=Game;" in settings_text
+    assert "StartupWMClass=roblox-mac-port" in settings_text and "Icon=roblox-mac-port-settings" in settings_text
     settings_icon = data / "icons/hicolor/256x256/apps/roblox-mac-port-settings.png"
     assert settings_icon.read_bytes() == (release / "icon_bw.png").read_bytes()
     subprocess.run([release / "install-uri-handler.sh"], env=env, check=True, capture_output=True, text=True)

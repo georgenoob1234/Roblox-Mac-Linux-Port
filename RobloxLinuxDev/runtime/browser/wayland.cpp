@@ -717,7 +717,7 @@ static bool initialize_ui() {
         if(unshare(CLONE_FS) || chdir(root)){g_printerr("Wayland browser directory setup failed\n");return false;}
     }
     g_printerr("WAYLAND helper init\n");
-    char name[]="roblox-mac",arg[]="native";char *argv[]={name,arg,nullptr};
+    char name[]="roblox-mac-port",arg[]="native";char *argv[]={name,arg,nullptr};
     if(browser_init(2,argv))return false;
 #if defined(RBX_PROFILER) && !defined(RBX_PROFILER_GL_HUD)
     initialize_profiler_overlay();

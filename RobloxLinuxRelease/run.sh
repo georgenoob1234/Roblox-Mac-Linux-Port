@@ -18,6 +18,7 @@ export ROBLOX_MAC_NOTIFY_HOME=${HOME:-}
 export ROBLOX_MAC_HOST_HOME=${ROBLOX_MAC_HOST_HOME:-${HOME:-}}
 export ROBLOX_MAC_HOST_CONFIG=${ROBLOX_MAC_HOST_CONFIG:-${XDG_CONFIG_HOME:-${HOME:-}/.config}}
 export ROBLOX_MAC_HOST_DATA_DIRS=${ROBLOX_MAC_HOST_DATA_DIRS:-${XDG_DATA_DIRS:-/usr/local/share:/usr/share}}
+[ -f "$HERE/icon.png" ] && export ROBLOX_MAC_ICON_PATH=${ROBLOX_MAC_ICON_PATH:-$HERE/icon.png}
 URI=
 case "${1:-}" in
     --uri) [ "$#" -eq 2 ] || { echo 'Usage: run.sh --uri URI' >&2; exit 2; }; URI=$2; shift 2;;

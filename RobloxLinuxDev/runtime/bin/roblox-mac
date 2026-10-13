@@ -413,7 +413,7 @@ launch_uri=os.environ.get('ROBLOX_MAC_LAUNCH_URI')
 if launch_uri:
     client[1:1]=['-protocolString', launch_uri]
     args.append('ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1')
-print(shlex.join(args+client))
+sys.stdout.buffer.write(os.fsencode(shlex.join(args+client)) + b'\n')
 PYTHON
 )
 set +e

@@ -95,27 +95,27 @@ cat > "$APPDIR/AppRun" <<'RUN'
 exec "$APPDIR/bin/roblox-mac" "$@"
 RUN
 chmod +x "$APPDIR/AppRun"
-cat > "$APPDIR/roblox-mac.desktop" <<'DESK'
+cat > "$APPDIR/roblox-mac-port.desktop" <<'DESK'
 [Desktop Entry]
 Type=Application
 Name=Roblox (macOS client)
 Exec=roblox-mac %u
-Icon=roblox-mac
+Icon=roblox-mac-port
 Categories=Game;
 MimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;
 Terminal=false
 StartupNotify=true
+StartupWMClass=roblox-mac-port
 DESK
-python3 - "$APPDIR/roblox-mac.png" <<'PY'
-# 256x256 flat icon, no dependencies; replace with real art whenever.
-import sys, zlib, struct
-w = h = 256
-raw = b''.join(b'\0' + bytes([0xE2, 0x23, 0x1A, 0xFF] * w) for _ in range(h))
-def chunk(t, d): return struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
-png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
-open(sys.argv[1], 'wb').write(png)
-PY
-ln -sf roblox-mac.png "$APPDIR/.DirIcon"
+ln -sf roblox-mac-port.desktop "$APPDIR/roblox-mac.desktop"
+mkdir -p "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+cp "$APPDIR/roblox-mac-port.desktop" "$APPDIR/usr/share/applications/"
+cp "$HERE/icon.png" "$APPDIR/roblox-mac-port.png"
+cp "$HERE/icon.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/roblox-mac-port.png"
+cp "$HERE/icon_bw.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/roblox-mac-port-settings.png"
+ln -sf roblox-mac-port.png "$APPDIR/.DirIcon"
+ln -sf roblox-mac-port.png "$APPDIR/roblox-mac.png"
+ln -sf roblox-mac-port.png "$APPDIR/icon.png"
 python3 "$HERE/check-portable.py" --appdir "$APPDIR"
 
 # Keep an existing mounted AppImage's inode intact, and retain the last working

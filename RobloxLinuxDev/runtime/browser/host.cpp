@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <dlfcn.h>
 #include <deque>
+#include <vector>
 #include <string>
 #include <map>
 #include "client-url.h"
@@ -416,6 +417,47 @@ static gboolean closed(GtkWidget*,GdkEvent*,gpointer) {
     } else if(guest)g_subprocess_send_signal(guest,SIGTERM);
     return TRUE;
 }
+static void setup_window_identity(GtkWidget *win) {
+    gdk_set_program_class("roblox-mac-port");
+    gtk_window_set_default_icon_name("roblox-mac-port");
+    if (!win) return;
+    gtk_window_set_icon_name(GTK_WINDOW(win), "roblox-mac-port");
+
+    std::vector<std::string> candidates;
+    const char *env_icon = g_getenv("ROBLOX_MAC_ICON_PATH");
+    if (env_icon && *env_icon) candidates.push_back(env_icon);
+
+    const char *data_env = g_getenv("ROBLOX_MAC_DATA");
+    if (data_env && *data_env) {
+        candidates.push_back(std::string(data_env) + "/../icon.png");
+        candidates.push_back(std::string(data_env) + "/icon.png");
+    }
+    const char *appdir = g_getenv("APPDIR");
+    if (appdir && *appdir) {
+        candidates.push_back(std::string(appdir) + "/roblox-mac-port.png");
+        candidates.push_back(std::string(appdir) + "/icon.png");
+        candidates.push_back(std::string(appdir) + "/usr/share/icons/hicolor/256x256/apps/roblox-mac-port.png");
+    }
+    const char *user_data = g_get_user_data_dir();
+    if (user_data && *user_data) {
+        candidates.push_back(std::string(user_data) + "/icons/hicolor/256x256/apps/roblox-mac-port.png");
+    }
+
+    for (const auto &path : candidates) {
+        if (g_file_test(path.c_str(), G_FILE_TEST_IS_REGULAR)) {
+            GError *err = nullptr;
+            GdkPixbuf *pb = gdk_pixbuf_new_from_file(path.c_str(), &err);
+            if (pb) {
+                gtk_window_set_icon(GTK_WINDOW(win), pb);
+                g_object_unref(pb);
+                if (err) g_clear_error(&err);
+                break;
+            }
+            if (err) g_clear_error(&err);
+        }
+    }
+}
+
 static void guest_done(GObject *object,GAsyncResult *result,gpointer) {
     g_subprocess_wait_finish(G_SUBPROCESS(object),result,nullptr);
     exit_status=g_subprocess_get_if_exited(guest)?g_subprocess_get_exit_status(guest):1;gtk_main_quit();
@@ -432,7 +474,7 @@ int main(int argc,char **argv) {
     g_setenv("WEBKIT_DISABLE_DMABUF_RENDERER","1",FALSE);
     native_wayland=g_getenv("ROBLOX_MAC_WAYLAND") && !strcmp(g_getenv("ROBLOX_MAC_WAYLAND"),"1");
     if(native_wayland)g_setenv("GDK_BACKEND","wayland",TRUE);
-    gdk_set_allowed_backends(native_wayland?"wayland":"x11");g_set_prgname("roblox-mac");g_set_application_name("Roblox");
+    gdk_set_allowed_backends(native_wayland?"wayland":"x11");g_set_prgname("roblox-mac-port");g_set_application_name("Roblox");
     if(!gtk_init_check(nullptr,nullptr)){g_printerr("roblox-mac: GTK could not open the display\n");return 1;}
     if(native_wayland)g_printerr("WAYLAND GTK initialized\n");
     apply_host_appearance_preferences();
@@ -447,6 +489,7 @@ int main(int argc,char **argv) {
     g_setenv("ROBLOX_MAC_WEBKIT_USER_AGENT",webkit_settings_get_user_agent(settings),TRUE);g_object_unref(settings);
     if(native_wayland)g_printerr("WAYLAND WebKit settings initialized\n");
     window=gtk_window_new(GTK_WINDOW_TOPLEVEL);gtk_window_set_title(GTK_WINDOW(window),"Roblox");gtk_window_set_default_size(GTK_WINDOW(window),1100,800);
+    setup_window_identity(window);
     if(decoration_mode==DECORATION_LEGACY) {
         header=gtk_header_bar_new();gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header),!native_wayland);gtk_window_set_titlebar(GTK_WINDOW(window),header);
         back=native_wayland?gtk_button_new_with_label("←"):gtk_button_new_from_icon_name("go-previous-symbolic",GTK_ICON_SIZE_BUTTON);

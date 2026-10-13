@@ -127,9 +127,72 @@ static void progress_cancel(GtkButton *button, gpointer data) {
     gtk_button_set_label(button, "Cancelling…"); gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
     label_text(state->status, "Cancelling; keeping the installed client…");
 }
+static char *find_icon_path(const char *root) {
+    const char *env_icon = g_getenv("ROBLOX_MAC_ICON_PATH");
+    if (env_icon && *env_icon && g_file_test(env_icon, G_FILE_TEST_IS_REGULAR))
+        return g_strdup(env_icon);
+
+    if (root && *root) {
+        char *p = g_build_filename(root, "icon.png", NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) return p;
+        g_free(p);
+
+        p = g_build_filename(root, "roblox-mac-port.png", NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) return p;
+        g_free(p);
+
+        p = g_build_filename(root, "..", "icon.png", NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) return p;
+        g_free(p);
+    }
+
+    const char *appdir = g_getenv("APPDIR");
+    if (appdir && *appdir) {
+        char *p = g_build_filename(appdir, "roblox-mac-port.png", NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) return p;
+        g_free(p);
+
+        p = g_build_filename(appdir, "icon.png", NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) return p;
+        g_free(p);
+
+        p = g_build_filename(appdir, "usr", "share", "icons", "hicolor", "256x256", "apps", "roblox-mac-port.png", NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) return p;
+        g_free(p);
+    }
+
+    const char *data_dir = g_get_user_data_dir();
+    if (data_dir && *data_dir) {
+        char *p = g_build_filename(data_dir, "icons", "hicolor", "256x256", "apps", "roblox-mac-port.png", NULL);
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) return p;
+        g_free(p);
+    }
+
+    return NULL;
+}
+
+static void setup_ui_identity(GtkWidget *win, const char *root) {
+    gdk_set_program_class("roblox-mac-port");
+    gtk_window_set_default_icon_name("roblox-mac-port");
+    if (!win) return;
+    gtk_window_set_icon_name(GTK_WINDOW(win), "roblox-mac-port");
+    char *icon = find_icon_path(root);
+    if (icon) {
+        GError *error = NULL;
+        GdkPixbuf *pb = gdk_pixbuf_new_from_file(icon, &error);
+        if (pb) {
+            gtk_window_set_icon(GTK_WINDOW(win), pb);
+            g_object_unref(pb);
+        }
+        g_clear_error(&error);
+        g_free(icon);
+    }
+}
+
 static gboolean progress_show(gpointer data) {
     ProgressState *state = data; state->show_id = 0; if (state->done) return G_SOURCE_REMOVE;
     state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state->window), "Roblox");
+    setup_ui_identity(state->window, state->root);
     gtk_window_set_default_size(GTK_WINDOW(state->window), 460, 170); gtk_window_set_resizable(GTK_WINDOW(state->window), FALSE); gtk_window_set_position(GTK_WINDOW(state->window), GTK_WIN_POS_CENTER);
     g_signal_connect(state->window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 24); gtk_container_add(GTK_CONTAINER(state->window), box);
@@ -176,7 +239,7 @@ static gboolean dialog_timeout(gpointer data) { dialog_finish(data, 1); return G
 static void dialog_button(GtkWidget *button, gpointer data) { dialog_finish(data, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "result"))); }
 static int run_dialog(const char *latest, const char *installed) {
     if (!gtk_init_check(NULL, NULL)) return 3;
-    apply_css(); DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state.window), "Roblox update available"); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
+    apply_css(); DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state.window), "Roblox update available"); setup_ui_identity(state.window, NULL); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 26); gtk_container_add(GTK_CONTAINER(state.window), box); gtk_box_pack_start(GTK_BOX(box), label("A Roblox update is ready", "title"), FALSE, FALSE, 0); char *versions = g_strdup_printf("Installed: %s\nNew version: %s", *installed ? installed : "none", *latest ? latest : "available"); gtk_box_pack_start(GTK_BOX(box), label(versions, NULL), FALSE, FALSE, 0); g_free(versions); gtk_box_pack_start(GTK_BOX(box), label("The prompt closes after 30 seconds and launches without updating.", "muted"), FALSE, FALSE, 0);
     GtkWidget *buttons = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL); gtk_button_box_set_layout(GTK_BUTTON_BOX(buttons), GTK_BUTTONBOX_END); gtk_box_set_spacing(GTK_BOX(buttons), 8); const char *names[] = {"Update now", "Launch without updating", "Skip this version"}; for (int i = 0; i < 3; ++i) { GtkWidget *button = gtk_button_new_with_mnemonic(names[i]); g_object_set_data(G_OBJECT(button), "result", GINT_TO_POINTER(i == 0 ? 0 : (i == 1 ? 1 : 2))); g_signal_connect(button, "clicked", G_CALLBACK(dialog_button), &state); gtk_container_add(GTK_CONTAINER(buttons), button); if (i == 1) gtk_widget_grab_focus(button); } gtk_box_pack_end(GTK_BOX(box), buttons, FALSE, FALSE, 0); gtk_widget_show_all(state.window); g_timeout_add_seconds(DIALOG_TIMEOUT_SECONDS, dialog_timeout, &state); gtk_main(); gtk_widget_destroy(state.window); return state.result;
 }
@@ -230,10 +293,10 @@ static GtkWidget *nav_button(const char *text, const char *page, LauncherState *
 
 static int run_launcher(const char *root, gboolean settings_page) {
     if (!gtk_init_check(NULL, NULL)) return 1;
-    apply_css(); LauncherState *state = g_new0(LauncherState, 1); state->root = g_strdup(root); state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state->window), "Roblox Mac Linux Port"); gtk_window_set_default_size(GTK_WINDOW(state->window), 820, 560); gtk_widget_set_size_request(state->window, 680, 460); gtk_window_set_position(GTK_WINDOW(state->window), GTK_WIN_POS_CENTER); g_signal_connect(state->window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    apply_css(); LauncherState *state = g_new0(LauncherState, 1); state->root = g_strdup(root); state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state->window), "Roblox Mac Linux Port"); setup_ui_identity(state->window, state->root); gtk_window_set_default_size(GTK_WINDOW(state->window), 820, 560); gtk_widget_set_size_request(state->window, 680, 460); gtk_window_set_position(GTK_WINDOW(state->window), GTK_WIN_POS_CENTER); g_signal_connect(state->window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0); gtk_container_add(GTK_CONTAINER(state->window), outer); GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4); gtk_widget_set_size_request(sidebar, 190, -1); gtk_style_context_add_class(gtk_widget_get_style_context(sidebar), "sidebar"); gtk_box_pack_start(GTK_BOX(outer), sidebar, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(sidebar), label("Roblox Mac Linux Port", "brand"), FALSE, FALSE, 0); GtkWidget *nav = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3); gtk_box_pack_start(GTK_BOX(sidebar), nav, FALSE, FALSE, 0); GSList *group = NULL; GtkWidget *play_nav = nav_button("▶  Play", "play", state, &group); GtkWidget *settings_nav = nav_button("⚙  Settings", "settings", state, &group); GtkWidget *info_nav = nav_button("●  Info", "info", state, &group); gtk_box_pack_start(GTK_BOX(nav), play_nav, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(nav), settings_nav, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(nav), info_nav, FALSE, FALSE, 0);
     state->stack = gtk_stack_new(); gtk_stack_set_transition_type(GTK_STACK(state->stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE); gtk_box_pack_start(GTK_BOX(outer), state->stack, TRUE, TRUE, 0);
-    GtkWidget *play = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18); gtk_container_set_border_width(GTK_CONTAINER(play), 42); gchar *icon_path = g_build_filename(root, "icon.png", NULL); GError *icon_error = NULL; GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file_at_scale(icon_path, 160, 160, TRUE, &icon_error); GtkWidget *image = pixbuf ? gtk_image_new_from_pixbuf(pixbuf) : gtk_image_new(); if (pixbuf) g_object_unref(pixbuf); g_clear_error(&icon_error); g_free(icon_path); gtk_widget_set_halign(image, GTK_ALIGN_CENTER); gtk_box_pack_start(GTK_BOX(play), image, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(play), label("Roblox Mac Linux Port", "title"), FALSE, FALSE, 0); state->play_version = label("Client version: —", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_version, FALSE, FALSE, 0); state->play_status = label("Checking…", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_status, FALSE, FALSE, 0); GtkWidget *play_button = gtk_button_new_with_mnemonic("_Play"); gtk_style_context_add_class(gtk_widget_get_style_context(play_button), "accent"); g_signal_connect(play_button, "clicked", G_CALLBACK(play_launch), state); gtk_box_pack_start(GTK_BOX(play), play_button, FALSE, FALSE, 0); GtkWidget *log_button = gtk_button_new_with_mnemonic("Open last _log"); g_signal_connect(log_button, "clicked", G_CALLBACK(open_log), state); gtk_box_pack_start(GTK_BOX(play), log_button, FALSE, FALSE, 0); gtk_stack_add_named(GTK_STACK(state->stack), play, "play");
+    GtkWidget *play = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18); gtk_container_set_border_width(GTK_CONTAINER(play), 42); gchar *icon_path = find_icon_path(root); GError *icon_error = NULL; GdkPixbuf *pixbuf = icon_path ? gdk_pixbuf_new_from_file_at_scale(icon_path, 160, 160, TRUE, &icon_error) : NULL; GtkWidget *image = pixbuf ? gtk_image_new_from_pixbuf(pixbuf) : gtk_image_new(); if (pixbuf) g_object_unref(pixbuf); g_clear_error(&icon_error); g_free(icon_path); gtk_widget_set_halign(image, GTK_ALIGN_CENTER); gtk_box_pack_start(GTK_BOX(play), image, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(play), label("Roblox Mac Linux Port", "title"), FALSE, FALSE, 0); state->play_version = label("Client version: —", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_version, FALSE, FALSE, 0); state->play_status = label("Checking…", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_status, FALSE, FALSE, 0); GtkWidget *play_button = gtk_button_new_with_mnemonic("_Play"); gtk_style_context_add_class(gtk_widget_get_style_context(play_button), "accent"); g_signal_connect(play_button, "clicked", G_CALLBACK(play_launch), state); gtk_box_pack_start(GTK_BOX(play), play_button, FALSE, FALSE, 0); GtkWidget *log_button = gtk_button_new_with_mnemonic("Open last _log"); g_signal_connect(log_button, "clicked", G_CALLBACK(open_log), state); gtk_box_pack_start(GTK_BOX(play), log_button, FALSE, FALSE, 0); gtk_stack_add_named(GTK_STACK(state->stack), play, "play");
     GtkWidget *settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(settings), 42); gtk_box_pack_start(GTK_BOX(settings), label("Settings", "title"), FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(settings), label("Updates and launch behavior", "subtitle"), FALSE, FALSE, 0); GtkWidget *grid = gtk_grid_new(); gtk_grid_set_row_spacing(GTK_GRID(grid), 12); gtk_grid_set_column_spacing(GTK_GRID(grid), 20); gtk_box_pack_start(GTK_BOX(settings), grid, FALSE, FALSE, 0); gtk_grid_attach(GTK_GRID(grid), label("Auto-update mode", NULL), 0, 0, 1, 1); state->mode = gtk_combo_box_text_new(); gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(state->mode), "auto", "Auto"); gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(state->mode), "ask", "Ask"); gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(state->mode), "off", "Off"); gtk_grid_attach(GTK_GRID(grid), state->mode, 1, 0, 1, 1); g_signal_connect(state->mode, "changed", G_CALLBACK(mode_changed), state); gtk_grid_attach(GTK_GRID(grid), label("Check interval (hours)", NULL), 0, 1, 1, 1); state->interval = gtk_spin_button_new_with_range(0, 8760, 1); gtk_grid_attach(GTK_GRID(grid), state->interval, 1, 1, 1, 1); g_signal_connect(state->interval, "value-changed", G_CALLBACK(interval_changed), state); state->settings_current = label(NULL, "subtitle"); state->settings_latest = label(NULL, "subtitle"); state->settings_checked = label(NULL, "subtitle"); state->settings_skipped = label(NULL, "subtitle"); gtk_box_pack_start(GTK_BOX(settings), state->settings_current, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(settings), state->settings_latest, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(settings), state->settings_checked, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(settings), state->settings_skipped, FALSE, FALSE, 0);
     GtkWidget *actions = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL); gtk_button_box_set_layout(GTK_BUTTON_BOX(actions), GTK_BUTTONBOX_START); gtk_box_set_spacing(GTK_BOX(actions), 8); gtk_box_pack_start(GTK_BOX(settings), actions, FALSE, FALSE, 0); GtkWidget *check = gtk_button_new_with_mnemonic("_Check for updates"); g_signal_connect(check, "clicked", G_CALLBACK(settings_check), state); gtk_container_add(GTK_CONTAINER(actions), check); state->update = gtk_button_new_with_mnemonic("_Update now"); g_signal_connect(state->update, "clicked", G_CALLBACK(settings_update), state); gtk_container_add(GTK_CONTAINER(actions), state->update); GtkWidget *reset = gtk_button_new_with_mnemonic("_Reset skipped version"); g_signal_connect(reset, "clicked", G_CALLBACK(settings_reset), state); gtk_container_add(GTK_CONTAINER(actions), reset);
     GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL); gtk_box_pack_start(GTK_BOX(settings), sep, FALSE, FALSE, 6);
@@ -266,6 +329,8 @@ static int run_launcher(const char *root, gboolean settings_page) {
 }
 
 int main(int argc, char **argv) {
+    g_set_prgname("roblox-mac-port");
+    g_set_application_name("Roblox");
     if (argc >= 2 && !strcmp(argv[1], "--progress")) return run_progress(argc >= 3 ? argv[2] : ".");
     if (argc >= 4 && !strcmp(argv[1], "--dialog")) return run_dialog(argv[2], argv[3]);
     if (argc >= 3 && !strcmp(argv[1], "--settings")) return run_launcher(argv[2], TRUE);

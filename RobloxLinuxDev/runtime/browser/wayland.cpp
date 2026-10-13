@@ -563,30 +563,135 @@ static void screen(int *w,int *h,double *hz) {
     if(!monitor)monitor=gdk_display_get_monitor(gdk_display_get_default(),0);
     GdkRectangle area;gdk_monitor_get_geometry(monitor,&area);*w=area.width;*h=area.height;*hz=gdk_monitor_get_refresh_rate(monitor)/1000.;
 }
+enum CursorKind {
+    CURSOR_DEFAULT,
+    CURSOR_POINTER,
+    CURSOR_TEXT,
+    CURSOR_CROSSHAIR,
+    CURSOR_GRAB,
+    CURSOR_GRABBING,
+    CURSOR_RESIZE_EW,
+    CURSOR_RESIZE_NS,
+    CURSOR_NOT_ALLOWED,
+    CURSOR_WAIT
+};
+static CursorKind resolve_cursor_kind(const char *name) {
+    if(!name || !*name)return CURSOR_DEFAULT;
+    if(!strcmp(name,"arrowCursor") || !strcmp(name,"arrow") || !strcmp(name,"left_ptr") || !strcmp(name,"default"))
+        return CURSOR_DEFAULT;
+    if(!strcmp(name,"pointingHandCursor") || !strcmp(name,"pointer") || !strcmp(name,"hand2") || !strcmp(name,"hand"))
+        return CURSOR_POINTER;
+    if(!strcmp(name,"IBeamCursor") || !strcmp(name,"IBeam") || !strcmp(name,"text") || !strcmp(name,"xterm") || !strcmp(name,"ibeam"))
+        return CURSOR_TEXT;
+    if(!strcmp(name,"crosshairCursor") || !strcmp(name,"crosshair"))
+        return CURSOR_CROSSHAIR;
+    if(!strcmp(name,"openHandCursor") || !strcmp(name,"openhand") || !strcmp(name,"grab"))
+        return CURSOR_GRAB;
+    if(!strcmp(name,"closedHandCursor") || !strcmp(name,"closedhand") || !strcmp(name,"grabbing"))
+        return CURSOR_GRABBING;
+    if(!strcmp(name,"resizeLeftRightCursor") || !strcmp(name,"ew-resize") || !strcmp(name,"col-resize"))
+        return CURSOR_RESIZE_EW;
+    if(!strcmp(name,"resizeUpDownCursor") || !strcmp(name,"ns-resize") || !strcmp(name,"row-resize"))
+        return CURSOR_RESIZE_NS;
+    if(!strcmp(name,"operationNotAllowedCursor") || !strcmp(name,"not-allowed"))
+        return CURSOR_NOT_ALLOWED;
+    if(!strcmp(name,"waitCursor") || !strcmp(name,"wait") || !strcmp(name,"watch"))
+        return CURSOR_WAIT;
+    return CURSOR_DEFAULT;
+}
+struct CursorSpec {
+    const char *xcursor_primary;
+    const char *xcursor_secondary;
+    const char *gdk_name;
+    SDL_SystemCursor sdl_cursor;
+};
+static CursorSpec get_cursor_spec(CursorKind kind) {
+    switch(kind) {
+        case CURSOR_POINTER:return {"pointer","hand2","pointer",SDL_SYSTEM_CURSOR_POINTER};
+        case CURSOR_TEXT:return {"text","xterm","text",SDL_SYSTEM_CURSOR_TEXT};
+        case CURSOR_CROSSHAIR:return {"crosshair","cross","crosshair",SDL_SYSTEM_CURSOR_CROSSHAIR};
+        case CURSOR_GRAB:return {"grab","openhand","grab",SDL_SYSTEM_CURSOR_DEFAULT};
+        case CURSOR_GRABBING:return {"grabbing","closedhand","grabbing",SDL_SYSTEM_CURSOR_MOVE};
+        case CURSOR_RESIZE_EW:return {"ew-resize","h_double_arrow","ew-resize",SDL_SYSTEM_CURSOR_EW_RESIZE};
+        case CURSOR_RESIZE_NS:return {"ns-resize","v_double_arrow","ns-resize",SDL_SYSTEM_CURSOR_NS_RESIZE};
+        case CURSOR_NOT_ALLOWED:return {"not-allowed","crossed_circle","not-allowed",SDL_SYSTEM_CURSOR_NOT_ALLOWED};
+        case CURSOR_WAIT:return {"wait","watch","wait",SDL_SYSTEM_CURSOR_WAIT};
+        case CURSOR_DEFAULT:
+        default:return {"left_ptr","default","default",SDL_SYSTEM_CURSOR_DEFAULT};
+    }
+}
+static void generate_fallback_cursor(CursorKind kind,std::vector<uint32_t> &out,int *w,int *h,int *pitch,int *hot_x,int *hot_y) {
+    const int S=24;
+    *w=S;*h=S;*pitch=S*4;
+    out.assign(S*S,0);
+    const uint32_t BLACK=0xFF000000;
+    const uint32_t WHITE=0xFFFFFFFF;
+    if(kind==CURSOR_TEXT) {
+        *hot_x=S/2;*hot_y=S/2;
+        for(int x=8;x<=16;++x){out[4*S+x]=BLACK;out[5*S+x]=WHITE;out[19*S+x]=WHITE;out[20*S+x]=BLACK;}
+        for(int y=5;y<=19;++y){out[y*S+11]=BLACK;out[y*S+12]=WHITE;out[y*S+13]=BLACK;}
+    } else if(kind==CURSOR_CROSSHAIR) {
+        *hot_x=S/2;*hot_y=S/2;
+        for(int i=4;i<=20;++i){out[12*S+i]=(i>=10 && i<=14)?WHITE:BLACK;out[i*S+12]=(i>=10 && i<=14)?WHITE:BLACK;}
+    } else {
+        *hot_x=0;*hot_y=0;
+        for(int y=0;y<16;++y){
+            for(int x=0;x<=y;++x){
+                if(x==0 || x==y || y==15)out[y*S+x]=BLACK;
+                else out[y*S+x]=WHITE;
+            }
+        }
+    }
+}
 static void cursor(const void *pixels,int w,int h,int pitch,int x,int y,const char *name) {
+    auto kind=resolve_cursor_kind(name);
+    auto spec=get_cursor_spec(kind);
     XcursorImage *theme=nullptr;
+    std::vector<uint32_t> fallback;
     if(!pixels) {
         const char *size=g_getenv("XCURSOR_SIZE");
-        theme=XcursorLibraryLoadImage(name && !strcmp(name,"IBeam")?"text":"left_ptr",g_getenv("XCURSOR_THEME"),size?std::clamp(atoi(size),16,128):24);
-        if(theme){pixels=theme->pixels;w=theme->width;h=theme->height;pitch=w*4;x=theme->xhot;y=theme->yhot;}
+        const char *theme_name=g_getenv("XCURSOR_THEME");
+        int target_size=size?std::clamp(atoi(size),16,128):24;
+        theme=XcursorLibraryLoadImage(spec.xcursor_primary,theme_name,target_size);
+        if(!theme && spec.xcursor_secondary)
+            theme=XcursorLibraryLoadImage(spec.xcursor_secondary,theme_name,target_size);
+        if(!theme && strcmp(spec.xcursor_primary,"left_ptr")!=0)
+            theme=XcursorLibraryLoadImage("left_ptr",theme_name,target_size);
+        if(!theme)
+            theme=XcursorLibraryLoadImage("default",theme_name,target_size);
+        if(theme) {
+            pixels=theme->pixels;w=theme->width;h=theme->height;pitch=w*4;x=theme->xhot;y=theme->yhot;
+        } else {
+            generate_fallback_cursor(kind,fallback,&w,&h,&pitch,&x,&y);
+            pixels=fallback.data();
+        }
     }
     SDL_Cursor *next=nullptr;
     if(pixels && w>0 && h>0 && w<=1024 && h<=1024) {
         auto surface=SDL_CreateSurfaceFrom(w,h,SDL_PIXELFORMAT_BGRA32,const_cast<void*>(pixels),pitch);
         if(surface){next=SDL_CreateColorCursor(surface,x,y);SDL_DestroySurface(surface);}
-    } else next=SDL_CreateSystemCursor(name && !strcmp(name,"IBeam")?SDL_SYSTEM_CURSOR_TEXT:SDL_SYSTEM_CURSOR_DEFAULT);
-    if(next){SDL_SetCursor(next);if(game_cursor)SDL_DestroyCursor(game_cursor);game_cursor=next;
-        if(pixels){cursor_pixels.assign((const unsigned char*)pixels,(const unsigned char*)pixels+pitch*h);cursor_width=w;cursor_height=h;cursor_pitch=pitch;cursor_x=x;cursor_y=y;}}
-    if(pixels && w>0 && h>0 && w<=1024 && h<=1024) {
-        auto rgba=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,w,h);
-        auto dest=gdk_pixbuf_get_pixels(rgba);int stride=gdk_pixbuf_get_rowstride(rgba);
-        for(int row=0;row<h;++row)for(int col=0;col<w;++col){
-            const auto src=(const unsigned char*)pixels+row*pitch+col*4;auto d=dest+row*stride+col*4;
-            for(int ch=0;ch<3;++ch)d[ch]=src[3]?std::min(255,int(src[2-ch])*255/src[3]):0;
-            d[3]=src[3];
+    }
+    if(!next)next=SDL_CreateSystemCursor(spec.sdl_cursor);
+    if(next){SDL_SetCursor(next);if(game_cursor)SDL_DestroyCursor(game_cursor);game_cursor=next;}
+    if(pixels && w>0 && h>0 && w<=1024 && h<=1024){
+        cursor_pixels.assign((const unsigned char*)pixels,(const unsigned char*)pixels+pitch*h);
+        cursor_width=w;cursor_height=h;cursor_pitch=pitch;cursor_x=x;cursor_y=y;
+    }
+    auto dpy=gdk_display_get_default();
+    if(dpy) {
+        GdkCursor *next_gtk=nullptr;
+        if(name && spec.gdk_name)next_gtk=gdk_cursor_new_from_name(dpy,spec.gdk_name);
+        if(!next_gtk && pixels && w>0 && h>0 && w<=1024 && h<=1024) {
+            auto rgba=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,w,h);
+            auto dest=gdk_pixbuf_get_pixels(rgba);int stride=gdk_pixbuf_get_rowstride(rgba);
+            for(int row=0;row<h;++row)for(int col=0;col<w;++col){
+                const auto src=(const unsigned char*)pixels+row*pitch+col*4;auto d=dest+row*stride+col*4;
+                for(int ch=0;ch<3;++ch)d[ch]=src[3]?std::min(255,int(src[2-ch])*255/src[3]):0;
+                d[3]=src[3];
+            }
+            next_gtk=gdk_cursor_new_from_pixbuf(dpy,rgba,x,y);g_object_unref(rgba);
         }
-        auto next=gdk_cursor_new_from_pixbuf(gdk_display_get_default(),rgba,x,y);g_object_unref(rgba);
-        if(next){if(gtk_cursor)g_object_unref(gtk_cursor);gtk_cursor=next;update_capture_cursor();}
+        if(next_gtk){if(gtk_cursor)g_object_unref(gtk_cursor);gtk_cursor=next_gtk;update_capture_cursor();}
     }
     if(theme)XcursorImageDestroy(theme);
 }

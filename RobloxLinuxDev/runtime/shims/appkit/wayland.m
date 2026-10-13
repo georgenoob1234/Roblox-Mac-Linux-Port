@@ -387,14 +387,20 @@ static int pollInput(struct RbxWaylandEvent *event,BOOL queueBusy) {
 }
 - (void)hideCursor{[self rbxSetCursorVisible:NO];}
 - (void)unhideCursor{[self rbxSetCursorVisible:YES];}
+static BOOL isLegacyCursorAppearance(void) {
+    const char *v=getenv("ROBLOX_MAC_CURSOR_APPEARANCE");
+    return v && !strcmp(v,"legacy");
+}
 - (id)cursorWithName:(NSString*)name {
     RbxWaylandCursor *c=[RbxWaylandCursor new];c->name=[name copy];
-    const char *texture=robloxCursorTexture([name UTF8String]);
-    if(texture) {
-        NSString *relative=[@"content/textures/Cursors/KeyboardMouse" stringByAppendingPathComponent:[NSString stringWithUTF8String:texture]];
-        NSString *path=[[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:relative];
-        c->image=[[NSImage alloc] initWithContentsOfFile:path];
-        if(c->image){NSSize size=[c->image size];c->hot=NSMakePoint(size.width/2,size.height/2);}
+    if(isLegacyCursorAppearance()) {
+        const char *texture=robloxCursorTexture([name UTF8String]);
+        if(texture) {
+            NSString *relative=[@"content/textures/Cursors/KeyboardMouse" stringByAppendingPathComponent:[NSString stringWithUTF8String:texture]];
+            NSString *path=[[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:relative];
+            c->image=[[NSImage alloc] initWithContentsOfFile:path];
+            if(c->image){NSSize size=[c->image size];c->hot=NSMakePoint(size.width/2,size.height/2);}
+        }
     }
     return [c autorelease];
 }
@@ -415,7 +421,7 @@ static int pollInput(struct RbxWaylandEvent *event,BOOL queueBusy) {
         [NSGraphicsContext restoreGraphicsState];
         if(pointerTrace())fprintf(stderr,"CURSOR bitmap width=%.0f height=%.0f hot=%.1f,%.1f\n",size.width,size.height,cursor->hot.x,cursor->hot.y);
         api->cursor(CGBitmapContextGetData(context),size.width,size.height,CGBitmapContextGetBytesPerRow(context),cursor->hot.x,cursor->hot.y,NULL);CGContextRelease(context);
-    } else api->cursor(NULL,0,0,0,0,0,[cursor->name UTF8String]);
+    } else api->cursor(NULL,0,0,0,0,0,cursor->name?[cursor->name UTF8String]:NULL);
     [cursor retain];[applied release];applied=cursor;
     rbxRefreshLockedCursor();
 }

@@ -9,12 +9,79 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <signal.h>
+#include <dlfcn.h>
 #include <deque>
 #include <string>
 #include <map>
 #include "client-url.h"
 
+enum DecorationMode { DECORATION_AUTO, DECORATION_SYSTEM, DECORATION_GTK, DECORATION_LEGACY };
+static DecorationMode decoration_mode = DECORATION_AUTO;
 static GtkWidget *window,*header,*stack,*socket_view,*back,*forward,*reload,*done;
+static GtkWidget *browser_toolbar;
+
+static void apply_host_appearance_preferences() {
+    const char *host_config = g_getenv("ROBLOX_MAC_HOST_CONFIG");
+    const char *host_home = g_getenv("ROBLOX_MAC_HOST_HOME");
+    std::string config_path;
+    if (host_config && *host_config) config_path = std::string(host_config) + "/gtk-3.0/settings.ini";
+    else if (host_home && *host_home) config_path = std::string(host_home) + "/.config/gtk-3.0/settings.ini";
+    else {
+        const char *user_cfg = g_get_user_config_dir();
+        if (user_cfg) config_path = std::string(user_cfg) + "/gtk-3.0/settings.ini";
+    }
+
+    GKeyFile *keyfile = g_key_file_new();
+    gboolean loaded = !config_path.empty() && g_key_file_load_from_file(keyfile, config_path.c_str(), G_KEY_FILE_NONE, nullptr);
+    GtkSettings *gtk_settings = gtk_settings_get_default();
+
+    if (loaded && gtk_settings) {
+        const char *group = "Settings";
+        if (!g_getenv("GTK_THEME")) {
+            gchar *val = g_key_file_get_string(keyfile, group, "gtk-theme-name", nullptr);
+            if (val) { g_object_set(gtk_settings, "gtk-theme-name", val, nullptr); g_free(val); }
+        }
+        GError *err = nullptr;
+        gboolean prefer_dark = g_key_file_get_boolean(keyfile, group, "gtk-application-prefer-dark-theme", &err);
+        if (!err) g_object_set(gtk_settings, "gtk-application-prefer-dark-theme", prefer_dark, nullptr);
+        else g_clear_error(&err);
+
+        if (!g_getenv("XCURSOR_THEME")) {
+            gchar *val = g_key_file_get_string(keyfile, group, "gtk-cursor-theme-name", nullptr);
+            if (val) {
+                g_object_set(gtk_settings, "gtk-cursor-theme-name", val, nullptr);
+                g_setenv("XCURSOR_THEME", val, TRUE);
+                g_free(val);
+            }
+        }
+        if (!g_getenv("XCURSOR_SIZE")) {
+            gint size = g_key_file_get_integer(keyfile, group, "gtk-cursor-theme-size", &err);
+            if (!err && size >= 16 && size <= 128) {
+                g_object_set(gtk_settings, "gtk-cursor-theme-size", size, nullptr);
+                char size_str[16];
+                g_snprintf(size_str, sizeof(size_str), "%d", size);
+                g_setenv("XCURSOR_SIZE", size_str, TRUE);
+            } else g_clear_error(&err);
+        }
+        gchar *icon_val = g_key_file_get_string(keyfile, group, "gtk-icon-theme-name", nullptr);
+        if (icon_val) { g_object_set(gtk_settings, "gtk-icon-theme-name", icon_val, nullptr); g_free(icon_val); }
+
+        gchar *font_val = g_key_file_get_string(keyfile, group, "gtk-font-name", nullptr);
+        if (font_val) { g_object_set(gtk_settings, "gtk-font-name", font_val, nullptr); g_free(font_val); }
+
+        gchar *layout = g_key_file_get_string(keyfile, group, "gtk-decoration-layout", nullptr);
+        if (layout) { g_object_set(gtk_settings, "gtk-decoration-layout", layout, nullptr); g_free(layout); }
+    }
+    g_key_file_free(keyfile);
+}
+
+typedef void (*GdkWaylandAnnounceFn)(GdkWindow*);
+static void announce_wayland_decoration(GdkWindow *gw, bool ssd) {
+    if (!gw) return;
+    const char *fn_name = ssd ? "gdk_wayland_window_announce_ssd" : "gdk_wayland_window_announce_csd";
+    auto fn = (GdkWaylandAnnounceFn)dlsym(RTLD_DEFAULT, fn_name);
+    if (fn) fn(gw);
+}
 static GSubprocess *guest;
 static WebKitWebContext *context;
 static std::string browser_data;
@@ -107,17 +174,35 @@ static bool request_header(const char *name,const char *value) {
 static void controls() {
     bool browsing=current!=nullptr;
     bool panel=browsing && !current->panel_title.empty();
-    for(auto w:{back,forward,reload})gtk_widget_set_visible(w,browsing && !panel);
-    gtk_widget_set_visible(done,browsing);gtk_button_set_label(GTK_BUTTON(done),panel?"Close":"Back to Roblox");
+    if(browser_toolbar) {
+        if(browsing) gtk_widget_show(browser_toolbar);
+        else gtk_widget_hide(browser_toolbar);
+    }
+    for(auto w:{back,forward,reload})if(w)gtk_widget_set_visible(w,browsing && !panel);
+    if(done) {
+        gtk_widget_set_visible(done,browsing);
+        gtk_button_set_label(GTK_BUTTON(done),panel?"Close":"Back to Roblox");
+    }
     if(browsing) {
-        gtk_widget_set_sensitive(back,webkit_web_view_can_go_back(current->view));
-        gtk_widget_set_sensitive(forward,webkit_web_view_can_go_forward(current->view));
+        if(back)gtk_widget_set_sensitive(back,webkit_web_view_can_go_back(current->view));
+        if(forward)gtk_widget_set_sensitive(forward,webkit_web_view_can_go_forward(current->view));
         const char *title=panel?current->panel_title.c_str():webkit_web_view_get_title(current->view);
-        gtk_header_bar_set_title(GTK_HEADER_BAR(header),title && *title?title:"Roblox — Browser");
-        const char *url=webkit_web_view_get_uri(current->view);GUri *uri=url?g_uri_parse(url,G_URI_FLAGS_NONE,nullptr):nullptr;
-        gtk_header_bar_set_subtitle(GTK_HEADER_BAR(header),!panel && uri?g_uri_get_host(uri):nullptr);
-        if(uri)g_uri_unref(uri);
-    } else {gtk_header_bar_set_title(GTK_HEADER_BAR(header),"Roblox");gtk_header_bar_set_subtitle(GTK_HEADER_BAR(header),nullptr);}
+        const char *wtitle=title && *title?title:"Roblox — Browser";
+        gtk_window_set_title(GTK_WINDOW(window),wtitle);
+        if(header) {
+            gtk_header_bar_set_title(GTK_HEADER_BAR(header),wtitle);
+            const char *url=webkit_web_view_get_uri(current->view);
+            GUri *uri=url?g_uri_parse(url,G_URI_FLAGS_NONE,nullptr):nullptr;
+            gtk_header_bar_set_subtitle(GTK_HEADER_BAR(header),!panel && uri?g_uri_get_host(uri):nullptr);
+            if(uri)g_uri_unref(uri);
+        }
+    } else {
+        gtk_window_set_title(GTK_WINDOW(window),"Roblox");
+        if(header) {
+            gtk_header_bar_set_title(GTK_HEADER_BAR(header),"Roblox");
+            gtk_header_bar_set_subtitle(GTK_HEADER_BAR(header),nullptr);
+        }
+    }
 }
 static void return_to_game(GtkWidget*,gpointer) {
     if(current)send_object(event(current,"closed"));
@@ -350,39 +435,80 @@ int main(int argc,char **argv) {
     gdk_set_allowed_backends(native_wayland?"wayland":"x11");g_set_prgname("roblox-mac");g_set_application_name("Roblox");
     if(!gtk_init_check(nullptr,nullptr)){g_printerr("roblox-mac: GTK could not open the display\n");return 1;}
     if(native_wayland)g_printerr("WAYLAND GTK initialized\n");
+    apply_host_appearance_preferences();
+    const char *dec_env=g_getenv("ROBLOX_MAC_DECORATIONS");
+    if(dec_env) {
+        if(!strcmp(dec_env,"legacy"))decoration_mode=DECORATION_LEGACY;
+        else if(!strcmp(dec_env,"gtk"))decoration_mode=DECORATION_GTK;
+        else if(!strcmp(dec_env,"system"))decoration_mode=DECORATION_SYSTEM;
+        else decoration_mode=DECORATION_AUTO;
+    }
     auto settings=webkit_settings_new();
     g_setenv("ROBLOX_MAC_WEBKIT_USER_AGENT",webkit_settings_get_user_agent(settings),TRUE);g_object_unref(settings);
     if(native_wayland)g_printerr("WAYLAND WebKit settings initialized\n");
     window=gtk_window_new(GTK_WINDOW_TOPLEVEL);gtk_window_set_title(GTK_WINDOW(window),"Roblox");gtk_window_set_default_size(GTK_WINDOW(window),1100,800);
-    header=gtk_header_bar_new();gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header),!native_wayland);gtk_window_set_titlebar(GTK_WINDOW(window),header);
-    // The host's Glycin image-loader subprocess hangs inside the Darwin process
-    // during symbolic-icon decoding. GTK text buttons need no image loader;
-    // keep WebKit's normal image handling and sandbox unchanged.
-    back=native_wayland?gtk_button_new_with_label("←"):gtk_button_new_from_icon_name("go-previous-symbolic",GTK_ICON_SIZE_BUTTON);
-    forward=native_wayland?gtk_button_new_with_label("→"):gtk_button_new_from_icon_name("go-next-symbolic",GTK_ICON_SIZE_BUTTON);
-    reload=native_wayland?gtk_button_new_with_label("↻"):gtk_button_new_from_icon_name("view-refresh-symbolic",GTK_ICON_SIZE_BUTTON);done=gtk_button_new_with_label("Back to Roblox");
-    if(native_wayland) {
-        auto close=gtk_button_new_with_label("×"),maximize=gtk_button_new_with_label("□"),minimize=gtk_button_new_with_label("−");
-        for(auto item:{std::pair{close,"Close"},std::pair{maximize,"Maximize or restore"},std::pair{minimize,"Minimize"}}) {
-            gtk_widget_set_tooltip_text(item.first,item.second);atk_object_set_name(gtk_widget_get_accessible(item.first),item.second);
-            gtk_widget_set_can_focus(item.first,FALSE);gtk_header_bar_pack_end(GTK_HEADER_BAR(header),item.first);
+    if(decoration_mode==DECORATION_LEGACY) {
+        header=gtk_header_bar_new();gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header),!native_wayland);gtk_window_set_titlebar(GTK_WINDOW(window),header);
+        back=native_wayland?gtk_button_new_with_label("←"):gtk_button_new_from_icon_name("go-previous-symbolic",GTK_ICON_SIZE_BUTTON);
+        forward=native_wayland?gtk_button_new_with_label("→"):gtk_button_new_from_icon_name("go-next-symbolic",GTK_ICON_SIZE_BUTTON);
+        reload=native_wayland?gtk_button_new_with_label("↻"):gtk_button_new_from_icon_name("view-refresh-symbolic",GTK_ICON_SIZE_BUTTON);done=gtk_button_new_with_label("Back to Roblox");
+        if(native_wayland) {
+            auto close=gtk_button_new_with_label("×"),maximize=gtk_button_new_with_label("□"),minimize=gtk_button_new_with_label("−");
+            for(auto item:{std::pair{close,"Close"},std::pair{maximize,"Maximize or restore"},std::pair{minimize,"Minimize"}}) {
+                gtk_widget_set_tooltip_text(item.first,item.second);atk_object_set_name(gtk_widget_get_accessible(item.first),item.second);
+                gtk_widget_set_can_focus(item.first,FALSE);gtk_header_bar_pack_end(GTK_HEADER_BAR(header),item.first);
+            }
+            g_signal_connect(close,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){request_close();}),nullptr);
+            g_signal_connect(maximize,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){if(gtk_window_is_maximized(GTK_WINDOW(window)))gtk_window_unmaximize(GTK_WINDOW(window));else gtk_window_maximize(GTK_WINDOW(window));}),nullptr);
+            g_signal_connect(minimize,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){gtk_window_iconify(GTK_WINDOW(window));}),nullptr);
         }
-        g_signal_connect(close,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){request_close();}),nullptr);
-        g_signal_connect(maximize,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){if(gtk_window_is_maximized(GTK_WINDOW(window)))gtk_window_unmaximize(GTK_WINDOW(window));else gtk_window_maximize(GTK_WINDOW(window));}),nullptr);
-        g_signal_connect(minimize,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){gtk_window_iconify(GTK_WINDOW(window));}),nullptr);
+        for(auto w:{back,forward,reload})gtk_header_bar_pack_start(GTK_HEADER_BAR(header),w);
+        gtk_header_bar_pack_end(GTK_HEADER_BAR(header),done);
+    } else {
+        if(decoration_mode==DECORATION_GTK) {
+            header=gtk_header_bar_new();gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header),TRUE);
+            gtk_window_set_titlebar(GTK_WINDOW(window),header);
+        } else {
+            header=nullptr;
+            gtk_window_set_decorated(GTK_WINDOW(window),TRUE);
+        }
+        browser_toolbar=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,6);
+        gtk_style_context_add_class(gtk_widget_get_style_context(browser_toolbar),"primary-toolbar");
+        gtk_container_set_border_width(GTK_CONTAINER(browser_toolbar),4);
+        gtk_widget_set_no_show_all(browser_toolbar,TRUE);
+        gtk_widget_hide(browser_toolbar);
+
+        back=gtk_button_new_with_label("←");
+        forward=gtk_button_new_with_label("→");
+        reload=gtk_button_new_with_label("↻");
+        done=gtk_button_new_with_label("Back to Roblox");
+
+        for(auto w:{back,forward,reload})gtk_box_pack_start(GTK_BOX(browser_toolbar),w,FALSE,FALSE,0);
+        gtk_box_pack_end(GTK_BOX(browser_toolbar),done,FALSE,FALSE,0);
     }
-    for(auto w:{back,forward,reload})gtk_header_bar_pack_start(GTK_HEADER_BAR(header),w);
-    gtk_header_bar_pack_end(GTK_HEADER_BAR(header),done);
     gtk_widget_set_tooltip_text(back,"Back");gtk_widget_set_tooltip_text(forward,"Forward");gtk_widget_set_tooltip_text(reload,"Reload");
     g_signal_connect(back,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){if(current)webkit_web_view_go_back(current->view);}),nullptr);
     g_signal_connect(forward,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){if(current)webkit_web_view_go_forward(current->view);}),nullptr);
     g_signal_connect(reload,"clicked",G_CALLBACK(+[](GtkWidget*,gpointer){if(current)webkit_web_view_reload(current->view);}),nullptr);
     g_signal_connect(done,"clicked",G_CALLBACK(return_to_game),nullptr);
-    stack=gtk_stack_new();socket_view=native_wayland?gtk_drawing_area_new():gtk_socket_new();gtk_stack_add_named(GTK_STACK(stack),socket_view,"game");gtk_container_add(GTK_CONTAINER(window),stack);
+    stack=gtk_stack_new();socket_view=native_wayland?gtk_drawing_area_new():gtk_socket_new();gtk_stack_add_named(GTK_STACK(stack),socket_view,"game");
+    if(browser_toolbar) {
+        GtkWidget *content_box=gtk_box_new(GTK_ORIENTATION_VERTICAL,0);
+        gtk_box_pack_start(GTK_BOX(content_box),browser_toolbar,FALSE,FALSE,0);
+        gtk_box_pack_start(GTK_BOX(content_box),stack,TRUE,TRUE,0);
+        gtk_container_add(GTK_CONTAINER(window),content_box);
+    } else {
+        gtk_container_add(GTK_CONTAINER(window),stack);
+    }
     if(!native_wayland)g_signal_connect(socket_view,"plug-removed",G_CALLBACK(+[](GtkSocket*,gpointer)->gboolean{return TRUE;}),nullptr);
     g_signal_connect(window,"delete-event",G_CALLBACK(closed),nullptr);
     if(native_wayland)g_printerr("WAYLAND widgets initialized\n");
     gtk_widget_realize(window);gtk_widget_realize(socket_view);controls();
+    if(native_wayland) {
+        GdkWindow *gw=gtk_widget_get_window(window);
+        if(decoration_mode==DECORATION_GTK)announce_wayland_decoration(gw,false);
+        else if(decoration_mode==DECORATION_AUTO || decoration_mode==DECORATION_SYSTEM)announce_wayland_decoration(gw,true);
+    }
     if(native_wayland)g_printerr("WAYLAND widgets realized\n");
     socket_path=std::string(g_getenv("ROBLOX_MAC_STAGE"))+"/ui.sock";sockaddr_un address{};address.sun_family=AF_UNIX;
     if(socket_path.size()+strlen("/Volumes/SystemRoot")>=sizeof(address.sun_path)){g_printerr("roblox-mac: UI socket path too long\n");return 1;}

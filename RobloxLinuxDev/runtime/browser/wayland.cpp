@@ -78,9 +78,12 @@ static void initialize_profiler_overlay() {
     // Keep the game in its native subsurface. GTK composites only the HUD
     // above it, without forcing a Vulkan -> GL game copy or EGL swap.
     auto overlay=gtk_overlay_new();
-    g_object_ref(stack);gtk_container_remove(GTK_CONTAINER(window),stack);
+    auto parent=gtk_widget_get_parent(stack);
+    if(!parent)parent=window;
+    g_object_ref(stack);gtk_container_remove(GTK_CONTAINER(parent),stack);
     gtk_container_add(GTK_CONTAINER(overlay),stack);g_object_unref(stack);
-    gtk_container_add(GTK_CONTAINER(window),overlay);
+    if(GTK_IS_BOX(parent))gtk_box_pack_start(GTK_BOX(parent),overlay,TRUE,TRUE,0);
+    else gtk_container_add(GTK_CONTAINER(parent),overlay);
     profiler_area=gtk_gl_area_new();
     gtk_gl_area_set_required_version(GTK_GL_AREA(profiler_area),3,3);
     gtk_gl_area_set_has_alpha(GTK_GL_AREA(profiler_area),TRUE);
@@ -453,15 +456,18 @@ static void action(void*,int op,double x,double y,const char *text) {
                 wl_display_flush(display);
             }
             break;
-        case RBX_WL_TITLE:gtk_header_bar_set_title(GTK_HEADER_BAR(header),text?text:"Roblox");break;
+        case RBX_WL_TITLE:
+            gtk_window_set_title(GTK_WINDOW(window),text?text:"Roblox");
+            if(header)gtk_header_bar_set_title(GTK_HEADER_BAR(header),text?text:"Roblox");
+            break;
         case RBX_WL_RESIZE_WINDOW:
             gtk_window_resize(GTK_WINDOW(window),std::max(1,(int)x),std::max(1,(int)y));
             // Tiled compositors can reject a requested size without a new GTK
             // allocation. Correct the guest's optimistic size on the next poll.
             resize_report_pending=(std::max(1,(int)x)!=content_width || std::max(1,(int)y)!=content_height);break;
         case RBX_WL_FULLSCREEN:
-            if(x){gtk_widget_hide(header);gtk_window_fullscreen(GTK_WINDOW(window));}
-            else {gtk_window_unfullscreen(GTK_WINDOW(window));gtk_widget_show(header);}break;
+            if(x){if(header)gtk_widget_hide(header);gtk_window_fullscreen(GTK_WINDOW(window));}
+            else {gtk_window_unfullscreen(GTK_WINDOW(window));if(header)gtk_widget_show(header);}break;
         case RBX_WL_LOCK:
             refresh_pointer_focus();pointer_capture.request(x!=0);
             if(!x)commit_capture_hint();

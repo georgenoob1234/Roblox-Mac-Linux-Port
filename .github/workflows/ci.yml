@@ -78,9 +78,11 @@ jobs:
         working-directory: r
         run: |
           # Replicate roblox-mac's socket path calculation to fail fast if the
-          # checkout path is too deep for Linux Unix-domain sockets.
+          # checkout path is too deep for Linux Unix-domain sockets.  The build
+          # data directory lives inside RobloxLinuxDev/ (build.sh sets
+          # ROBLOX_MAC_DATA to $HERE/.build/profile with HERE=RobloxLinuxDev).
           HERE=$(pwd)
-          DATA="$HERE/.build/profile"
+          DATA="$HERE/RobloxLinuxDev/.build/profile"
           PREFIX="$DATA/prefix"
           ss_sock="$PREFIX/var/run/shellspawn.sock"
           ui_sock="/Volumes/SystemRoot$DATA/launch.123456/ui.sock"

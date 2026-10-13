@@ -68,7 +68,7 @@ sh run.sh set check_interval_hours 24
 
 Settings live in `DO_NOT_SHARE/bootstrapper.json`; defaults are `ask` and a 24-hour check interval, with `0` checking every launch. Exit status `0` means success (including a dropped second launch), `1` means setup/update/check failure, `2` means invalid arguments or settings, and `125` means cancellation. Browser links are passed as opaque in-memory arguments; a launch received while Roblox is running sends a notification and exits without queueing.
 
-Normal launches and browser links use the bundled GTK3 bootstrapper window when a
+Normal game launches and browser links use the bundled GTK3 bootstrapper window when a
 first-run setup or update has work to show. Ask mode offers Update now, Launch
 without updating, and Skip this version; a short timeout safely launches without
 updating. `sh run.sh --settings` opens the same release's settings without taking

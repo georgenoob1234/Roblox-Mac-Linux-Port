@@ -1,0 +1,30 @@
+name: Runner Smoke Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: >
+      github.repository == 'georgenoob1234/Roblox-Mac-Linux-Port'
+      && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64, roblox-builder]
+    timeout-minutes: 5
+
+    steps:
+      - name: Check builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -un)" = runner
+          uname -m
+          clang --version
+          llvm-config --version
+          ninja --version
+          docker info >/dev/null
+          unshare -Ur true
+          df -h /
+          echo "Runner smoke test passed"

@@ -204,17 +204,38 @@ if [ "${1:-}" != "--inside" ]; then
         echo "  sudo sysctl -w kernel.unprivileged_userns_clone=1" >&2
         exit 1
     }
-    # Darling's shellspawn socket lives at "$PREFIX/var/run/shellspawn.sock".
-    # Linux caps Unix-domain socket pathnames at 107 bytes; a deeply nested data
-    # directory fails there, deep into the launch, so refuse early. Existing
-    # prefixes are never moved or recreated.
-    if [ "${#PREFIX}" -gt 80 ]; then
-        echo "roblox-mac: data directory is too deep for Darling's Unix-domain sockets:" >&2
-        echo "  $PREFIX" >&2
-        echo "  Point ROBLOX_MAC_DATA at a shorter directory and rerun, for example:" >&2
-        echo "  ROBLOX_MAC_DATA=~/rbx-data $0 $*" >&2
+    # Two Unix sockets are derived from the data directory: Darling's shellspawn
+    # socket at "$PREFIX/var/run/shellspawn.sock" and the GTK UI socket at
+    # "$ROBLOX_MAC_STAGE/ui.sock", which the guest reaches as
+    # "/Volumes/SystemRoot$ROBLOX_MAC_STAGE/ui.sock". Linux sockaddr_un.sun_path
+    # is 108 bytes and the last one must stay NUL, so no socket pathname may
+    # exceed 107. Measure bytes, not characters: ${#var} counts characters in
+    # UTF-8 locales. mktemp replaces the XXXXXX of "$DATA/launch.XXXXXX" with
+    # six bytes (simulated below as "123456"). Nothing is created yet and
+    # existing prefixes are never moved, deleted or recreated.
+    _rbx_bytes() { LC_ALL=C printf %s "$1" | wc -c; }
+    _rbx_shellspawn=$PREFIX/var/run/shellspawn.sock
+    _rbx_ui=/Volumes/SystemRoot$DATA/launch.123456/ui.sock
+    _rbx_ss_len=$(_rbx_bytes "$_rbx_shellspawn")
+    _rbx_ui_len=$(_rbx_bytes "$_rbx_ui")
+    if [ "$_rbx_ss_len" -gt 107 ] || [ "$_rbx_ui_len" -gt 107 ]; then
+        echo "roblox-mac: data directory too deep for Linux Unix-domain sockets (max 107 bytes)." >&2
+        if [ "$_rbx_ss_len" -gt 107 ]; then
+            echo "  shellspawn socket: $_rbx_shellspawn" >&2
+        fi
+        if [ "$_rbx_ui_len" -gt 107 ]; then
+            echo "  UI socket: $_rbx_ui" >&2
+        fi
+        if [ "${RELEASE:-0}" = 1 ]; then
+            echo "  Release data must stay under DO_NOT_SHARE, so move the whole extracted" >&2
+            echo "  release directory to a shorter path (for example ~/RobloxLinuxRelease) and rerun." >&2
+        else
+            echo "  Point ROBLOX_MAC_DATA at a shorter directory and rerun, for example:" >&2
+            echo "  ROBLOX_MAC_DATA=~/rbx-data $0 $*" >&2
+        fi
         exit 1
     fi
+    unset _rbx_bytes _rbx_shellspawn _rbx_ui _rbx_ss_len _rbx_ui_len
     # Only the parent: `darling` initialises the prefix itself on first run, and skips that setup
     # entirely if the directory already exists.
     mkdir -p "$(dirname "$PREFIX")"

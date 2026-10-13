@@ -32,7 +32,20 @@ def test_appimage_icon_setup():
     assert 'cp "$HERE/icon.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/roblox-mac-port.png"' in text, "Missing hicolor app icon copy in build-appimage.sh"
     assert 'cp "$HERE/icon_bw.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/roblox-mac-port-settings.png"' in text, "Missing settings icon copy in build-appimage.sh"
     assert 'ln -sf roblox-mac-port.png "$APPDIR/.DirIcon"' in text, "Missing .DirIcon symlink in build-appimage.sh"
-    print("PASS AppImage icon bundle configuration")
+    assert 'roblox-mac.desktop' not in text, "Found redundant roblox-mac.desktop in build-appimage.sh"
+
+    # Verify that AppDir packaging logic creates exactly one root-level .desktop entry
+    with tempfile.TemporaryDirectory(prefix="roblox-appdir-") as tmpdir:
+        temp = Path(tmpdir)
+        desk_match = re.search(r'cat > "\$APPDIR/roblox-mac-port\.desktop" <<\'DESK\'\n(.*?)\nDESK', text, re.DOTALL)
+        assert desk_match, "Could not find roblox-mac-port.desktop heredoc in build-appimage.sh"
+        (temp / "roblox-mac-port.desktop").write_text(desk_match.group(1))
+
+        root_desktops = list(temp.glob("*.desktop"))
+        assert len(root_desktops) == 1, f"Expected exactly one root .desktop entry, found: {root_desktops}"
+        assert root_desktops[0].name == "roblox-mac-port.desktop", f"Unexpected root desktop: {root_desktops[0]}"
+
+    print("PASS AppImage icon bundle configuration and single canonical root desktop entry")
 
 def test_desktop_entries():
     with tempfile.TemporaryDirectory(prefix="roblox-identity-") as tmpdir:

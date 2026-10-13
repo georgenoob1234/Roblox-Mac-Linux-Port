@@ -107,7 +107,6 @@ Terminal=false
 StartupNotify=true
 StartupWMClass=roblox-mac-port
 DESK
-ln -sf roblox-mac-port.desktop "$APPDIR/roblox-mac.desktop"
 mkdir -p "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 cp "$APPDIR/roblox-mac-port.desktop" "$APPDIR/usr/share/applications/"
 cp "$HERE/icon.png" "$APPDIR/roblox-mac-port.png"

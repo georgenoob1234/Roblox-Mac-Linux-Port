@@ -204,6 +204,17 @@ if [ "${1:-}" != "--inside" ]; then
         echo "  sudo sysctl -w kernel.unprivileged_userns_clone=1" >&2
         exit 1
     }
+    # Darling's shellspawn socket lives at "$PREFIX/var/run/shellspawn.sock".
+    # Linux caps Unix-domain socket pathnames at 107 bytes; a deeply nested data
+    # directory fails there, deep into the launch, so refuse early. Existing
+    # prefixes are never moved or recreated.
+    if [ "${#PREFIX}" -gt 80 ]; then
+        echo "roblox-mac: data directory is too deep for Darling's Unix-domain sockets:" >&2
+        echo "  $PREFIX" >&2
+        echo "  Point ROBLOX_MAC_DATA at a shorter directory and rerun, for example:" >&2
+        echo "  ROBLOX_MAC_DATA=~/rbx-data $0 $*" >&2
+        exit 1
+    fi
     # Only the parent: `darling` initialises the prefix itself on first run, and skips that setup
     # entirely if the directory already exists.
     mkdir -p "$(dirname "$PREFIX")"

@@ -4,7 +4,7 @@ import json, os, pathlib, re, shlex, struct, subprocess, tempfile
 here=pathlib.Path(__file__).resolve().parent
 root=here.parent
 out=pathlib.Path(os.environ.get("OUT",str(here))).resolve()
-state=pathlib.Path(tempfile.mkdtemp(prefix='roblox-video-'))
+state=pathlib.Path(tempfile.mkdtemp(prefix='rbx-video-',dir='/tmp'))
 commands=[]
 for codec,encoder,tag,extension in [('avc1','libx264','avc1','h264'),('hvc1','libx265','hvc1','hevc')]:
     movie=state/(codec+'.mp4');annex=state/(codec+'.'+extension)

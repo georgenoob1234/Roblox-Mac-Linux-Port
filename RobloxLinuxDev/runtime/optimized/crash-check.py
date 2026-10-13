@@ -3,7 +3,7 @@
 import os,pathlib,resource,shlex,subprocess,tempfile
 here=pathlib.Path(__file__).resolve().parent;root=here.parent
 out=pathlib.Path(os.environ.get('OUT',str(here))).resolve()
-state=pathlib.Path(tempfile.mkdtemp(prefix='c-',dir=here));report=state/'fatal.log'
+state=pathlib.Path(tempfile.mkdtemp(prefix='rbx-crash-',dir='/tmp'));report=state/'fatal.log'
 guest='/Volumes/SystemRoot'
 command=shlex.join(['env','ROBLOX_MAC_CRASH_LOG='+str(report),guest+str(out/'crash-check')])
 env=dict(os.environ,ROBLOX_MAC_CONFIG='/dev/null',ROBLOX_MAC_DATA=str(state/'data'),ROBLOX_MAC_WAYLAND='0')

@@ -218,12 +218,12 @@ if [ "${1:-}" != "--inside" ]; then
     _rbx_ui=/Volumes/SystemRoot$DATA/launch.123456/ui.sock
     _rbx_ss_len=$(_rbx_bytes "$_rbx_shellspawn")
     _rbx_ui_len=$(_rbx_bytes "$_rbx_ui")
-    if [ "$_rbx_ss_len" -gt 107 ] || [ "$_rbx_ui_len" -gt 107 ]; then
+    if [ "$_rbx_ss_len" -gt 107 ] || { [ "${1:-}" != --shell ] && [ "$_rbx_ui_len" -gt 107 ]; }; then
         echo "roblox-mac: data directory too deep for Linux Unix-domain sockets (max 107 bytes)." >&2
         if [ "$_rbx_ss_len" -gt 107 ]; then
             echo "  shellspawn socket: $_rbx_shellspawn" >&2
         fi
-        if [ "$_rbx_ui_len" -gt 107 ]; then
+        if [ "${1:-}" != --shell ] && [ "$_rbx_ui_len" -gt 107 ]; then
             echo "  UI socket: $_rbx_ui" >&2
         fi
         if [ "${RELEASE:-0}" = 1 ]; then
@@ -235,7 +235,8 @@ if [ "${1:-}" != "--inside" ]; then
         fi
         exit 1
     fi
-    unset _rbx_bytes _rbx_shellspawn _rbx_ui _rbx_ss_len _rbx_ui_len
+    unset -f _rbx_bytes
+    unset _rbx_shellspawn _rbx_ui _rbx_ss_len _rbx_ui_len
     # Only the parent: `darling` initialises the prefix itself on first run, and skips that setup
     # entirely if the directory already exists.
     mkdir -p "$(dirname "$PREFIX")"

@@ -14,8 +14,12 @@ DEFAULTS = {
     "last_check": 0,
     "last_known_latest": "",
     "last_known_latest_display": "",
+    "window_decoration": "auto",
+    "cursor_appearance": "system",
 }
 VALID_MODES = {"auto", "ask", "off"}
+VALID_DECORATIONS = {"auto", "system", "gtk", "legacy"}
+VALID_CURSORS = {"system", "legacy"}
 KNOWN_DISPLAY_VERSIONS = {
     # Release notes and the launcher have carried these tested content hashes.
     "version-00a4ca14e31b41e9": "0.740.0.7400927",
@@ -52,6 +56,10 @@ def read_settings(data):
     for key in ("skipped_version", "last_known_latest", "last_known_latest_display"):
         value = values.get(key, "")
         values[key] = value if isinstance(value, str) else ""
+    if values.get("window_decoration") not in VALID_DECORATIONS:
+        values["window_decoration"] = DEFAULTS["window_decoration"]
+    if values.get("cursor_appearance") not in VALID_CURSORS:
+        values["cursor_appearance"] = DEFAULTS["cursor_appearance"]
     return values
 
 
@@ -165,11 +173,20 @@ def main(argv):
                 raise SystemExit(2)
             if key == "auto_update" and value not in VALID_MODES:
                 raise SystemExit("auto_update must be auto, ask or off")
+            if key == "window_decoration" and value not in VALID_DECORATIONS:
+                raise SystemExit("window_decoration must be auto, system, gtk or legacy")
+            if key == "cursor_appearance" and value not in VALID_CURSORS:
+                raise SystemExit("cursor_appearance must be system or legacy")
             if key == "check_interval_hours":
                 value = max(0, int(value))
             elif key in {"last_check"}:
                 value = max(0, int(value))
             values[key] = value
+            write_settings(data, values)
+            return
+        if operation == "reset_appearance" and len(argv) == 4:
+            values["window_decoration"] = DEFAULTS["window_decoration"]
+            values["cursor_appearance"] = DEFAULTS["cursor_appearance"]
             write_settings(data, values)
             return
         raise SystemExit(2)

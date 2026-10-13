@@ -90,6 +90,20 @@ installed_version() { cat "$HERE/RobloxVersion/.version" 2>/dev/null || true; }
 
 launch() {
     uri=${ROBLOX_MAC_LAUNCH_URI:-}
+    dec=${ROBLOX_MAC_DECORATIONS:-}
+    if [ -z "$dec" ]; then
+        dec=$(settings_get window_decoration 2>/dev/null || printf 'auto')
+    fi
+    case "$dec" in auto|system|gtk|legacy) ;; *) dec=auto;; esac
+    export ROBLOX_MAC_DECORATIONS=$dec
+
+    cur=${ROBLOX_MAC_CURSOR_APPEARANCE:-}
+    if [ -z "$cur" ]; then
+        cur=$(settings_get cursor_appearance 2>/dev/null || printf 'system')
+    fi
+    case "$cur" in system|desktop) cur=system;; legacy|roblox) cur=legacy;; *) cur=system;; esac
+    export ROBLOX_MAC_CURSOR_APPEARANCE=$cur
+
     if [ -n "$uri" ]; then
         exec env ROBLOX_MAC_LOCK_HELD=1 "$APP" --uri "$uri" "$@"
     fi
@@ -206,10 +220,12 @@ case "$command" in
         status_json; exit 0;;
     get)
         [ "$#" -eq 2 ] || { echo 'Usage: run.sh get SETTING' >&2; exit 2; }
-        settings_get "$2"; exit 0;;
+        settings_get "$2"; exit $?;;
     set)
         [ "$#" -eq 3 ] || { echo 'Usage: run.sh set SETTING VALUE' >&2; exit 2; }
-        settings_set "$2" "$3"; exit 0;;
+        settings_set "$2" "$3"; exit $?;;
+    reset-appearance)
+        python3 "$HELPER" settings "$DATA" reset_appearance; exit $?;;
     check)
         mkdir -p "$DATA"; exec 9>"$DATA/instance.lock"
         if ! flock -n -E 73 9; then

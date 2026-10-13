@@ -347,6 +347,43 @@ int main() {
     can_present=false;
     assert(!visible() && !rbx_wayland_vulkan_visible());
     can_present=true;
-    puts("PASS keyboard label mapping/modifiers, GTK click counts/scroll signs, capture FIFO/unlock/cursor state, capture requests, release hint offset/commit/focus safety, blur/browser release, focus batch barriers, 1:1 deltas, 150 ordered events, UTF-8 IME and shared GL/Vulkan window visibility");
+
+    // Desktop cursor mapping & fallback checks
+    assert(resolve_cursor_kind("arrowCursor")==CURSOR_DEFAULT);
+    assert(resolve_cursor_kind("pointingHandCursor")==CURSOR_POINTER);
+    assert(resolve_cursor_kind("IBeamCursor")==CURSOR_TEXT);
+    assert(resolve_cursor_kind("crosshairCursor")==CURSOR_CROSSHAIR);
+    assert(resolve_cursor_kind("closedHandCursor")==CURSOR_GRABBING);
+    assert(resolve_cursor_kind("openHandCursor")==CURSOR_GRAB);
+    assert(resolve_cursor_kind("resizeLeftRightCursor")==CURSOR_RESIZE_EW);
+    assert(resolve_cursor_kind("resizeUpDownCursor")==CURSOR_RESIZE_NS);
+    assert(resolve_cursor_kind("operationNotAllowedCursor")==CURSOR_NOT_ALLOWED);
+    assert(resolve_cursor_kind("waitCursor")==CURSOR_WAIT);
+    assert(resolve_cursor_kind("left_ptr")==CURSOR_DEFAULT);
+    assert(resolve_cursor_kind("pointer")==CURSOR_POINTER);
+    assert(resolve_cursor_kind("text")==CURSOR_TEXT);
+    assert(resolve_cursor_kind(nullptr)==CURSOR_DEFAULT);
+    assert(resolve_cursor_kind("unknown_custom")==CURSOR_DEFAULT);
+
+    std::vector<uint32_t> fb;
+    int fbw=0,fbh=0,fbpitch=0,fbhx=0,fbhy=0;
+    generate_fallback_cursor(CURSOR_DEFAULT,fb,&fbw,&fbh,&fbpitch,&fbhx,&fbhy);
+    assert(fbw==24 && fbh==24 && fbpitch==96 && fbhx==0 && fbhy==0 && fb.size()==576);
+    assert(fb[0]==0xFF000000);
+
+    generate_fallback_cursor(CURSOR_TEXT,fb,&fbw,&fbh,&fbpitch,&fbhx,&fbhy);
+    assert(fbw==24 && fbh==24 && fbhx==12 && fbhy==12 && fb.size()==576);
+
+    generate_fallback_cursor(CURSOR_CROSSHAIR,fb,&fbw,&fbh,&fbpitch,&fbhx,&fbhy);
+    assert(fbw==24 && fbh==24 && fbhx==12 && fbhy==12 && fb.size()==576);
+
+    int cw=0,ch=0,cp=0,cx=0,cy=0;
+    const void *img=cursor_image(&cw,&ch,&cp,&cx,&cy);
+    assert(img!=nullptr && cw>0 && ch>0 && cp>=cw*4);
+
+    cursor(nullptr,0,0,0,0,0,"pointingHandCursor");
+    assert(!cursor_pixels.empty());
+
+    puts("PASS keyboard label mapping/modifiers, GTK click counts/scroll signs, capture FIFO/unlock/cursor state, capture requests, release hint offset/commit/focus safety, blur/browser release, focus batch barriers, 1:1 deltas, 150 ordered events, UTF-8 IME, shared GL/Vulkan window visibility and desktop cursor resolution/fallbacks");
 }
 #endif

@@ -70,6 +70,7 @@ if [ -f "$CONFIG" ]; then
     _env_app=${ROBLOX_MAC_APP:-}; _env_data=${ROBLOX_MAC_DATA:-}; _env_vd=${SDL_VIDEODRIVER:-}; _env_renderer=${ROBLOX_MAC_RENDERER:-}
     _env_size=${ROBLOX_MAC_RENDER_SIZE:-}
     _env_opt=${ROBLOX_MAC_OPTIMIZED:-}; _env_cpu=${ROBLOX_MAC_CPU_AFFINITY:-}; _env_workers=${RBX_PIPELINE_WORKERS:-}; _env_swap=${ROBLOX_MAC_SWAP_INTERVAL:-}
+    _env_decorations=${ROBLOX_MAC_DECORATIONS:-}; _env_cursor=${ROBLOX_MAC_CURSOR_APPEARANCE:-}
     # shellcheck disable=SC1090
     . "$CONFIG"
     [ -n "$_env_app" ]  && ROBLOX_MAC_APP=$_env_app
@@ -81,7 +82,11 @@ if [ -f "$CONFIG" ]; then
     [ -n "$_env_workers" ] && RBX_PIPELINE_WORKERS=$_env_workers
     [ -n "$_env_swap" ] && ROBLOX_MAC_SWAP_INTERVAL=$_env_swap
     [ -n "$_env_size" ] && ROBLOX_MAC_RENDER_SIZE=$_env_size
+    [ -n "$_env_decorations" ] && ROBLOX_MAC_DECORATIONS=$_env_decorations
+    [ -n "$_env_cursor" ] && ROBLOX_MAC_CURSOR_APPEARANCE=$_env_cursor
 fi
+export ROBLOX_MAC_DECORATIONS=${ROBLOX_MAC_DECORATIONS:-auto}
+export ROBLOX_MAC_CURSOR_APPEARANCE=${ROBLOX_MAC_CURSOR_APPEARANCE:-system}
 export ROBLOX_MAC_RENDER_SIZE=${ROBLOX_MAC_RENDER_SIZE:-}
 export ROBLOX_MAC_CPU_AFFINITY=${ROBLOX_MAC_CPU_AFFINITY:-}
 export ROBLOX_MAC_SWAP_INTERVAL=${ROBLOX_MAC_SWAP_INTERVAL:-0}
@@ -138,6 +143,7 @@ if [ "${RELEASE:-0}" = 1 ]; then
 fi
 if [ "${1:-}" = --show-config ]; then
     printf 'CONFIG=%s\nDATA=%s\nAPP=%s\nRENDERER=%s\n' "$CONFIG" "$DATA" "$APP" "$ROBLOX_MAC_RENDERER"
+    printf 'DECORATIONS=%s\nCURSOR_APPEARANCE=%s\n' "$ROBLOX_MAC_DECORATIONS" "$ROBLOX_MAC_CURSOR_APPEARANCE"
     printf 'CPU_AFFINITY=%s\nSWAP_INTERVAL=%s\n' "$ROBLOX_MAC_CPU_AFFINITY" "${ROBLOX_MAC_SWAP_INTERVAL:-metal}"
     printf 'NATIVE_MEMORY=%s\n' "$TRACKA_NATIVE_MEMORY"
     printf 'RENDER_SIZE=%s\n' "${ROBLOX_MAC_RENDER_SIZE:-window}"
@@ -394,6 +400,10 @@ args=['env','TMPDIR='+client_tmp,'TEMPDIR='+client_tmp,
       'ROBLOX_MAC_PIPELINE_CACHE='+client_data+'/vk-pipeline-cache-v1.bin',
       'PTHREAD_MUTEX_DEFAULT_POLICY=3','PTHREAD_MUTEX_USE_ULOCK=1',
       'DYLD_FORCE_FLAT_NAMESPACE=1','DYLD_INSERT_LIBRARIES='+sys.argv[1]]
+if os.environ.get('ROBLOX_MAC_CURSOR_APPEARANCE'):
+    args.append('ROBLOX_MAC_CURSOR_APPEARANCE='+os.environ['ROBLOX_MAC_CURSOR_APPEARANCE'])
+if os.environ.get('ROBLOX_MAC_DECORATIONS'):
+    args.append('ROBLOX_MAC_DECORATIONS='+os.environ['ROBLOX_MAC_DECORATIONS'])
 if os.environ.get('DYLD_PRINT_LIBRARIES'): args.append('DYLD_PRINT_LIBRARIES=1')
 if os.environ.get('DYLD_FRAMEWORK_PATH'): args.append('DYLD_FRAMEWORK_PATH='+os.environ['DYLD_FRAMEWORK_PATH'])
 # Match fetch-client's production build even when account preferences select a test channel.
@@ -403,7 +413,7 @@ launch_uri=os.environ.get('ROBLOX_MAC_LAUNCH_URI')
 if launch_uri:
     client[1:1]=['-protocolString', launch_uri]
     args.append('ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1')
-print(shlex.join(args+client))
+sys.stdout.buffer.write(os.fsencode(shlex.join(args+client)) + b'\n')
 PYTHON
 )
 set +e

@@ -37,6 +37,7 @@ Exec=$exec_path %u
 Icon=roblox-mac-port
 Terminal=false
 StartupNotify=true
+StartupWMClass=roblox-mac-port
 Categories=Game;
 MimeType=x-scheme-handler/roblox;x-scheme-handler/roblox-player;
 EOF
@@ -50,6 +51,7 @@ Exec=$exec_path --launcher
 Icon=roblox-mac-port-settings
 Terminal=false
 StartupNotify=true
+StartupWMClass=roblox-mac-port
 Categories=Game;
 EOF
     cp "$SETTINGS_ICON_SOURCE" "$SETTINGS_ICON_PATH"

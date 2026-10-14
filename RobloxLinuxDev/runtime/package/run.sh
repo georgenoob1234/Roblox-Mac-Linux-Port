@@ -46,9 +46,34 @@ if [ "${1:-}" = --launcher ]; then
     open_launcher_ui --launcher
 fi
 export ROBLOX_MAC_UI_APP=$TARGET_APPIMAGE
+_is_internal_updater() {
+    for _arg in "$@"; do
+        case "$_arg" in
+            --client-version|--client-version-display|--download-client|--prepare-shaders)
+                return 0;;
+        esac
+    done
+    return 1
+}
+if ! _is_internal_updater "$@"; then
+    _short_base=/tmp
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
+        _xlen=$(LC_ALL=C printf %s "$XDG_RUNTIME_DIR" | wc -c)
+        [ "$_xlen" -le 32 ] && _short_base=$XDG_RUNTIME_DIR
+    fi
+    _app_target=$(mktemp -d "$_short_base/rbx-mnt.XXXXXX")
+    chmod 700 "$_app_target"
+    export APPIMAGE_TARGET_DIR=$_app_target
+    cleanup_target_dir() { rm -rf -- "$_app_target" 2>/dev/null || true; }
+    trap cleanup_target_dir EXIT INT TERM HUP
+fi
 case "${1:-}" in
     --diagnose|--debug|--client-version|--client-version-display|--download-client|--prepare-shaders|--shell|--inside)
-        exec "$HERE/RobloxLinux.AppImage" "$@";;
+        "$HERE/RobloxLinux.AppImage" "$@"
+        _status=$?
+        exit $_status;;
 esac
 [ -t 2 ] || export ROBLOX_MAC_NO_TERMINAL=1
-exec "$HERE/bootstrap.sh" "$@"
+"$HERE/bootstrap.sh" "$@"
+_status=$?
+exit $_status

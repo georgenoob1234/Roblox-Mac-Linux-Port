@@ -269,6 +269,7 @@ if [ "${1:-}" != "--inside" ]; then
     # Clean up only the aliases and per-launch temporary resources owned by this launch.
     # Never delete the real data directory or Darling prefix.
     cleanup_alias() {
+        [ -n "${INNER_PID:-}" ] && kill -KILL "$INNER_PID" 2>/dev/null || true
         rm -rf -- "$ROBLOX_MAC_STAGE" 2>/dev/null || true
         rm -f -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
         rmdir -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
@@ -288,11 +289,21 @@ if [ "${1:-}" != "--inside" ]; then
                 return 0
             fi
         fi
-        "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@"
-        return $?
+        "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@" &
+        INNER_PID=$!
+        wait "$INNER_PID" 2>/dev/null
+        _rc=$?
+        unset INNER_PID
+        return $_rc
     }
     # --pid --fork --mount-proc: launchd expects to own the process tree, and without a PID
     # namespace its daemons (opendirectoryd, shellspawn) never come up.
+    echo "=== [DIAG: Before unshare] ===" >&2
+    echo "  REAL_DATA=${REAL_DATA:-}" >&2
+    echo "  DATA=${DATA:-}" >&2
+    echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
+    echo "  TMPDIR=${TMPDIR:-}" >&2
+    echo "  PREFIX=${PREFIX:-}" >&2
     if [ "${ROBLOX_MAC_WAYLAND:-}" = 1 ]; then
         export GDK_BACKEND=wayland EGL_PLATFORM=wayland
         export ROBLOX_MAC_WAYLAND_HELPER=$ROOT/browser/libroblox-wayland.so
@@ -339,6 +350,7 @@ mount -t overlay overlay -o "lowerdir=$STAGE:/usr" /usr
 # sockaddr_un.sun_path while persisting all changes to the original data directory.
 REAL_DATA=${ROBLOX_MAC_REAL_DATA:-$DATA}
 if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+    mkdir -p -m 700 "$REAL_DATA/client-tmp" "$REAL_DATA/crashes"
     if [ -d "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
         mount --bind "$REAL_DATA" "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
     fi
@@ -366,6 +378,13 @@ export ROBLOX_MAC_COOKIE_HELPER=$ROOT/shims/cfnet/libcookies-host.so
 export ROBLOX_MAC_VIDEO_HELPER=$ROOT/optimized/libtracka-video-host.so
 mkdir -p "$DATA/crashes"
 export ROBLOX_MAC_CRASH_LOG=$DATA/crashes/fatal.log
+
+echo "=== [DIAG: Inside namespace before launching Darling] ===" >&2
+echo "  REAL_DATA=${REAL_DATA:-}" >&2
+echo "  DATA=${DATA:-}" >&2
+echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
+echo "  TMPDIR=${TMPDIR:-}" >&2
+echo "  PREFIX=${PREFIX:-}" >&2
 
 # Creating private/etc first makes Darling mistake an empty prefix for an initialized one.
 [ -d "$PREFIX" ] || darling shell true
@@ -462,6 +481,13 @@ if launch_uri:
 sys.stdout.buffer.write(os.fsencode(shlex.join(args+client)) + b'\n')
 PYTHON
 )
+echo "=== [DIAG: Before exec'ing RobloxPlayer] ===" >&2
+echo "  HOME=${HOME:-}" >&2
+echo "  TMPDIR=${TMPDIR:-}" >&2
+echo "  client-tmp path=$DATA/client-tmp" >&2
+echo "  resolved /Volumes/SystemRoot mapping: G=$G, DATA=$DATA" >&2
+echo "  host client-tmp exists: $([ -d "$DATA/client-tmp" ] && echo YES || echo NO)" >&2
+echo "  guest client-tmp: /Volumes/SystemRoot$DATA/client-tmp" >&2
 set +e
 darling shell bash -c "$COMMAND"
 status=$?

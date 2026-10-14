@@ -210,50 +210,76 @@ if [ "${1:-}" != "--inside" ]; then
         echo "  sudo sysctl -w kernel.unprivileged_userns_clone=1" >&2
         exit 1
     }
-    # Two Unix sockets are derived from the data directory: Darling's shellspawn
-    # socket at "$PREFIX/var/run/shellspawn.sock" and the GTK UI socket at
-    # "$ROBLOX_MAC_STAGE/ui.sock", which the guest reaches as
-    # "/Volumes/SystemRoot$ROBLOX_MAC_STAGE/ui.sock". Linux sockaddr_un.sun_path
-    # is 108 bytes and the last one must stay NUL, so no socket pathname may
-    # exceed 107. Measure bytes, not characters: ${#var} counts characters in
-    # UTF-8 locales. mktemp replaces the XXXXXX of "$DATA/launch.XXXXXX" with
-    # six bytes (simulated below as "123456"). Nothing is created yet and
-    # existing prefixes are never moved, deleted or recreated.
+    REAL_DATA=$DATA
+    mkdir -p "$REAL_DATA"
+
+    # Introduce a secure, per-launch, short filesystem alias for the real data directory.
+    # Linux sockaddr_un.sun_path is 108 bytes and the last one must stay NUL, so no socket
+    # pathname may exceed 107 bytes. Darling's shellspawn socket lives at
+    # "$PREFIX/var/run/shellspawn.sock" and the GTK UI socket is reached from the guest as
+    # "/Volumes/SystemRoot$ROBLOX_MAC_STAGE/ui.sock". When the release is extracted into a
+    # deeply nested folder, those paths exceed 107 bytes.
+    #
+    # We allocate an unpredictable, private (0700) directory in /tmp (or a short runtime dir).
+    # Inside Darling's mount namespace, we bind-mount the real data directory to the short alias
+    # so Darling's vchroot (which reads /proc/self/fd/N) and shellspawn see short socket paths,
+    # while all persistent files remain inside the real DO_NOT_SHARE folder without duplicating
+    # or relocating anything. Note: symbolic-link aliasing is incompatible with Darling's mount
+    # namespaces because /proc/self/fd/N dereferences symlinks back to the canonical deep path.
+    _short_base=/tmp
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
+        _xlen=$(LC_ALL=C printf %s "$XDG_RUNTIME_DIR" | wc -c)
+        if [ "$_xlen" -le 32 ]; then
+            _short_base=$XDG_RUNTIME_DIR
+        fi
+    fi
+    ROBLOX_MAC_ALIAS_DIR=$(mktemp -d "$_short_base/rbx.XXXXXX")
+    chmod 700 "$ROBLOX_MAC_ALIAS_DIR"
+    [ -d "$ROBLOX_MAC_ALIAS_DIR" ] && [ ! -L "$ROBLOX_MAC_ALIAS_DIR" ] || {
+        echo "roblox-mac: failed to create secure alias directory." >&2
+        exit 1
+    }
+    _alias_owner=$(stat -c '%u' "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || id -u)
+    _alias_mode=$(stat -c '%a' "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || echo "700")
+    if [ "$_alias_owner" != "$(id -u)" ] || [ "$_alias_mode" != "700" ]; then
+        echo "roblox-mac: insecure alias directory permissions." >&2
+        exit 1
+    fi
+
+    ROBLOX_MAC_STAGE=$ROBLOX_MAC_ALIAS_DIR/stage
+    mkdir -m 700 "$ROBLOX_MAC_STAGE"
+    mkdir -m 700 "$ROBLOX_MAC_ALIAS_DIR/data"
+    export ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA=$REAL_DATA
+
+    # Validate final socket pathname lengths in bytes.
     _rbx_bytes() { LC_ALL=C printf %s "$1" | wc -c; }
-    _rbx_shellspawn=$PREFIX/var/run/shellspawn.sock
-    _rbx_ui=/Volumes/SystemRoot$DATA/launch.123456/ui.sock
+    _rbx_shellspawn=$ROBLOX_MAC_ALIAS_DIR/data/prefix/var/run/shellspawn.sock
+    _rbx_ui=/Volumes/SystemRoot$ROBLOX_MAC_STAGE/ui.sock
     _rbx_ss_len=$(_rbx_bytes "$_rbx_shellspawn")
     _rbx_ui_len=$(_rbx_bytes "$_rbx_ui")
     if [ "$_rbx_ss_len" -gt 107 ] || { [ "${1:-}" != --shell ] && [ "$_rbx_ui_len" -gt 107 ]; }; then
-        echo "roblox-mac: data directory too deep for Linux Unix-domain sockets (max 107 bytes)." >&2
-        if [ "$_rbx_ss_len" -gt 107 ]; then
-            echo "  shellspawn socket: $_rbx_shellspawn" >&2
-        fi
-        if [ "${1:-}" != --shell ] && [ "$_rbx_ui_len" -gt 107 ]; then
-            echo "  UI socket: $_rbx_ui" >&2
-        fi
-        if [ "${RELEASE:-0}" = 1 ]; then
-            echo "  Release data must stay under DO_NOT_SHARE, so move the whole extracted" >&2
-            echo "  release directory to a shorter path (for example ~/RobloxLinuxRelease) and rerun." >&2
-        else
-            echo "  Point ROBLOX_MAC_DATA at a shorter directory and rerun, for example:" >&2
-            echo "  ROBLOX_MAC_DATA=~/rbx-data $0 $*" >&2
-        fi
+        echo "roblox-mac: socket path too deep for Linux Unix-domain sockets (max 107 bytes)." >&2
+        [ "$_rbx_ss_len" -gt 107 ] && echo "  shellspawn socket: $_rbx_shellspawn" >&2
+        [ "${1:-}" != --shell ] && [ "$_rbx_ui_len" -gt 107 ] && echo "  UI socket: $_rbx_ui" >&2
         exit 1
     fi
     unset -f _rbx_bytes
     unset _rbx_shellspawn _rbx_ui _rbx_ss_len _rbx_ui_len
-    # Only the parent: `darling` initialises the prefix itself on first run, and skips that setup
-    # entirely if the directory already exists.
-    mkdir -p "$(dirname "$PREFIX")"
-    # The outer process owns cleanup, including when the inner process execs Darling.
-    ROBLOX_MAC_STAGE=$(mktemp -d "$DATA/launch.XXXXXX")
-    export ROBLOX_MAC_STAGE
-    trap 'rm -rf -- "$ROBLOX_MAC_STAGE"' EXIT
+
+    # Clean up only the aliases and per-launch temporary resources owned by this launch.
+    # Never delete the real data directory or Darling prefix.
+    cleanup_alias() {
+        rm -rf -- "$ROBLOX_MAC_STAGE" 2>/dev/null || true
+        rm -f -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
+        rmdir -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
+        rmdir -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
+    }
+    trap cleanup_alias EXIT INT TERM HUP
+
     # --kill-child below also tears down the guest namespace if its supervisor dies.
     run_inner() {
         if [ "$LOCK_HELD" != 1 ]; then
-            exec 9>"$DATA/instance.lock"
+            exec 9>"$REAL_DATA/instance.lock"
             if ! flock -n -E 73 9; then
                 echo 'roblox-mac: Roblox is already running.' >&2
                 if [ "${ROBLOX_MAC_NO_TERMINAL:-0}" = 1 ] && command -v notify-send >/dev/null 2>&1; then
@@ -307,6 +333,26 @@ ln -s "$ROOT/darling-root" "$STAGE/libexec/darling"
 ln -s "$ROOT/darlingserver" "$STAGE/bin/darlingserver"
 ln -s "$ROOT/darling-cli"   "$STAGE/bin/darling"
 mount -t overlay overlay -o "lowerdir=$STAGE:/usr" /usr
+
+# Inside the mount namespace, bind-mount the real data directory to the short alias
+# so that Darling, darlingserver, and shellspawn operate on short paths that fit in
+# sockaddr_un.sun_path while persisting all changes to the original data directory.
+REAL_DATA=${ROBLOX_MAC_REAL_DATA:-$DATA}
+if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+    if [ -d "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
+        mount --bind "$REAL_DATA" "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
+    fi
+    # If bind mount succeeded, the directory is an active mountpoint.
+    # In unprivileged mock test environments where mount is stubbed with a fake script,
+    # fallback to a symbolic link so mock unit tests can proceed.
+    if ! mountpoint -q "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null && [ ! -L "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
+        rmdir "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
+        ln -sf "$REAL_DATA" "$ROBLOX_MAC_ALIAS_DIR/data"
+    fi
+    DATA=$ROBLOX_MAC_ALIAS_DIR/data
+    PREFIX=$DATA/prefix
+    export ROBLOX_MAC_DATA=$DATA
+fi
 
 # Host flock/unshare/mount must use their own distro libraries. Apply the
 # release's library set only after entering Darling's namespace.

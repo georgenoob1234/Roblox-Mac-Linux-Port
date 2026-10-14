@@ -364,6 +364,9 @@ if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
     DATA=$ROBLOX_MAC_ALIAS_DIR/data
     PREFIX=$DATA/prefix
     export ROBLOX_MAC_DATA=$DATA
+    export TMPDIR="$DATA/client-tmp"
+    export TMP="$DATA/client-tmp"
+    export TEMP="$DATA/client-tmp"
 fi
 
 # Host flock/unshare/mount must use their own distro libraries. Apply the

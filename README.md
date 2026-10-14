@@ -1,5 +1,7 @@
 # Roblox Mac Linux Port
 
+## If you want the original spidercraft version, download the initial commit/ first release.
+
 An experimental, unofficial runner for the Intel macOS Roblox client on x86_64 Linux, using Darling, Wayland and Vulkan.
 
 **[Download RobloxLinuxRelease.tar.gz](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/releases/)**, extract it, run `./install-uri-handler.sh` once from `RobloxLinuxRelease`, then open Roblox from your desktop application menu.

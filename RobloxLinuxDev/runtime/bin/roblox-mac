@@ -106,7 +106,11 @@ if [ "${RELEASE:-0}" = 1 ]; then
     PRIVATE=$STATE/DO_NOT_SHARE
     # Ignore inherited home/cache paths; staging overrides must stay in this folder.
     DATA=$(realpath -m -- "$DATA")
-    case "$DATA" in "$PRIVATE"|"$PRIVATE"/*) ;; *) echo 'Release data must stay inside DO_NOT_SHARE.' >&2; exit 2;; esac
+    if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ] && [ "$DATA" = "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
+        :
+    else
+        case "$DATA" in "$PRIVATE"|"$PRIVATE"/*) ;; *) echo 'Release data must stay inside DO_NOT_SHARE.' >&2; exit 2;; esac
+    fi
     mkdir -p "$PRIVATE"
     chmod 700 "$PRIVATE"
     export HOME=$PRIVATE/home XDG_CONFIG_HOME=$PRIVATE/config
@@ -210,7 +214,10 @@ if [ "${1:-}" != "--inside" ]; then
         echo "  sudo sysctl -w kernel.unprivileged_userns_clone=1" >&2
         exit 1
     }
-    REAL_DATA=$DATA
+    REAL_DATA=${ROBLOX_MAC_REAL_DATA:-$DATA}
+    if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ] && [ "$REAL_DATA" = "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
+        REAL_DATA=${STATE:-$HERE}/DO_NOT_SHARE
+    fi
     mkdir -p "$REAL_DATA"
 
     # Introduce a secure, per-launch, short filesystem alias for the real data directory.
@@ -233,22 +240,29 @@ if [ "${1:-}" != "--inside" ]; then
             _short_base=$XDG_RUNTIME_DIR
         fi
     fi
-    ROBLOX_MAC_ALIAS_DIR=$(mktemp -d "$_short_base/rbx.XXXXXX")
-    chmod 700 "$ROBLOX_MAC_ALIAS_DIR"
-    [ -d "$ROBLOX_MAC_ALIAS_DIR" ] && [ ! -L "$ROBLOX_MAC_ALIAS_DIR" ] || {
-        echo "roblox-mac: failed to create secure alias directory." >&2
-        exit 1
-    }
-    _alias_owner=$(stat -c '%u' "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || id -u)
-    _alias_mode=$(stat -c '%a' "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || echo "700")
-    if [ "$_alias_owner" != "$(id -u)" ] || [ "$_alias_mode" != "700" ]; then
-        echo "roblox-mac: insecure alias directory permissions." >&2
-        exit 1
-    fi
+    _created_alias=0
+    if [ -z "${ROBLOX_MAC_ALIAS_DIR:-}" ] || [ ! -d "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+        ROBLOX_MAC_ALIAS_DIR=$(mktemp -d "$_short_base/rbx.XXXXXX")
+        chmod 700 "$ROBLOX_MAC_ALIAS_DIR"
+        [ -d "$ROBLOX_MAC_ALIAS_DIR" ] && [ ! -L "$ROBLOX_MAC_ALIAS_DIR" ] || {
+            echo "roblox-mac: failed to create secure alias directory." >&2
+            exit 1
+        }
+        _alias_owner=$(stat -c '%u' "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || id -u)
+        _alias_mode=$(stat -c '%a' "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || echo "700")
+        if [ "$_alias_owner" != "$(id -u)" ] || [ "$_alias_mode" != "700" ]; then
+            echo "roblox-mac: insecure alias directory permissions." >&2
+            exit 1
+        fi
 
-    ROBLOX_MAC_STAGE=$ROBLOX_MAC_ALIAS_DIR/stage
-    mkdir -m 700 "$ROBLOX_MAC_STAGE"
-    mkdir -m 700 "$ROBLOX_MAC_ALIAS_DIR/data"
+        ROBLOX_MAC_STAGE=$ROBLOX_MAC_ALIAS_DIR/stage
+        mkdir -m 700 "$ROBLOX_MAC_STAGE"
+        mkdir -m 700 "$ROBLOX_MAC_ALIAS_DIR/data"
+        _created_alias=1
+    else
+        ROBLOX_MAC_STAGE=${ROBLOX_MAC_STAGE:-$ROBLOX_MAC_ALIAS_DIR/stage}
+        mkdir -p -m 700 "$ROBLOX_MAC_STAGE" "$ROBLOX_MAC_ALIAS_DIR/data"
+    fi
     export ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA=$REAL_DATA
 
     # Validate final socket pathname lengths in bytes.
@@ -270,10 +284,12 @@ if [ "${1:-}" != "--inside" ]; then
     # Never delete the real data directory or Darling prefix.
     cleanup_alias() {
         [ -n "${INNER_PID:-}" ] && kill -KILL "$INNER_PID" 2>/dev/null || true
-        rm -rf -- "$ROBLOX_MAC_STAGE" 2>/dev/null || true
-        rm -f -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
-        rmdir -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
-        rmdir -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
+        if [ "$_created_alias" = 1 ]; then
+            rm -rf -- "$ROBLOX_MAC_STAGE" 2>/dev/null || true
+            rm -f -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
+            rmdir -- "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
+            rmdir -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
+        fi
     }
     trap cleanup_alias EXIT INT TERM HUP
 
@@ -460,6 +476,7 @@ fi
 mkdir -p -m 700 "$DATA/client-tmp"
 COMMAND=$(python3 - "$INSERT" "$G$(CDPATH= cd -- "$APP" && pwd)/Contents/MacOS/RobloxPlayer" "$@" <<'PYTHON'
 import os,shlex,sys
+print(os.environ['ROBLOX_MAC_DATA'], file=sys.stderr)
 # Use pthread's native futex-backed mode. Darling's psynch RPC path can lose
 # the receiver/update condition-variable wakeup; our shim supplies ulock_wait2.
 client_data='/Volumes/SystemRoot'+os.path.abspath(os.environ['ROBLOX_MAC_DATA'])
@@ -491,6 +508,10 @@ echo "  client-tmp path=$DATA/client-tmp" >&2
 echo "  resolved /Volumes/SystemRoot mapping: G=$G, DATA=$DATA" >&2
 echo "  host client-tmp exists: $([ -d "$DATA/client-tmp" ] && echo YES || echo NO)" >&2
 echo "  guest client-tmp: /Volumes/SystemRoot$DATA/client-tmp" >&2
+echo "=== [DIAG: Immediately before darling shell] ===" >&2
+echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
+echo "  DATA=${DATA:-}" >&2
+echo "  TMPDIR=${TMPDIR:-}" >&2
 set +e
 darling shell bash -c "$COMMAND"
 status=$?

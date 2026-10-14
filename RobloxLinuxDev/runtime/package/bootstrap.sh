@@ -88,7 +88,33 @@ settings_get() { python3 "$HELPER" settings "$DATA" get "$1"; }
 settings_set() { python3 "$HELPER" settings "$DATA" set "$1" "$2"; }
 installed_version() { cat "$HERE/RobloxVersion/.version" 2>/dev/null || true; }
 
+_created_boot_alias=0
+ensure_alias() {
+    if [ -z "${ROBLOX_MAC_ALIAS_DIR:-}" ] || [ ! -d "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+        _short_base=/tmp
+        if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
+            _xlen=$(LC_ALL=C printf %s "$XDG_RUNTIME_DIR" | wc -c)
+            [ "$_xlen" -le 32 ] && _short_base=$XDG_RUNTIME_DIR
+        fi
+        _alias_dir=$(mktemp -d "$_short_base/rbx.XXXXXX")
+        chmod 700 "$_alias_dir"
+        mkdir -m 700 "$_alias_dir/stage"
+        mkdir -m 700 "$_alias_dir/data"
+        export ROBLOX_MAC_ALIAS_DIR=$_alias_dir
+        export ROBLOX_MAC_STAGE=$_alias_dir/stage
+        export ROBLOX_MAC_REAL_DATA=$DATA
+        _created_boot_alias=1
+    fi
+}
+cleanup_boot_alias() {
+    if [ "${_created_boot_alias:-0}" = 1 ] && [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+        rm -rf -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup_boot_alias EXIT INT TERM HUP
+
 launch() {
+    ensure_alias
     uri=${ROBLOX_MAC_LAUNCH_URI:-}
     dec=${ROBLOX_MAC_DECORATIONS:-}
     if [ -z "$dec" ]; then
@@ -105,9 +131,13 @@ launch() {
     export ROBLOX_MAC_CURSOR_APPEARANCE=$cur
 
     if [ -n "$uri" ]; then
-        exec env ROBLOX_MAC_LOCK_HELD=1 "$APP" --uri "$uri" "$@"
+        env ROBLOX_MAC_LOCK_HELD=1 "$APP" --uri "$uri" "$@"
+        _status=$?
+        exit $_status
     fi
-    exec env ROBLOX_MAC_LOCK_HELD=1 "$APP" "$@"
+    env ROBLOX_MAC_LOCK_HELD=1 "$APP" "$@"
+    _status=$?
+    exit $_status
 }
 
 ask_update() {
@@ -142,6 +172,7 @@ ask_update() {
 
 first_run() {
     [ -f "$MARKER" ] && [ -d "$DATA/prefix" ] && return 0
+    ensure_alias
     event first-run 5 'Setting up for the first time' 0 0 false
     say 'Setting up Roblox for the first time; this may take a minute.'
     # The warm-up does not own the instance lock. Close FD 9 before exec so a

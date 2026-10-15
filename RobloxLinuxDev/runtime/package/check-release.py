@@ -43,6 +43,31 @@ with tempfile.TemporaryDirectory(prefix='roblox release ') as tmp:
     rejected = subprocess.run([root / 'bin/roblox-mac', '--show-config'], capture_output=True,
         env={**env, 'ROBLOX_MAC_DATA': str(folder / 'outside')})
     assert rejected.returncode == 2 and not (folder / 'outside').exists()
+    # The updater stages beside the client; a release run accepts a data path
+    # outside DO_NOT_SHARE only inside the launcher-managed .update-work
+    # directory (update-roblox.sh points ROBLOX_MAC_DATA there for the download
+    # and for shader preparation) or as a live-launch alias's data directory.
+    fakecurl = folder / 'confine-bin'
+    fakecurl.mkdir()
+    (fakecurl / 'curl').write_text('#!/bin/sh\nexit 1\n')
+    (fakecurl / 'curl').chmod(0o755)
+    staging = release / '.update-work'
+    (staging / 'data').mkdir(parents=True)
+    for staged_data in (staging / 'data', staging / 'next' / 'runtime'):
+        staged = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+            env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+                 'ROBLOX_MAC_DATA': str(staged_data)})
+        assert b'Release data must stay inside DO_NOT_SHARE.' not in staged.stderr, staged.stderr
+    alias = os.path.realpath(staging)
+    aliased = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+        env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+             'ROBLOX_MAC_ALIAS_DIR': alias, 'ROBLOX_MAC_DATA': alias + '/data'})
+    assert b'Release data must stay inside DO_NOT_SHARE.' not in aliased.stderr, aliased.stderr
+    stranger = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+        env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+             'ROBLOX_MAC_DATA': str(release / 'stranger-data')})
+    assert stranger.returncode == 2 and b'Release data must stay inside DO_NOT_SHARE.' in stranger.stderr
+    shutil.rmtree(staging)
     assert config['APP'] == str(version / 'RobloxPlayer.app')
     assert config['FFLAGS'] == str(flags)
     assert config['SHADER_CACHE'] == str(version / 'spv-cache-v1')

@@ -79,7 +79,10 @@ while kill -0 "$curl_pid" 2>/dev/null; do
         progress cancelled 0 "Download cancelled" 0 "$total" false
         exit 125
     fi
-    done_bytes=$(wc -c < "$tmp/c.zip" 2>/dev/null || echo 0)
+    # 2>/dev/null must precede the input redirection: the poll can run before
+    # curl has created c.zip, and a failed < open would otherwise print a
+    # spurious "No such file or directory" for the not-yet-existing file.
+    done_bytes=$(wc -c 2>/dev/null < "$tmp/c.zip" || echo 0)
     case "$total" in
         0) percent=-1;;
         *) percent=$((25 + done_bytes * 45 / total)); [ "$percent" -gt 70 ] && percent=70;;
@@ -91,7 +94,7 @@ if ! wait "$curl_pid"; then
     progress failed 0 "Download failed" 0 "$total" false
     exit 1
 fi
-done_bytes=$(wc -c < "$tmp/c.zip" 2>/dev/null || echo 0)
+done_bytes=$(wc -c 2>/dev/null < "$tmp/c.zip" || echo 0)
 progress downloading 70 "Download complete" "$done_bytes" "$total"
 python3 - "$tmp/c.zip" <<'PY'
 import pathlib, stat, sys, zipfile

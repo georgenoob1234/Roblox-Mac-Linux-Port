@@ -106,10 +106,19 @@ if [ "${RELEASE:-0}" = 1 ]; then
     PRIVATE=$STATE/DO_NOT_SHARE
     # Ignore inherited home/cache paths; staging overrides must stay in this folder.
     DATA=$(realpath -m -- "$DATA")
+    # $STATE/.update-work is the launcher-managed staging beside the client:
+    # update-roblox.sh points ROBLOX_MAC_DATA inside it while a new client is
+    # downloaded and verified, so the exception is a canonical prefix match on
+    # that one directory. Nothing else may keep data outside DO_NOT_SHARE.
+    STAGING=$(realpath -m -- "$STATE/.update-work")
     if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ] && [ "$DATA" = "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
         :
     else
-        case "$DATA" in "$PRIVATE"|"$PRIVATE"/*) ;; *) echo 'Release data must stay inside DO_NOT_SHARE.' >&2; exit 2;; esac
+        case "$DATA" in
+            "$PRIVATE"|"$PRIVATE"/*) ;;
+            "$STAGING"|"$STAGING"/*) ;;
+            *) echo 'Release data must stay inside DO_NOT_SHARE.' >&2; exit 2;;
+        esac
     fi
     mkdir -p "$PRIVATE"
     chmod 700 "$PRIVATE"

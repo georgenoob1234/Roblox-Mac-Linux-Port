@@ -58,7 +58,12 @@ if [ ! -e "$HERE/RobloxVersion" ] && [ -e "$WORK/TXN" ]; then
     exit 1
 fi
 rm -rf -- "$WORK"
-mkdir -p "$WORK/next"
+# A release run confines ROBLOX_MAC_DATA to DO_NOT_SHARE, with one exception:
+# this launcher-managed staging directory, which the runtime accepts by
+# canonical path prefix. Download directly into staging (never through the
+# live-launch alias), then adopt the fixed "next" name the swap and the
+# launcher's recovery expect.
+mkdir -p "$WORK/data"
 cleanup() {
     # Never delete the backup until the new client is confirmed installed. If
     # the swap failed, restore the previous client first; keep the work dir for
@@ -78,9 +83,11 @@ trap 'exit 143' TERM HUP
 progress downloading 25 'Starting Roblox download' 0 0 true
 if cancelled; then progress cancelled 0 'Update cancelled' 0 0 false; exit 125; fi
 # AppImage owns the downloader and shader tools; stage the new client directly
-# in $WORK/next so it is verified before anything is renamed.
-ROBLOX_MAC_DATA="$WORK/next" ROBLOX_MAC_PROGRESS_FD="${ROBLOX_MAC_PROGRESS_FD:-}" \
+# beside the client so it is verified before anything is renamed.
+ROBLOX_MAC_DATA="$WORK/data" \
+    ROBLOX_MAC_PROGRESS_FD="${ROBLOX_MAC_PROGRESS_FD:-}" \
     ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --download-client
+mv "$WORK/data" "$WORK/next"
 if cancelled; then progress cancelled 0 'Update cancelled' 0 0 false; exit 125; fi
 progress verifying 74 'Verifying the downloaded client' 0 0 true
 if ! ROBLOX_MAC_DATA="$WORK/next/runtime" ROBLOX_MAC_APP="$WORK/next/RobloxPlayer.app" \

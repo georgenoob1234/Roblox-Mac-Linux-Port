@@ -53,8 +53,9 @@ recover_interrupted_update() {
     if client_valid; then
         rm -rf -- "$WORK"
     elif [ ! -e "$WORK/TXN" ]; then
-        [ -e "$HERE/RobloxVersion" ] ||
-            { echo 'roblox: the client is missing with no staged update to restore.' >&2; return 1; }
+        # No commit started, so staging is disposable whether or not a client
+        # is installed. A missing client is a normal first run: drop the stale
+        # staging and let the launcher reach its download/check path.
         rm -rf -- "$WORK"
     fi
     return 0

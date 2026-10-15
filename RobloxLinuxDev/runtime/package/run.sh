@@ -9,7 +9,8 @@ mkdir -p "$HERE/DO_NOT_SHARE/tmp"
 chmod 700 "$HERE/DO_NOT_SHARE"
 export APPIMAGELAUNCHER_DISABLE=1 _FORCE_HEADLESS=1
 export TARGET_APPIMAGE=$HERE/RobloxLinux.AppImage
-unset APPIMAGE_TARGET_DIR
+[ -n "${APPIMAGE_TARGET_DIR:-}" ] && [ -d "${APPIMAGE_TARGET_DIR:-}" ] || unset APPIMAGE_TARGET_DIR
+[ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ] && [ -d "${ROBLOX_MAC_ALIAS_DIR:-}" ] || unset ROBLOX_MAC_ALIAS_DIR
 export TMPDIR=$HERE/DO_NOT_SHARE/tmp TMP=$HERE/DO_NOT_SHARE/tmp TEMP=$HERE/DO_NOT_SHARE/tmp
 # Capture the session bus before the runtime redirects HOME/XDG_* inside its private prefix.
 export ROBLOX_MAC_NOTIFY_DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}
@@ -46,9 +47,58 @@ if [ "${1:-}" = --launcher ]; then
     open_launcher_ui --launcher
 fi
 export ROBLOX_MAC_UI_APP=$TARGET_APPIMAGE
+_is_internal_updater() {
+    for _arg in "$@"; do
+        case "$_arg" in
+            --client-version|--client-version-display|--download-client|--prepare-shaders)
+                return 0;;
+        esac
+    done
+    return 1
+}
+if ! _is_internal_updater "$@"; then
+    _short_base=/tmp
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
+        _xlen=$(LC_ALL=C printf %s "$XDG_RUNTIME_DIR" | wc -c)
+        [ "$_xlen" -le 32 ] && _short_base=$XDG_RUNTIME_DIR
+    fi
+    _created_app_target=0
+    if [ -z "${APPIMAGE_TARGET_DIR:-}" ] || [ ! -d "${APPIMAGE_TARGET_DIR:-}" ]; then
+        _app_target=$(mktemp -d "$_short_base/rbx-mnt.XXXXXX")
+        chmod 700 "$_app_target"
+        export APPIMAGE_TARGET_DIR=$_app_target
+        _created_app_target=1
+    fi
+    _created_run_alias=0
+    if [ -z "${ROBLOX_MAC_ALIAS_DIR:-}" ] || [ ! -d "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+        _alias_dir=$(mktemp -d "$_short_base/rbx.XXXXXX")
+        chmod 700 "$_alias_dir"
+        mkdir -m 700 "$_alias_dir/stage"
+        mkdir -m 700 "$_alias_dir/data"
+        export ROBLOX_MAC_ALIAS_DIR=$_alias_dir
+        export ROBLOX_MAC_STAGE=$_alias_dir/stage
+        export ROBLOX_MAC_REAL_DATA=$HERE/DO_NOT_SHARE
+        _created_run_alias=1
+    fi
+    cleanup_target_dir() {
+        if [ "${_created_run_alias:-0}" = 1 ] && [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+            rm -rf -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
+        fi
+        if [ "${_created_app_target:-0}" = 1 ] && [ -n "${APPIMAGE_TARGET_DIR:-}" ]; then
+            rm -rf -- "$APPIMAGE_TARGET_DIR" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_target_dir EXIT
+    trap 'cleanup_target_dir; exit 130' INT
+    trap 'cleanup_target_dir; exit 143' TERM HUP
+fi
 case "${1:-}" in
     --diagnose|--debug|--client-version|--client-version-display|--download-client|--prepare-shaders|--shell|--inside)
-        exec "$HERE/RobloxLinux.AppImage" "$@";;
+        "$HERE/RobloxLinux.AppImage" "$@"
+        _status=$?
+        exit $_status;;
 esac
 [ -t 2 ] || export ROBLOX_MAC_NO_TERMINAL=1
-exec "$HERE/bootstrap.sh" "$@"
+"$HERE/bootstrap.sh" "$@"
+_status=$?
+exit $_status

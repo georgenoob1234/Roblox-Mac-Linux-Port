@@ -61,16 +61,29 @@ assert 'exec 9>"$REAL_DATA/instance.lock"' in launcher_text, \
     "roblox-mac single-instance lock must target real data directory"
 
 # 4. Safe cleanup trap
-assert "trap cleanup_alias EXIT INT TERM HUP" in launcher_text, \
-    "roblox-mac must trap EXIT, INT, TERM, and HUP for alias cleanup"
+assert "trap cleanup_alias EXIT" in launcher_text, \
+    "roblox-mac must trap EXIT for alias cleanup"
+assert "trap 'cleanup_alias; exit 130' INT" in launcher_text, \
+    "roblox-mac must exit 130 on SIGINT after cleanup"
+assert "trap 'cleanup_alias; exit 143' TERM HUP" in launcher_text, \
+    "roblox-mac must exit 143 on SIGTERM/SIGHUP after cleanup"
 assert 'rm -rf -- "$ROBLOX_MAC_STAGE"' in launcher_text, \
     "cleanup_alias must remove per-launch stage"
 assert 'rmdir -- "$ROBLOX_MAC_ALIAS_DIR"' in launcher_text, \
     "cleanup_alias must remove alias dir"
 
-# 5. Bind-mount inside namespace with mock fallback
+# 5. Bind-mount inside namespace (no symlink fallback)
 assert 'mount --bind "$REAL_DATA" "$ROBLOX_MAC_ALIAS_DIR/data"' in launcher_text, \
     "roblox-mac must bind-mount real data directory inside user/mount namespace"
+assert 'mountpoint -q "$ROBLOX_MAC_ALIAS_DIR/data"' in launcher_text, \
+    "roblox-mac must verify the bind mount succeeded"
+assert "ln -sf" not in launcher_text.split("# Inside the mount namespace")[1].split("# Host flock")[0] \
+    if "# Inside the mount namespace" in launcher_text else True, \
+    "roblox-mac must not fall back to symlinks for the data alias"
+
+# 6. Idempotent stage link creation
+assert "_ensure_link" in launcher_text, \
+    "roblox-mac must use idempotent link creation for stage symlinks"
 
 print("PASS: Static and script contract assertions passed.")
 
@@ -406,13 +419,81 @@ finally:
 # ==============================================================================
 # SECTION 7: Cleanup Verification
 # ==============================================================================
-print("\n[Section 7] Verifying no leftover rbx.* alias directories...")
-for base in ("/tmp", os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")):
-    if os.path.isdir(base):
-        leftovers = list(Path(base).glob("rbx.*"))
-        assert len(leftovers) == 0, f"Found leftover alias directories in {base}: {leftovers}"
+print("\n[Section 7] Verifying no leftover alias directories from this test run...")
+# Only check for alias directories that this test session created, not all rbx.*
+# directories system-wide (another Roblox session may legitimately own some).
+_tracked_alias_dirs = []
+for _base in ("/tmp", os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")):
+    if _base and os.path.isdir(_base):
+        for _entry in Path(_base).glob("rbx.*"):
+            _stat = _entry.stat()
+            # Only flag directories owned by the current user created during this test
+            if _stat.st_uid == os.getuid():
+                _age = time.time() - _stat.st_mtime
+                if _age < 600:  # created within last 10 minutes
+                    _tracked_alias_dirs.append(_entry)
 
-print("PASS: All alias directories cleanly removed.")
+# The test suite itself should not leave any aliases behind.
+# Filter out any that belong to concurrent legitimate Roblox sessions by checking
+# if they were created before this test started (approximated by process start time).
+_test_start = time.time() - 3600  # generous 1-hour window
+_leftovers = [d for d in _tracked_alias_dirs if d.stat().st_mtime > _test_start]
+assert len(_leftovers) == 0, \
+    f"Test suite left alias directories: {_leftovers}"
+
+print("PASS: All test-owned alias directories cleanly removed.")
+
+# ==============================================================================
+# SECTION 8: Warm-up → Launch Sequence (Regression test for symlink crash)
+# ==============================================================================
+print("\n[Section 8] Warm-up → Launch Sequence (shared alias idempotency)...")
+
+with tempfile.TemporaryDirectory(prefix="roblox-seq ") as tmp:
+    seq_data = Path(tmp) / "DO_NOT_SHARE"
+    seq_data.mkdir(mode=0o700)
+
+    # Create a shared alias directory (simulating what run.sh/bootstrap.sh do)
+    seq_alias = Path(tmp) / "alias"
+    seq_alias.mkdir(mode=0o700)
+    (seq_alias / "stage").mkdir(mode=0o700)
+    (seq_alias / "data").mkdir(mode=0o700)
+
+    env = {
+        **os.environ,
+        "ROBLOX_MAC_DATA": str(seq_data),
+        "ROBLOX_MAC_ROOT": str(ROOT),
+        "ROBLOX_MAC_CONFIG": "/dev/null",
+        "ROBLOX_MAC_ALIAS_DIR": str(seq_alias),
+        "ROBLOX_MAC_STAGE": str(seq_alias / "stage"),
+        "ROBLOX_MAC_REAL_DATA": str(seq_data),
+    }
+
+    # First invocation: creates stage symlinks inside the namespace
+    print("  8a: First invocation (warm-up simulation)...")
+    res1 = subprocess.run(
+        [str(LAUNCHER), "--shell", "echo WARMUP_OK"],
+        env=env, capture_output=True, text=True, timeout=120
+    )
+    assert res1.returncode == 0, f"First invocation failed: {res1.stderr}"
+    assert "WARMUP_OK" in res1.stdout, f"First invocation output missing: {res1.stdout}"
+    print("  PASS 8a: First invocation succeeded.")
+
+    # Second invocation with the SAME alias: must not crash on existing symlinks
+    print("  8b: Second invocation (launch simulation, same alias)...")
+    res2 = subprocess.run(
+        [str(LAUNCHER), "--shell", "echo LAUNCH_OK"],
+        env=env, capture_output=True, text=True, timeout=120
+    )
+    assert res2.returncode == 0, \
+        f"Second invocation crashed (symlink collision?): {res2.stderr}"
+    assert "LAUNCH_OK" in res2.stdout, \
+        f"Second invocation output missing: {res2.stdout}"
+    # Verify no "File exists" error leaked through
+    assert "File exists" not in res2.stderr, \
+        f"Symlink 'File exists' error found in stderr: {res2.stderr}"
+    print("  PASS 8b: Second invocation succeeded without symlink collision.")
+
+print("PASS: Warm-up → launch sequence verified; no symlink crash.")
 
 print("\n" + "=" * 70)
 print("ALL REGRESSION TESTS PASSED SUCCESSFULLY!")

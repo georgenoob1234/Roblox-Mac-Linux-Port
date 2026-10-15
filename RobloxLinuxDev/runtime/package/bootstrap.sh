@@ -111,7 +111,9 @@ cleanup_boot_alias() {
         rm -rf -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
     fi
 }
-trap cleanup_boot_alias EXIT INT TERM HUP
+trap cleanup_boot_alias EXIT
+trap 'cleanup_boot_alias; exit 130' INT
+trap 'cleanup_boot_alias; exit 143' TERM HUP
 
 launch() {
     ensure_alias
@@ -172,13 +174,16 @@ ask_update() {
 
 first_run() {
     [ -f "$MARKER" ] && [ -d "$DATA/prefix" ] && return 0
-    ensure_alias
     event first-run 5 'Setting up for the first time' 0 0 false
     say 'Setting up Roblox for the first time; this may take a minute.'
+    # The warm-up runs in a subshell so it allocates its own throwaway alias
+    # directory. This prevents the warm-up's stage symlinks from contaminating
+    # the alias that the actual game launch will receive from run.sh.
     # The warm-up does not own the instance lock. Close FD 9 before exec so a
     # Darling/AppImage child cannot strand the lock if timeout has to kill it.
-    if ! timeout --foreground --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
-        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true; then
+    if ! (unset ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA
+          timeout --foreground --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
+        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true); then
         say 'First-run setup failed or timed out; the client was not launched.'
         notify 'Roblox first-run setup failed; the client was not launched.' 'Roblox setup failed'
         return 1

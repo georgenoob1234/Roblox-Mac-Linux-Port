@@ -88,7 +88,9 @@ if ! _is_internal_updater "$@"; then
             rm -rf -- "$APPIMAGE_TARGET_DIR" 2>/dev/null || true
         fi
     }
-    trap cleanup_target_dir EXIT INT TERM HUP
+    trap cleanup_target_dir EXIT
+    trap 'cleanup_target_dir; exit 130' INT
+    trap 'cleanup_target_dir; exit 143' TERM HUP
 fi
 case "${1:-}" in
     --diagnose|--debug|--client-version|--client-version-display|--download-client|--prepare-shaders|--shell|--inside)

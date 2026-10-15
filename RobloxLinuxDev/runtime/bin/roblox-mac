@@ -216,7 +216,7 @@ if [ "${1:-}" != "--inside" ]; then
     }
     REAL_DATA=${ROBLOX_MAC_REAL_DATA:-$DATA}
     if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ] && [ "$REAL_DATA" = "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
-        REAL_DATA=${STATE:-$HERE}/DO_NOT_SHARE
+        REAL_DATA=${STATE:-$ROOT}/DO_NOT_SHARE
     fi
     mkdir -p "$REAL_DATA"
 
@@ -291,7 +291,9 @@ if [ "${1:-}" != "--inside" ]; then
             rmdir -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
         fi
     }
-    trap cleanup_alias EXIT INT TERM HUP
+    trap cleanup_alias EXIT
+    trap 'cleanup_alias; exit 130' INT
+    trap 'cleanup_alias; exit 143' TERM HUP
 
     # --kill-child below also tears down the guest namespace if its supervisor dies.
     run_inner() {
@@ -307,19 +309,20 @@ if [ "${1:-}" != "--inside" ]; then
         fi
         "$ROOT/scripts/launch-settings.sh" "$FLAGS" "$APP" python3 "$ROOT/scripts/runtime-limits.py" "$@" &
         INNER_PID=$!
-        wait "$INNER_PID" 2>/dev/null
-        _rc=$?
+        wait "$INNER_PID" 2>/dev/null || _rc=$?
         unset INNER_PID
-        return $_rc
+        return ${_rc:-0}
     }
     # --pid --fork --mount-proc: launchd expects to own the process tree, and without a PID
     # namespace its daemons (opendirectoryd, shellspawn) never come up.
-    echo "=== [DIAG: Before unshare] ===" >&2
-    echo "  REAL_DATA=${REAL_DATA:-}" >&2
-    echo "  DATA=${DATA:-}" >&2
-    echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
-    echo "  TMPDIR=${TMPDIR:-}" >&2
-    echo "  PREFIX=${PREFIX:-}" >&2
+    if [ "${ROBLOX_MAC_DEBUG:-}" = 1 ]; then
+        echo "=== [DIAG: Before unshare] ===" >&2
+        echo "  REAL_DATA=${REAL_DATA:-}" >&2
+        echo "  DATA=${DATA:-}" >&2
+        echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
+        echo "  TMPDIR=${TMPDIR:-}" >&2
+        echo "  PREFIX=${PREFIX:-}" >&2
+    fi
     if [ "${ROBLOX_MAC_WAYLAND:-}" = 1 ]; then
         export GDK_BACKEND=wayland EGL_PLATFORM=wayland
         export ROBLOX_MAC_WAYLAND_HELPER=$ROOT/browser/libroblox-wayland.so
@@ -356,9 +359,21 @@ shift
 # a small directory on top of the real /usr. Read-only, invisible outside this namespace.
 STAGE=${ROBLOX_MAC_STAGE:?missing launcher stage directory}
 mkdir -p "$STAGE/bin" "$STAGE/libexec"
-ln -s "$ROOT/darling-root" "$STAGE/libexec/darling"
-ln -s "$ROOT/darlingserver" "$STAGE/bin/darlingserver"
-ln -s "$ROOT/darling-cli"   "$STAGE/bin/darling"
+_ensure_link() {
+    _target=$1; _link=$2
+    if [ -L "$_link" ]; then
+        _existing=$(readlink -- "$_link")
+        if [ "$_existing" = "$_target" ]; then return 0; fi
+        echo "roblox-mac: stage link $_link points to $_existing, expected $_target" >&2
+        exit 1
+    fi
+    ln -s "$_target" "$_link"
+}
+_ensure_link "$ROOT/darling-root"  "$STAGE/libexec/darling"
+_ensure_link "$ROOT/darlingserver" "$STAGE/bin/darlingserver"
+_ensure_link "$ROOT/darling-cli"   "$STAGE/bin/darling"
+unset -f _ensure_link
+unset _target _link _existing
 mount -t overlay overlay -o "lowerdir=$STAGE:/usr" /usr
 
 # Inside the mount namespace, bind-mount the real data directory to the short alias
@@ -368,14 +383,16 @@ REAL_DATA=${ROBLOX_MAC_REAL_DATA:-$DATA}
 if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
     mkdir -p -m 700 "$REAL_DATA/client-tmp" "$REAL_DATA/crashes"
     if [ -d "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
-        mount --bind "$REAL_DATA" "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
+        if ! mount --bind "$REAL_DATA" "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null; then
+            echo "roblox-mac: failed to bind-mount data directory to alias." >&2
+            echo "  source: $REAL_DATA" >&2
+            echo "  target: $ROBLOX_MAC_ALIAS_DIR/data" >&2
+            exit 1
+        fi
     fi
-    # If bind mount succeeded, the directory is an active mountpoint.
-    # In unprivileged mock test environments where mount is stubbed with a fake script,
-    # fallback to a symbolic link so mock unit tests can proceed.
-    if ! mountpoint -q "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null && [ ! -L "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
-        rmdir "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null || true
-        ln -sf "$REAL_DATA" "$ROBLOX_MAC_ALIAS_DIR/data"
+    if ! mountpoint -q "$ROBLOX_MAC_ALIAS_DIR/data" 2>/dev/null; then
+        echo "roblox-mac: alias data directory is not a mountpoint after bind mount." >&2
+        exit 1
     fi
     DATA=$ROBLOX_MAC_ALIAS_DIR/data
     PREFIX=$DATA/prefix
@@ -398,12 +415,14 @@ export ROBLOX_MAC_VIDEO_HELPER=$ROOT/optimized/libtracka-video-host.so
 mkdir -p "$DATA/crashes"
 export ROBLOX_MAC_CRASH_LOG=$DATA/crashes/fatal.log
 
-echo "=== [DIAG: Inside namespace before launching Darling] ===" >&2
-echo "  REAL_DATA=${REAL_DATA:-}" >&2
-echo "  DATA=${DATA:-}" >&2
-echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
-echo "  TMPDIR=${TMPDIR:-}" >&2
-echo "  PREFIX=${PREFIX:-}" >&2
+if [ "${ROBLOX_MAC_DEBUG:-}" = 1 ]; then
+    echo "=== [DIAG: Inside namespace before launching Darling] ===" >&2
+    echo "  REAL_DATA=${REAL_DATA:-}" >&2
+    echo "  DATA=${DATA:-}" >&2
+    echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
+    echo "  TMPDIR=${TMPDIR:-}" >&2
+    echo "  PREFIX=${PREFIX:-}" >&2
+fi
 
 # Creating private/etc first makes Darling mistake an empty prefix for an initialized one.
 [ -d "$PREFIX" ] || darling shell true
@@ -476,7 +495,6 @@ fi
 mkdir -p -m 700 "$DATA/client-tmp"
 COMMAND=$(python3 - "$INSERT" "$G$(CDPATH= cd -- "$APP" && pwd)/Contents/MacOS/RobloxPlayer" "$@" <<'PYTHON'
 import os,shlex,sys
-print(os.environ['ROBLOX_MAC_DATA'], file=sys.stderr)
 # Use pthread's native futex-backed mode. Darling's psynch RPC path can lose
 # the receiver/update condition-variable wakeup; our shim supplies ulock_wait2.
 client_data='/Volumes/SystemRoot'+os.path.abspath(os.environ['ROBLOX_MAC_DATA'])
@@ -501,17 +519,19 @@ if launch_uri:
 sys.stdout.buffer.write(os.fsencode(shlex.join(args+client)) + b'\n')
 PYTHON
 )
-echo "=== [DIAG: Before exec'ing RobloxPlayer] ===" >&2
-echo "  HOME=${HOME:-}" >&2
-echo "  TMPDIR=${TMPDIR:-}" >&2
-echo "  client-tmp path=$DATA/client-tmp" >&2
-echo "  resolved /Volumes/SystemRoot mapping: G=$G, DATA=$DATA" >&2
-echo "  host client-tmp exists: $([ -d "$DATA/client-tmp" ] && echo YES || echo NO)" >&2
-echo "  guest client-tmp: /Volumes/SystemRoot$DATA/client-tmp" >&2
-echo "=== [DIAG: Immediately before darling shell] ===" >&2
-echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
-echo "  DATA=${DATA:-}" >&2
-echo "  TMPDIR=${TMPDIR:-}" >&2
+if [ "${ROBLOX_MAC_DEBUG:-}" = 1 ]; then
+    echo "=== [DIAG: Before exec'ing RobloxPlayer] ===" >&2
+    echo "  HOME=${HOME:-}" >&2
+    echo "  TMPDIR=${TMPDIR:-}" >&2
+    echo "  client-tmp path=$DATA/client-tmp" >&2
+    echo "  resolved /Volumes/SystemRoot mapping: G=$G, DATA=$DATA" >&2
+    echo "  host client-tmp exists: $([ -d "$DATA/client-tmp" ] && echo YES || echo NO)" >&2
+    echo "  guest client-tmp: /Volumes/SystemRoot$DATA/client-tmp" >&2
+    echo "=== [DIAG: Immediately before darling shell] ===" >&2
+    echo "  ROBLOX_MAC_DATA=${ROBLOX_MAC_DATA:-}" >&2
+    echo "  DATA=${DATA:-}" >&2
+    echo "  TMPDIR=${TMPDIR:-}" >&2
+fi
 set +e
 darling shell bash -c "$COMMAND"
 status=$?

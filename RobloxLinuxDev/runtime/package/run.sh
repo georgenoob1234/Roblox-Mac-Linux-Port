@@ -20,6 +20,45 @@ export ROBLOX_MAC_HOST_HOME=${ROBLOX_MAC_HOST_HOME:-${HOME:-}}
 export ROBLOX_MAC_HOST_CONFIG=${ROBLOX_MAC_HOST_CONFIG:-${XDG_CONFIG_HOME:-${HOME:-}/.config}}
 export ROBLOX_MAC_HOST_DATA_DIRS=${ROBLOX_MAC_HOST_DATA_DIRS:-${XDG_DATA_DIRS:-/usr/local/share:/usr/share}}
 [ -f "$HERE/icon.png" ] && export ROBLOX_MAC_ICON_PATH=${ROBLOX_MAC_ICON_PATH:-$HERE/icon.png}
+# Repair a client swap interrupted by a crash or power loss. This mirrors
+# bootstrap.sh; run.sh needs it because --debug/--diagnose can launch the
+# AppImage directly without going through the bootstrapper.
+WORK=$HERE/.update-work
+next_valid() {
+    [ -x "$WORK/next/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$WORK/next/.version" ] &&
+    [ -f "$WORK/next/spv-cache-v1/report.json" ]
+}
+client_valid() {
+    [ -x "$HERE/RobloxVersion/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$HERE/RobloxVersion/.version" ] &&
+    [ -f "$HERE/RobloxVersion/spv-cache-v1/report.json" ]
+}
+recover_interrupted_update() {
+    [ -d "$WORK" ] || return 0
+    if [ -e "$WORK/TXN" ] && [ ! -e "$HERE/RobloxVersion" ]; then
+        if next_valid; then
+            mv "$WORK/next" "$HERE/RobloxVersion" ||
+                { echo 'roblox: could not install the staged update.' >&2; return 1; }
+            echo 'roblox: recovered an interrupted update (completed the downloaded client).' >&2
+        elif [ -d "$WORK/previous" ]; then
+            mv "$WORK/previous" "$HERE/RobloxVersion" ||
+                { echo 'roblox: could not restore the previous client.' >&2; return 1; }
+            echo 'roblox: recovered an interrupted update (restored the previous client).' >&2
+        else
+            echo 'roblox: an interrupted update left no usable client; reinstall from a fresh release.' >&2
+            return 1
+        fi
+    fi
+    if client_valid; then
+        rm -rf -- "$WORK"
+    elif [ ! -e "$WORK/TXN" ]; then
+        [ -e "$HERE/RobloxVersion" ] ||
+            { echo 'roblox: the client is missing with no staged update to restore.' >&2; return 1; }
+        rm -rf -- "$WORK"
+    fi
+    return 0
+}
 URI=
 case "${1:-}" in
     --uri) [ "$#" -eq 2 ] || { echo 'Usage: run.sh --uri URI' >&2; exit 2; }; URI=$2; shift 2;;
@@ -57,6 +96,13 @@ _is_internal_updater() {
     return 1
 }
 if ! _is_internal_updater "$@"; then
+    if [ -d "$WORK" ]; then
+        # Serialize with a concurrent updater via the instance lock; its exit
+        # is best-effort here because bootstrap.sh repairs and reports again.
+        ( exec 9>"$HERE/DO_NOT_SHARE/instance.lock" &&
+          flock -n -E 73 9 &&
+          recover_interrupted_update ) || true
+    fi
     _short_base=/tmp
     if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
         _xlen=$(LC_ALL=C printf %s "$XDG_RUNTIME_DIR" | wc -c)

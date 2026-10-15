@@ -14,6 +14,7 @@ network, Darling runtime or real client is needed:
   6. a normal update still works after a recovery
   7. DO_NOT_SHARE stays byte-for-byte untouched in every case
 """
+import fcntl
 import os
 import shutil
 import subprocess
@@ -145,6 +146,22 @@ def assert_intact(private, before, label):
     assert not list(private.glob(".update.*")), f"{label}: staging leaked into DO_NOT_SHARE"
 
 
+def lock_free(private):
+    """True when nothing still holds the instance lock (a stranded FD would fail)."""
+    lock = private / "instance.lock"
+    if not lock.exists():
+        return True
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 with tempfile.TemporaryDirectory(prefix="roblox recovery ") as tmpdir:
     tmp = Path(tmpdir)
 
@@ -238,6 +255,7 @@ with tempfile.TemporaryDirectory(prefix="roblox recovery ") as tmpdir:
     assert recovered.returncode != 0, "S4b: recovery should fail loudly"
     assert not (release / "RobloxVersion").exists(), "S4b: a broken client was installed"
     assert (work / "TXN").exists(), "S4b: recovery data was discarded on failure"
+    assert lock_free(private), "S4b: a failed recovery stranded the instance lock"
     assert_intact(private, before, "S4b")
     print("  PASS 4b: with nothing to restore, recovery fails loudly and keeps its data.")
 
@@ -292,6 +310,21 @@ with tempfile.TemporaryDirectory(prefix="roblox recovery ") as tmpdir:
     assert (work / "previous").is_dir(), "S6b: the backup was deleted"
     assert_intact(private, before, "S6b")
     print("  PASS 6b: a manual update refuses an ambiguous state without deleting the backup.")
+
+    # 7. A missing client with only stale, uncommitted staging is a normal first run. --------
+    release, private = make_release(tmp / "s7")
+    before = snapshot(private)
+    (release / ".update-work/next").mkdir(parents=True)
+    (release / ".update-work/next/partial").write_text("half a download\n")  # no marker
+    shutil.rmtree(release / "RobloxVersion")
+    first = launch(release)
+    assert first.returncode == 0, (first.returncode, first.stderr)
+    assert "no staged update to restore" not in first.stderr
+    assert (release / "launched").exists(), "S7: launcher did not reach its download/check path"
+    assert not (release / ".update-work").exists(), "S7: stale staging not removed"
+    assert lock_free(private), "S7: the launch stranded the instance lock"
+    assert_intact(private, before, "S7")
+    print("  PASS 7: a missing client with stale staging continues to the download/check path.")
 
 print("PASS update crash-safety: fixed staging, durable marker, startup recovery, "
       "rollback, staged-client reuse, DO_NOT_SHARE preservation")

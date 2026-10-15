@@ -123,9 +123,9 @@ recover_interrupted_update() {
     if client_valid; then
         rm -rf -- "$WORK"
     elif [ ! -e "$WORK/TXN" ]; then
-        # No commit started: staging is disposable and RobloxVersion is intact.
-        [ -e "$HERE/RobloxVersion" ] ||
-            { echo 'roblox: the client is missing with no staged update to restore.' >&2; return 1; }
+        # No commit started, so staging is disposable whether or not a client
+        # is installed. A missing client is a normal first run: drop the stale
+        # staging and let the bootstrapper reach its download/check path.
         rm -rf -- "$WORK"
     fi
     return 0
@@ -310,7 +310,7 @@ case "$command" in
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
-        recover_interrupted_update || exit 1
+        recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
@@ -325,7 +325,7 @@ case "$command" in
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
-        recover_interrupted_update || exit 1
+        recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
@@ -346,7 +346,7 @@ if ! flock -n -E 73 9; then
     notify 'Roblox is already running.' 'Roblox is already running'
     exit 0
 fi
-recover_interrupted_update || { finish_progress; exit 1; }
+recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
 start_progress
 first_run || { finish_progress; exit 1; }
 installed=$(installed_version)

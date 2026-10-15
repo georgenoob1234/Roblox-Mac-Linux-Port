@@ -88,6 +88,49 @@ settings_get() { python3 "$HELPER" settings "$DATA" get "$1"; }
 settings_set() { python3 "$HELPER" settings "$DATA" set "$1" "$2"; }
 installed_version() { cat "$HERE/RobloxVersion/.version" 2>/dev/null || true; }
 
+# Repair a client swap interrupted by a crash or power loss. update-roblox.sh
+# stages into $WORK and writes the durable $WORK/TXN marker right before it
+# renames RobloxVersion aside; that marker with a missing RobloxVersion is the
+# commit point this finishes or rolls back. It only touches $WORK and the client
+# directory, never DO_NOT_SHARE, and is safe to call before every launch.
+WORK=$HERE/.update-work
+next_valid() {
+    [ -x "$WORK/next/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$WORK/next/.version" ] &&
+    [ -f "$WORK/next/spv-cache-v1/report.json" ]
+}
+client_valid() {
+    [ -x "$HERE/RobloxVersion/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$HERE/RobloxVersion/.version" ] &&
+    [ -f "$HERE/RobloxVersion/spv-cache-v1/report.json" ]
+}
+recover_interrupted_update() {
+    [ -d "$WORK" ] || return 0
+    if [ -e "$WORK/TXN" ] && [ ! -e "$HERE/RobloxVersion" ]; then
+        if next_valid; then
+            mv "$WORK/next" "$HERE/RobloxVersion" ||
+                { echo 'roblox: could not install the staged update.' >&2; return 1; }
+            say 'recovered an interrupted update (completed the downloaded client).'
+        elif [ -d "$WORK/previous" ]; then
+            mv "$WORK/previous" "$HERE/RobloxVersion" ||
+                { echo 'roblox: could not restore the previous client.' >&2; return 1; }
+            say 'recovered an interrupted update (restored the previous client).'
+        else
+            echo 'roblox: an interrupted update left no usable client; reinstall from a fresh release.' >&2
+            return 1
+        fi
+    fi
+    if client_valid; then
+        rm -rf -- "$WORK"
+    elif [ ! -e "$WORK/TXN" ]; then
+        # No commit started: staging is disposable and RobloxVersion is intact.
+        [ -e "$HERE/RobloxVersion" ] ||
+            { echo 'roblox: the client is missing with no staged update to restore.' >&2; return 1; }
+        rm -rf -- "$WORK"
+    fi
+    return 0
+}
+
 _created_boot_alias=0
 ensure_alias() {
     if [ -z "${ROBLOX_MAC_ALIAS_DIR:-}" ] || [ ! -d "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
@@ -267,6 +310,7 @@ case "$command" in
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
+        recover_interrupted_update || exit 1
         start_progress
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
@@ -281,6 +325,7 @@ case "$command" in
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
+        recover_interrupted_update || exit 1
         start_progress
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
@@ -301,6 +346,7 @@ if ! flock -n -E 73 9; then
     notify 'Roblox is already running.' 'Roblox is already running'
     exit 0
 fi
+recover_interrupted_update || { finish_progress; exit 1; }
 start_progress
 first_run || { finish_progress; exit 1; }
 installed=$(installed_version)

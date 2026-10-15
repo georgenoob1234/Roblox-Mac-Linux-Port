@@ -221,6 +221,9 @@ The following checks do not launch the Roblox client. Requirements differ: some 
 # Release path validation, flag checks, updater rollback, download safety
 python3 runtime/package/check-release.py
 
+# Crash-safe client updates: interrupted-swap recovery, staged-client reuse
+python3 runtime/package/check-update-recovery.py
+
 # AppImage extraction and path handling (no FUSE required)
 python3 runtime/package/check-appimage.py /path/to/roblox-mac-x86_64.AppImage
 

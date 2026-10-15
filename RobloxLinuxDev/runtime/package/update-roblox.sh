@@ -37,7 +37,11 @@ if ! flock -n -E 74 8; then
     echo 'An update is already running.' >&2
     exit 1
 fi
-version=$(sh "$HERE/run.sh" --client-version)
+# AppImage-spawning children must not inherit the lock file descriptors: the
+# AppImage runtime's FUSE daemon outlives its command (it keeps the mount for
+# reuse) and would strand the instance lock and the update lock until it
+# exits. bootstrap.sh defends its updater children the same way.
+version=$(sh "$HERE/run.sh" --client-version 8>&- 9>&-)
 # Extract-and-run may print filesystem progress before the application's output.
 version=$(printf '%s\n' "$version" | sed -n '/^version-[0-9a-f][0-9a-f]*$/p')
 [ -n "$version" ] || { echo 'Could not read the current Roblox version.' >&2; exit 1; }
@@ -86,12 +90,12 @@ if cancelled; then progress cancelled 0 'Update cancelled' 0 0 false; exit 125; 
 # beside the client so it is verified before anything is renamed.
 ROBLOX_MAC_DATA="$WORK/data" \
     ROBLOX_MAC_PROGRESS_FD="${ROBLOX_MAC_PROGRESS_FD:-}" \
-    ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --download-client
+    ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --download-client 8>&- 9>&-
 mv "$WORK/data" "$WORK/next"
 if cancelled; then progress cancelled 0 'Update cancelled' 0 0 false; exit 125; fi
 progress verifying 74 'Verifying the downloaded client' 0 0 true
 if ! ROBLOX_MAC_DATA="$WORK/next/runtime" ROBLOX_MAC_APP="$WORK/next/RobloxPlayer.app" \
-    ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --debug --prepare-shaders ||
+    ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --debug --prepare-shaders 8>&- 9>&- ||
    [ ! -f "$WORK/next/spv-cache-v1/report.json" ]; then
     echo 'Shader preparation failed; the previous client has not been changed.' >&2
     exit 1

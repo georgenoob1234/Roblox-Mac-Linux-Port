@@ -228,6 +228,15 @@ if [ "${1:-}" != "--inside" ]; then
         REAL_DATA=${STATE:-$ROOT}/DO_NOT_SHARE
     fi
     mkdir -p "$REAL_DATA"
+    # A stale AppImage/FUSE mount below the data directory makes the
+    # in-namespace bind-mount of $REAL_DATA fail with EINVAL (a killed run
+    # can leave one under $REAL_DATA/tmp). Detach leftovers before launching;
+    # findmnt, not find: stale FUSE entries fail lstat and get skipped.
+    findmnt -rn -o TARGET 2>/dev/null | grep -F "$REAL_DATA/" | while IFS= read -r _stale_mount; do
+        fusermount3 -uz "$_stale_mount" 2>/dev/null ||
+            fusermount -uz "$_stale_mount" 2>/dev/null ||
+            umount -l "$_stale_mount" 2>/dev/null || true
+    done
 
     # Introduce a secure, per-launch, short filesystem alias for the real data directory.
     # Linux sockaddr_un.sun_path is 108 bytes and the last one must stay NUL, so no socket

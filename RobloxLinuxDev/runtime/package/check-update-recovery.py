@@ -61,6 +61,19 @@ SESSION = {
 }
 APPIMAGE = """#!/bin/sh
 set -eu
+# Stand-in for the real AppImage runtime's FUSE daemon: a background child
+# that outlives its command and keeps every inherited descriptor open, as
+# squashfuse does when uruntime keeps a mount for reuse. The updater and the
+# bootstrapper must close their lock descriptors for AppImage-spawning
+# children (8>&- 9>&-), or this sleeper strands the instance lock and the
+# update lock. Output is redirected so it never keeps the harness's capture
+# pipes open.
+sleep 30 >/dev/null 2>&1 </dev/null &
+# run.sh must hand every AppImage invocation a mount directory outside the
+# release folder, and so outside DO_NOT_SHARE: a FUSE mount below the data
+# directory makes the launch-time bind-mount fail with EINVAL.
+[ -n "${APPIMAGE_TARGET_DIR:-}" ] && [ -d "$APPIMAGE_TARGET_DIR" ] || exit 9
+case "$APPIMAGE_TARGET_DIR" in "$(dirname -- "$0")"/*) exit 9;; esac
 version=${TEST_CLIENT_VERSION:-version-abcd}
 [ "${1:-}" != --debug ] || shift
 case "${1:-}" in
@@ -179,6 +192,7 @@ with tempfile.TemporaryDirectory(prefix="roblox recovery ") as tmpdir:
     assert (release / "RobloxVersion/.version").read_text().strip() == NEW
     assert (release / "RobloxVersion/RobloxPlayer.app/Contents/MacOS/RobloxPlayer").stat().st_mode & 0o111
     assert not (release / ".update-work").exists(), "work dir not cleaned"
+    assert lock_free(private), "S1: the update stranded the instance lock"
     assert_intact(private, before, "S1")
     assert "already up to date" in update(release).stdout
     print("  PASS 1: normal update installs the client and cleans staging.")
@@ -299,6 +313,7 @@ with tempfile.TemporaryDirectory(prefix="roblox recovery ") as tmpdir:
     assert again.returncode == 0, again.stderr
     assert (release / "RobloxVersion/.version").read_text().strip() == NEW2
     assert not (release / ".update-work").exists()
+    assert lock_free(private), "S6: an update stranded the instance lock"
     assert_intact(private, before, "S6")
     print("  PASS 6: a normal update still works after a recovery.")
 

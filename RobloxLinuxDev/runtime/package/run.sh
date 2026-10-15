@@ -3,7 +3,9 @@
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # AppImageLauncher can relocate the image or run a memfd whose parent is /.
-# Keep the original image and let uruntime name its cache inside our private tmp.
+# Keep the original image, and keep the AppImage runtime's mounts outside
+# DO_NOT_SHARE: a FUSE mount below it makes the launch-time in-namespace
+# bind-mount of the data directory fail with EINVAL.
 umask 077
 mkdir -p "$HERE/DO_NOT_SHARE/tmp"
 chmod 700 "$HERE/DO_NOT_SHARE"
@@ -12,6 +14,43 @@ export TARGET_APPIMAGE=$HERE/RobloxLinux.AppImage
 [ -n "${APPIMAGE_TARGET_DIR:-}" ] && [ -d "${APPIMAGE_TARGET_DIR:-}" ] || unset APPIMAGE_TARGET_DIR
 [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ] && [ -d "${ROBLOX_MAC_ALIAS_DIR:-}" ] || unset ROBLOX_MAC_ALIAS_DIR
 export TMPDIR=$HERE/DO_NOT_SHARE/tmp TMP=$HERE/DO_NOT_SHARE/tmp TEMP=$HERE/DO_NOT_SHARE/tmp
+# The AppImage runtime mounts or extracts itself at APPIMAGE_TARGET_DIR when
+# one is set, and otherwise below TMPDIR (DO_NOT_SHARE/tmp here). Every
+# invocation — the updater's internal ones included — therefore gets a
+# short-lived mount directory outside DO_NOT_SHARE, beside the per-launch
+# mount directories the full launcher flow already uses.
+_short_base=/tmp
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
+    _xlen=$(LC_ALL=C printf %s "$XDG_RUNTIME_DIR" | wc -c)
+    [ "$_xlen" -le 32 ] && _short_base=$XDG_RUNTIME_DIR
+fi
+_created_app_target=0
+if [ -z "${APPIMAGE_TARGET_DIR:-}" ] || [ ! -d "${APPIMAGE_TARGET_DIR:-}" ]; then
+    _app_target=$(mktemp -d "$_short_base/rbx-mnt.XXXXXX")
+    chmod 700 "$_app_target"
+    export APPIMAGE_TARGET_DIR=$_app_target
+    _created_app_target=1
+fi
+cleanup_target_dir() {
+    if [ "${_created_run_alias:-0}" = 1 ] && [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
+        rm -rf -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
+    fi
+    if [ "${_created_app_target:-0}" = 1 ] && [ -n "${APPIMAGE_TARGET_DIR:-}" ]; then
+        # The AppImage runtime's FUSE daemon can outlive the command, keeping
+        # its mount (and this directory) in place; detach it before removal.
+        # findmnt, not find: stale FUSE entries fail lstat and get skipped.
+        findmnt -rn -o TARGET 2>/dev/null | grep -F "$APPIMAGE_TARGET_DIR" |
+        while IFS= read -r _mnt; do
+            fusermount3 -uz "$_mnt" 2>/dev/null ||
+                fusermount -uz "$_mnt" 2>/dev/null ||
+                umount -l "$_mnt" 2>/dev/null || true
+        done
+        rm -rf -- "$APPIMAGE_TARGET_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup_target_dir EXIT
+trap 'cleanup_target_dir; exit 130' INT
+trap 'cleanup_target_dir; exit 143' TERM HUP
 # Capture the session bus before the runtime redirects HOME/XDG_* inside its private prefix.
 export ROBLOX_MAC_NOTIFY_DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}
 export ROBLOX_MAC_NOTIFY_XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}
@@ -104,18 +143,6 @@ if ! _is_internal_updater "$@"; then
           flock -n -E 73 9 &&
           recover_interrupted_update ) || true
     fi
-    _short_base=/tmp
-    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
-        _xlen=$(LC_ALL=C printf %s "$XDG_RUNTIME_DIR" | wc -c)
-        [ "$_xlen" -le 32 ] && _short_base=$XDG_RUNTIME_DIR
-    fi
-    _created_app_target=0
-    if [ -z "${APPIMAGE_TARGET_DIR:-}" ] || [ ! -d "${APPIMAGE_TARGET_DIR:-}" ]; then
-        _app_target=$(mktemp -d "$_short_base/rbx-mnt.XXXXXX")
-        chmod 700 "$_app_target"
-        export APPIMAGE_TARGET_DIR=$_app_target
-        _created_app_target=1
-    fi
     _created_run_alias=0
     if [ -z "${ROBLOX_MAC_ALIAS_DIR:-}" ] || [ ! -d "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
         _alias_dir=$(mktemp -d "$_short_base/rbx.XXXXXX")
@@ -127,17 +154,6 @@ if ! _is_internal_updater "$@"; then
         export ROBLOX_MAC_REAL_DATA=$HERE/DO_NOT_SHARE
         _created_run_alias=1
     fi
-    cleanup_target_dir() {
-        if [ "${_created_run_alias:-0}" = 1 ] && [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
-            rm -rf -- "$ROBLOX_MAC_ALIAS_DIR" 2>/dev/null || true
-        fi
-        if [ "${_created_app_target:-0}" = 1 ] && [ -n "${APPIMAGE_TARGET_DIR:-}" ]; then
-            rm -rf -- "$APPIMAGE_TARGET_DIR" 2>/dev/null || true
-        fi
-    }
-    trap cleanup_target_dir EXIT
-    trap 'cleanup_target_dir; exit 130' INT
-    trap 'cleanup_target_dir; exit 143' TERM HUP
 fi
 case "${1:-}" in
     --diagnose|--debug|--client-version|--client-version-display|--download-client|--prepare-shaders|--shell|--inside)

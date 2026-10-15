@@ -43,7 +43,10 @@ start_progress() {
     mkfifo "$UI_FIFO" 2>/dev/null || { UI_FIFO=; return 0; }
     # Read/write keeps startup non-blocking even when GTK is unavailable.
     exec 8<>"$UI_FIFO"
-    "$UI_APP" --bootstrapper-ui --progress "$DATA" 8>&- <"$UI_FIFO" >/dev/null 2>&1 & UI_PID=$!
+    # AppImage-spawning children never inherit FD 9 (the instance lock): the
+    # AppImage runtime's FUSE daemon outlives its command (it keeps the mount
+    # for reuse) and would strand the lock after this process exits.
+    "$UI_APP" --bootstrapper-ui --progress "$DATA" 8>&- 9>&- <"$UI_FIFO" >/dev/null 2>&1 & UI_PID=$!
     rm -f -- "$UI_FIFO"
     UI_FD=1
 }
@@ -176,11 +179,11 @@ launch() {
     export ROBLOX_MAC_CURSOR_APPEARANCE=$cur
 
     if [ -n "$uri" ]; then
-        env ROBLOX_MAC_LOCK_HELD=1 "$APP" --uri "$uri" "$@"
+        env ROBLOX_MAC_LOCK_HELD=1 "$APP" --uri "$uri" "$@" 9>&-
         _status=$?
         exit $_status
     fi
-    env ROBLOX_MAC_LOCK_HELD=1 "$APP" "$@"
+    env ROBLOX_MAC_LOCK_HELD=1 "$APP" "$@" 9>&-
     _status=$?
     exit $_status
 }
@@ -189,7 +192,7 @@ ask_update() {
     latest=$1
     installed=$2
     if [ -n "$UI_APP" ]; then
-        choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" >/dev/null 2>&1; printf '%s' "$?" )
+        choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" 9>&- >/dev/null 2>&1; printf '%s' "$?" )
         case "$choice" in
             0) return 0;;
             2) settings_set skipped_version "$latest" >/dev/null 2>&1 || true;;
@@ -248,7 +251,7 @@ check_latest() {
     fi
     check_output=$DATA/.check.$$
     rm -f -- "$check_output"
-    timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version >"$check_output" 2>/dev/null &
+    timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version 9>&- >"$check_output" 2>/dev/null &
     check_pid=$!
     while kill -0 "$check_pid" 2>/dev/null; do
         if cancelled; then kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true; rm -f -- "$check_output"; return 125; fi
@@ -260,7 +263,7 @@ check_latest() {
     settings_set last_check "$now" >/dev/null 2>&1 || true
     if [ -n "$latest" ]; then
         settings_set last_known_latest "$latest" >/dev/null 2>&1 || true
-        display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
+        display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 9>&- 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
         [ -z "$display" ] || settings_set last_known_latest_display "$display" >/dev/null 2>&1 || true
         printf '%s\n' "$latest"
     else

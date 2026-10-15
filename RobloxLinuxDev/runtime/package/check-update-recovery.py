@@ -42,6 +42,12 @@ assert 'rm -rf -- "$WORK"' in UPDATE
 assert "stat -c %d" in UPDATE
 # Traps keep the standard exit codes.
 assert "trap 'exit 130' INT" in UPDATE and "trap 'exit 143' TERM HUP" in UPDATE
+# The updater stages inside the launcher-managed work directory; the runtime's
+# release confinement accepts ROBLOX_MAC_DATA there by canonical path prefix,
+# so staging must not masquerade as a live-launch alias data directory.
+assert 'ROBLOX_MAC_ALIAS_DIR' not in UPDATE
+assert 'ROBLOX_MAC_DATA="$WORK/data"' in UPDATE
+assert 'ROBLOX_MAC_DATA="$WORK/next/runtime"' in UPDATE
 
 OLD = "version-old"
 NEW = "version-abcd"

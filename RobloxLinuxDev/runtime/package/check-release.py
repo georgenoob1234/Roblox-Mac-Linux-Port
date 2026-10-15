@@ -44,22 +44,29 @@ with tempfile.TemporaryDirectory(prefix='roblox release ') as tmp:
         env={**env, 'ROBLOX_MAC_DATA': str(folder / 'outside')})
     assert rejected.returncode == 2 and not (folder / 'outside').exists()
     # The updater stages beside the client; a release run accepts a data path
-    # outside DO_NOT_SHARE only as the alias's data directory, so the updater
-    # must export both ROBLOX_MAC_ALIAS_DIR and the matching ROBLOX_MAC_DATA.
+    # outside DO_NOT_SHARE only inside the launcher-managed .update-work
+    # directory (update-roblox.sh points ROBLOX_MAC_DATA there for the download
+    # and for shader preparation) or as a live-launch alias's data directory.
     fakecurl = folder / 'confine-bin'
     fakecurl.mkdir()
     (fakecurl / 'curl').write_text('#!/bin/sh\nexit 1\n')
     (fakecurl / 'curl').chmod(0o755)
     staging = release / '.update-work'
     (staging / 'data').mkdir(parents=True)
+    for staged_data in (staging / 'data', staging / 'next' / 'runtime'):
+        staged = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+            env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+                 'ROBLOX_MAC_DATA': str(staged_data)})
+        assert b'Release data must stay inside DO_NOT_SHARE.' not in staged.stderr, staged.stderr
     alias = os.path.realpath(staging)
-    staged = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+    aliased = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
         env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
              'ROBLOX_MAC_ALIAS_DIR': alias, 'ROBLOX_MAC_DATA': alias + '/data'})
-    assert b'Release data must stay inside DO_NOT_SHARE.' not in staged.stderr, staged.stderr
-    bare = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
-        env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'], 'ROBLOX_MAC_DATA': str(staging / 'next')})
-    assert bare.returncode == 2 and b'Release data must stay inside DO_NOT_SHARE.' in bare.stderr
+    assert b'Release data must stay inside DO_NOT_SHARE.' not in aliased.stderr, aliased.stderr
+    stranger = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+        env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+             'ROBLOX_MAC_DATA': str(release / 'stranger-data')})
+    assert stranger.returncode == 2 and b'Release data must stay inside DO_NOT_SHARE.' in stranger.stderr
     shutil.rmtree(staging)
     assert config['APP'] == str(version / 'RobloxPlayer.app')
     assert config['FFLAGS'] == str(flags)

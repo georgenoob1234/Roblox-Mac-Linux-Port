@@ -48,11 +48,28 @@ REL=$SBX/release
 DNS=$REL/DO_NOT_SHARE
 FAILED=0
 
+# The AppImage runtime FUSE-mounts itself read-only under DO_NOT_SHARE/tmp
+# (run.sh points TMPDIR there). A killed run — Ctrl-C, a timeout kill — can
+# leave that mount behind, and the sandbox cannot be removed while it is
+# mounted, so detach every leftover before removing or keeping the sandbox.
+# Lazy unmounting works even if a process still holds the mount.
+unmount_sandbox() {
+    for mount_dir in $(find "$SBX" -maxdepth 5 -name '.mount_*' -type d -prune 2>/dev/null); do
+        fusermount3 -uz "$mount_dir" 2>/dev/null ||
+            fusermount -uz "$mount_dir" 2>/dev/null ||
+            umount -l "$mount_dir" 2>/dev/null || true
+    done
+}
 cleanup() {
+    unmount_sandbox
     if [ "${VALIDATE_KEEP:-0}" = 1 ] || [ "$FAILED" = 1 ]; then
         echo "sandbox kept for inspection: $SBX" >&2
     else
-        rm -rf -- "$SBX"
+        rm -rf -- "$SBX" 2>/dev/null || {
+            echo "could not fully remove the sandbox: $SBX" >&2
+            echo '  a mount may remain; detach it with: fusermount3 -uz '"$SBX"'/release/DO_NOT_SHARE/tmp/.mount_*' >&2
+            echo '  then remove the sandbox with: rm -rf '"$SBX" >&2
+        }
     fi
 }
 trap cleanup EXIT

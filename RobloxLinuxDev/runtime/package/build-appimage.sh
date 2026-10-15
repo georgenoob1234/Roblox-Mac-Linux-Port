@@ -84,8 +84,9 @@ if [ -f "$ROOT/optimized/ready" ]; then
     # Only runtime artifacts, never build caches or development source trees.
     python3 "$ROOT/optimized/package.py" "$APPDIR"
 fi
-# Shader pipeline: the metal2vulkan binary plus the two scripts fill $DATA/spv-cache on the user's machine.
-mkdir -p "$APPDIR/metal"; cp "$ROOT/metal/pack2air.py" "$ROOT/metal/translate-all.sh" "$ROOT/metal/translate-one.py" "$ROOT/metal/prepare-cache.py" "$APPDIR/metal/"
+# Shader pipeline: the metal2vulkan binary plus the metal scripts fill $DATA/spv-cache on the
+# user's machine; translate-all.sh also runs analyze_shader_failures.py for the failure summary.
+mkdir -p "$APPDIR/metal"; cp "$ROOT/metal/pack2air.py" "$ROOT/metal/translate-all.sh" "$ROOT/metal/translate-one.py" "$ROOT/metal/prepare-cache.py" "$ROOT/metal/analyze_shader_failures.py" "$APPDIR/metal/"
 cp "$TOP/metal2vulkan/target/release/metal2vulkan" "$APPDIR/usr/bin/"
 python3 "$HERE/bundle-browser.py" "$APPDIR"
 

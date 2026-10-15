@@ -27,6 +27,11 @@ find "$OUT/air" -maxdepth 1 -name '*.air' -print0 | xargs -0 -P"$(nproc)" -I{} s
 echo '--- failure reasons:'
 grep -h 'metal2vulkan: ' "$OUT"/spv/*.out | grep -v 'wrote\|PASS\|auto-detected\|FALLBACK' \
     | sed 's/[0-9]\+/N/g; s/;.*//' | sort | uniq -c | sort -rn
+# Machine-readable per-shader failure records for analyze_shader_failures.py.
+# Best-effort: the translated artifacts are already on disk, and a broken summary
+# must never fail shader preparation itself.
+python3 "$HERE/analyze_shader_failures.py" --collect "$OUT" \
+    || echo 'shader failure summary unavailable' >&2
 # The translator omits the terminating signal. Retry one affected input directly
 # so diagnostics distinguish SIGILL, SIGSEGV and SIGKILL under the same limits.
 failed=$(grep -l 'llvm-dis killed by signal' "$OUT"/spv/*.out | head -n 1)

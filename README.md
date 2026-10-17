@@ -30,6 +30,11 @@ preserves `DO_NOT_SHARE` (cookies, settings, caches and logs) by default,
 along with user-modified and unexpected files. The directory is left behind
 when preserved data remains.
 
+The interactive installer asks whether to keep your data. The explicit CLI
+equivalent is `--keep-data` (the default); use
+`uninstall --yes --purge-data` only when you want app-owned data removed from
+the install root. Unknown files and unsafe symlinks are still preserved.
+
 If you prefer to inspect the bootstrap before running it:
 
 ```bash

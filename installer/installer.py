@@ -25,6 +25,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
@@ -83,7 +84,13 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _color(code: str, value: str) -> str:
-    if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+    if (
+        sys.stdout.isatty()
+        and sys.stderr.isatty()
+        and not os.environ.get("NO_COLOR")
+        and not os.environ.get("CI")
+        and os.environ.get("TERM", "") != "dumb"
+    ):
         return f"\033[{code}m{value}\033[0m"
     return value
 
@@ -562,14 +569,14 @@ def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> No
             target.rmdir()
 
 
-def finalize_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> None:
+def finalize_transaction(target: Path, txn: Path, journal: dict[str, Any], preserve_modified: bool = True) -> None:
     backup_root = txn / "backup"
     for op in journal.get("files", []):
         rel = op["path"]
         backup = backup_root / rel
         if lstat_or_none(backup) is None:
             continue
-        if op.get("modified") and op.get("had_old"):
+        if op.get("modified") and op.get("had_old") and preserve_modified:
             saved = preserve_to_backup(backup, target.parent, "user-modified")
             good(f"Preserved your modified {rel} at {saved}")
         else:
@@ -707,7 +714,7 @@ def build_operations(target: Path, old_manifest: dict[str, Any] | None, new_mani
 
 def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | None,
                       new_manifest: dict[str, Any] | None, staged_payload: Path | None,
-                      target_created: bool = False) -> None:
+                      target_created: bool = False, preserve_modified: bool = True) -> None:
     manifest_path = target / MANIFEST_NAME
     old_manifest_exists = lstat_or_none(manifest_path) is not None
     old_manifest_hash = sha256_file(manifest_path) if old_manifest_exists else None
@@ -757,7 +764,7 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
         except Exception as recovery_exc:
             warn(f"Automatic rollback was incomplete: {recovery_exc}")
         raise
-    finalize_transaction(target, txn, journal)
+    finalize_transaction(target, txn, journal, preserve_modified=preserve_modified)
 
 
 def check_platform() -> None:
@@ -805,7 +812,8 @@ def check_local_space(source: Path, target: Path, names: list[str], dry_run: boo
 def run_install_or_update(target: Path, source: Path, release_tag: str | None,
                           dry_run: bool = False, migrate_data: bool | None = None,
                           force_desktop: bool = False, yes: bool = False,
-                          confirmed: bool = False) -> None:
+                          confirmed: bool = False,
+                          install_desktop_integration: bool = True) -> None:
     names = safe_payload_names(source)
     check_local_space(source, target, names, dry_run=dry_run)
     if not target.parent.exists():
@@ -913,12 +921,18 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
     if lstat_or_none(target / "DO_NOT_SHARE") is None:
         note("DO_NOT_SHARE will be created by the launcher on first run. It is always preserved on uninstall.")
 
-    try:
-        install_desktop(target, force=force_desktop, yes=yes, dry_run=False)
-    except InstallerError as exc:
-        warn(f"Application files are installed, but desktop integration was not changed: {exc}")
-        warn("Resolve the desktop-file conflict or run: python3 installer.py desktop install --force-desktop")
-    good("Done. Launch 'Roblox (Mac Linux Port)' from your application menu, or run run.sh from the install folder.")
+    if install_desktop_integration:
+        try:
+            install_desktop(target, force=force_desktop, yes=yes, dry_run=False)
+        except InstallerError as exc:
+            warn(f"Application files are installed, but desktop integration was not changed: {exc}")
+            warn("Resolve the desktop-file conflict or run: python3 installer.py desktop install --force-desktop")
+    else:
+        note("Desktop integration skipped. Run 'installer.py desktop install --yes' later to enable it.")
+    if install_desktop_integration:
+        good("Done. Launch 'Roblox (Mac Linux Port)' from your application menu, or run run.sh from the install folder.")
+    else:
+        good("Done. Launch with run.sh from the install folder, or enable desktop integration later.")
 
 
 def confirm(prompt: str, default: bool = False) -> bool:
@@ -1303,16 +1317,19 @@ def uninstall_desktop(dry_run: bool = False, expected_target: Path | None = None
 
 
 def remove_install(target: Path, yes: bool = False, dry_run: bool = False,
-                   remove_client_cache: bool = False) -> None:
+                   remove_client_cache: bool = False, keep_data: bool = True) -> None:
     recover_transactions(target)
     manifest = inspect_target(target)
     if manifest is None:
         fail(f"No valid installer manifest exists at {target}; refusing to delete an unknown folder.")
     assert_not_running(target)
     print(f"Install location: {target}")
-    print("DO_NOT_SHARE: will be kept, including cookies, settings, logs, and caches.")
-    print("Unknown files and files modified since installation will also be kept.")
-    if remove_client_cache:
+    if keep_data:
+        print("Data choice: keep DO_NOT_SHARE, RobloxVersion, and user files")
+    else:
+        print("Data choice: remove app data inside this install when it is a real directory")
+    print("Unknown files and external paths are always kept.")
+    if keep_data and remove_client_cache:
         print("RobloxVersion will be removed only if its expected client markers are present; interrupted .update-work will be kept.")
     if dry_run:
         note("Dry run: no files will be removed.")
@@ -1323,15 +1340,21 @@ def remove_install(target: Path, yes: bool = False, dry_run: bool = False,
                 print(f"  - {name} (already missing)")
             elif stat.S_ISREG(st.st_mode) and sha256_file(path) == info["sha256"]:
                 print(f"  - {name}")
+            elif not keep_data and stat.S_ISREG(st.st_mode):
+                print(f"  - {name} (modified; full purge requested)")
             else:
                 print(f"  ! {name} (modified/unexpected; would be preserved)")
+        if not keep_data:
+            for name in ("DO_NOT_SHARE", "RobloxVersion", ".update-work"):
+                if lstat_or_none(target / name) is not None:
+                    print(f"  - {name} (app data)")
         return
     if not yes and (not sys.stdin.isatty() or not confirm(f"Uninstall application files from {target}?", default=False)):
         note("Cancelled; nothing was changed.")
         return
     txn = Path(tempfile.mkdtemp(prefix=TXN_PREFIX, dir=target.parent))
     try:
-        apply_transaction(target, txn, manifest, None, None, False)
+        apply_transaction(target, txn, manifest, None, None, False, preserve_modified=keep_data)
     except Exception:
         if txn.exists() and lstat_or_none(txn / "journal.json") is None:
             with contextlib.suppress(OSError):
@@ -1341,16 +1364,26 @@ def remove_install(target: Path, yes: bool = False, dry_run: bool = False,
         uninstall_desktop(expected_target=target)
     except InstallerError as exc:
         warn(f"Application files were removed, but desktop cleanup needs attention: {exc}")
-    if remove_client_cache:
+    if keep_data and remove_client_cache:
         remove_runtime_cache(target)
+    if not keep_data:
+        remove_full_data(target, manifest)
     # Only remove the install root when it is truly empty. DO_NOT_SHARE and any
     # unknown/modified files make it stay in place by design.
     try:
         target.rmdir()
         fsync_dir(target.parent)
-        good("Uninstalled. The now-empty application directory was removed.")
+        if keep_data:
+            good("Uninstalled application files. No data directory remained to preserve.")
+        else:
+            good("Uninstalled application and app data. No unrelated files were removed.")
     except OSError:
-        good("Uninstalled managed application files. The install folder remains because it contains preserved data or unknown files.")
+        if keep_data:
+            good("Uninstalled application files. Your data was preserved.")
+            note(f"Preserved data path: {target / 'DO_NOT_SHARE'}")
+        else:
+            good("Uninstalled application and app data. Unrelated entries were preserved.")
+            note(f"Remaining entries are at: {target}")
         try:
             remaining = sorted(p.name for p in target.iterdir())
             if remaining:
@@ -1380,6 +1413,40 @@ def remove_runtime_cache(target: Path) -> None:
         else:
             shutil.rmtree(work)
             good("Removed the non-transactional update staging cache.")
+
+
+def remove_full_data(target: Path, manifest: dict[str, Any]) -> list[Path]:
+    """Remove explicitly app-owned data for a confirmed full uninstall.
+
+    Only manifest paths and the three runtime-owned directories are considered.
+    Unknown entries are never traversed or deleted, and symlinks are removed
+    only as links (never followed).
+    """
+    removed: list[Path] = []
+    for name in manifest.get("files", {}):
+        path = target / name
+        st = lstat_or_none(path)
+        if st is None:
+            continue
+        if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+            path.unlink()
+            removed.append(path)
+        else:
+            warn(f"Preserving unexpected managed path during full uninstall: {path}")
+    for name in ("DO_NOT_SHARE", "RobloxVersion", ".update-work"):
+        path = target / name
+        st = lstat_or_none(path)
+        if st is None:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            warn(f"Preserving symlink during full uninstall: {path}")
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            warn(f"Preserving unexpected data path during full uninstall: {path}")
+            continue
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
 
 
 def fetch_json(url: str) -> dict[str, Any]:
@@ -1567,80 +1634,227 @@ def status(target: Path) -> None:
         print("Other preserved entries: " + ", ".join(sorted(extras)[:12]) + (" …" if len(extras) > 12 else ""))
 
 
+TITLE_LINES = (
+    "  ____   ___  ____   ___  ___  __  __",
+    " |  _ \\ / _ \\| __ ) / _ \\|_ _||  \\/  |",
+    " | |_) | | | |  _ \\| | | || | | |\\/| |",
+    " |  _ <| |_| | |_) | |_| || | | |  | |",
+    " |_| \\_\\\\___/|____/ \\___/|___||_|  |_|",
+    "             M A C   L I N U X   P O R T",
+)
+
+
+@dataclass
+class InstallationState:
+    target: Path
+    manifest: dict[str, Any] | None
+    latest_tag: str | None = None
+    release_error: str | None = None
+
+    @property
+    def installed(self) -> bool:
+        return self.manifest is not None
+
+    @property
+    def installed_version(self) -> str:
+        if not self.manifest:
+            return "not installed"
+        return str(self.manifest.get("version") or "unknown")
+
+    @property
+    def update_available(self) -> bool:
+        return self.installed and bool(self.latest_tag) and self.installed_version != self.latest_tag
+
+    @property
+    def desktop_managed(self) -> bool:
+        try:
+            desktop = load_desktop_state()
+        except InstallerError:
+            return False
+        return bool(desktop and desktop.get("install_dir") == str(self.target))
+
+
+def color_enabled() -> bool:
+    return bool(
+        sys.stdout.isatty()
+        and sys.stderr.isatty()
+        and not os.environ.get("NO_COLOR")
+        and not os.environ.get("CI")
+        and os.environ.get("TERM", "") != "dumb"
+    )
+
+
+def rgb(text: str, red: int, green: int, blue: int) -> str:
+    if not color_enabled():
+        return text
+    return f"\033[38;2;{red};{green};{blue}m{text}\033[0m"
+
+
+def print_title(animated: bool = True) -> None:
+    """Print a compact ASCII splash, animating only in a capable TTY."""
+    animate = animated and color_enabled() and sys.stdin.isatty()
+    frames = 5 if animate else 1
+    for frame in range(frames):
+        if animate:
+            print("\033[2J\033[H", end="")
+        for row, line in enumerate(TITLE_LINES):
+            if animate:
+                shine = (frame * 8 + row * 5) % max(1, len(line))
+                rendered = "".join(
+                    rgb(ch, 255, 42 + (70 if abs(index - shine) < 3 else 0), 42 + (70 if abs(index - shine) < 3 else 0))
+                    if ch != " " else ch
+                    for index, ch in enumerate(line)
+                )
+            else:
+                rendered = _color("1;31", line)
+            print(rendered)
+        if animate and frame + 1 < frames:
+            time.sleep(0.07)
+
+
 def print_banner() -> None:
-    print(_color("1;35", r"""
-╭──────────────────────────────────────────────────────╮
-│             ROBLOX MAC LINUX PORT                    │
-│          Safe installer · updater · remover          │
-╰──────────────────────────────────────────────────────╯"""))
-    print("Your files stay yours. DO_NOT_SHARE is never removed by uninstall.")
+    print_title(animated=False)
+    print("-" * 54)
+
+
+def detect_installation_state(target: Path, check_release: bool = True) -> InstallationState:
+    manifest = load_manifest(target) if check_target_root(target) else None
+    state = InstallationState(target=target, manifest=manifest)
+    if check_release:
+        try:
+            state.latest_tag = latest_release_metadata()["tag"]
+        except InstallerError as exc:
+            state.release_error = str(exc)
+    return state
+
+
+def menu_choices(state: InstallationState, update_declined: bool = False) -> list[tuple[str, str]]:
+    if not state.installed:
+        return [("1", "Install"), ("2", "Exit")]
+    if state.update_available or update_declined:
+        return [("1", "Update"), ("2", "Uninstall"), ("3", "Exit")]
+    return [("1", "Uninstall"), ("2", "Exit")]
+
+
+def render_state(state: InstallationState) -> None:
+    print(f"Target: {state.target}")
+    if state.installed:
+        print(f"Installed: {state.installed_version}")
+        if state.latest_tag:
+            print(f"Latest:    {state.latest_tag}")
+        elif state.release_error:
+            print("Latest:    unavailable (the update check failed)")
+        data = state.target / "DO_NOT_SHARE"
+        data_status = "present" if data.is_dir() and not data.is_symlink() else "not created"
+        print(f"Data:      {data_status} (preserved by default)")
+    else:
+        print("Installation: not installed")
+        if state.latest_tag:
+            print(f"Release:      {state.latest_tag} ready to download")
+        elif state.release_error:
+            print("Release:      unavailable; install will retry the official release check")
+
+
+def render_update_notice(state: InstallationState) -> None:
+    if state.update_available:
+        print()
+        print(f"Update available: {state.installed_version} -> {state.latest_tag}")
+        print("Install the latest release now?")
+
+
+def print_menu(state: InstallationState, update_declined: bool = False) -> None:
+    print()
+    for number, label in menu_choices(state, update_declined):
+        print(f"  [{number}] {label}")
+
+
+def ask_desktop_integration() -> bool:
+    return confirm(
+        "Add Roblox to your application menu and open Roblox links automatically?",
+        default=True,
+    )
+
+
+def interactive_install(target: Path, state: InstallationState, integrate_desktop: bool) -> None:
+    check_platform()
+    src_dir = Path(__file__).resolve().parent
+    if not source_looks_like_release(src_dir) or src_dir == target:
+        src, tag, temp_obj = get_source_for_action("install" if not state.installed else "update", target, None)
+    else:
+        src, tag, temp_obj = src_dir, None, None
+    try:
+        run_install_or_update(
+            target,
+            src,
+            tag,
+            confirmed=True,
+            yes=True,
+            install_desktop_integration=integrate_desktop,
+        )
+    finally:
+        if temp_obj:
+            temp_obj.cleanup()
 
 
 def interactive_menu() -> int:
     target = normalized_target(default_prefix())
+    update_declined = False
+    first_screen = True
     while True:
-        print_banner()
-        print(f"\nInstall location: {target}")
-        manifest = None
-        if target.exists():
-            with contextlib.suppress(InstallerError):
-                manifest = load_manifest(target)
-        print("\n  1) Install / update from this release folder")
-        print("  2) Update to the latest official release")
-        print("  3) Check installation status")
-        print("  4) Install desktop launcher / URI handler")
-        print("  5) Uninstall application (keep DO_NOT_SHARE)")
-        print("  6) Exit")
+        if first_screen:
+            print_title(animated=True)
+            first_screen = False
+        else:
+            print(_color("1;31", "ROBLOX MAC LINUX PORT"))
+        print("-" * 54)
         try:
-            choice = input("\nChoose an action [1-6]: ").strip()
+            state = detect_installation_state(target)
+        except InstallerError as exc:
+            warn(str(exc))
+            state = InstallationState(target=target)
+        render_state(state)
+        if state.update_available and not update_declined:
+            render_update_notice(state)
+            if confirm("Update now?", default=True):
+                try:
+                    with installer_lock():
+                        interactive_install(target, state, state.desktop_managed)
+                except (InstallerError, KeyboardInterrupt) as exc:
+                    warn(str(exc) or "Update cancelled.")
+                update_declined = False
+                continue
+            update_declined = True
+        print_menu(state, update_declined)
+        try:
+            choice = input("\nChoose an action: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             return 0
+        choices = dict(menu_choices(state, update_declined))
+        if choice not in choices:
+            warn("Choose one of the displayed options.")
+            continue
+        action = choices[choice]
+        if action == "Exit":
+            print("Bye!")
+            return 0
         try:
             with installer_lock():
-                if choice == "1":
-                    if not confirm(f"Install/update {APP_NAME} at {target}?", default=False):
-                        note("Cancelled; nothing was changed.")
-                        continue
-                    check_platform()
-                    src_dir = Path(__file__).resolve().parent
-                    if not source_looks_like_release(src_dir) or src_dir == target:
-                        warn("This folder is not a complete release bundle; the latest official release will be downloaded instead.")
-                        src, tag, temp_obj = get_source_for_action("update", target, None)
-                    else:
-                        src, tag, temp_obj = src_dir, None, None
-                    try:
-                        run_install_or_update(target, src, tag, migrate_data=None, confirmed=True)
-                    finally:
-                        if temp_obj:
-                            temp_obj.cleanup()
-                elif choice == "2":
-                    if not confirm(f"Download and install the latest release at {target}?", default=False):
-                        note("Cancelled; nothing was changed.")
-                        continue
-                    check_platform()
-                    src, tag, temp_obj = get_source_for_action("update", target, None)
-                    try:
-                        run_install_or_update(target, src, tag, migrate_data=None, confirmed=True)
-                    finally:
-                        if temp_obj:
-                            temp_obj.cleanup()
-                elif choice == "3":
-                    status(target)
-                elif choice == "4":
-                    install_desktop(target, force=False)
-                elif choice == "5":
-                    remove_install(target)
-                elif choice == "6":
-                    print("Bye!")
-                    return 0
-                else:
-                    warn("Choose a number from 1 to 6.")
+                if action == "Install":
+                    integrate = ask_desktop_integration()
+                    interactive_install(target, state, integrate)
+                    update_declined = False
+                elif action == "Update":
+                    interactive_install(target, state, state.desktop_managed)
+                    update_declined = False
+                elif action == "Uninstall":
+                    keep_data = confirm("Keep your Roblox data for a future reinstall?", default=True)
+                    remove_install(target, yes=True, keep_data=keep_data)
+                    update_declined = False
         except InstallerError as exc:
             warn(str(exc))
         except KeyboardInterrupt:
             print("\nCancelled.")
-        input("\nPress Enter to return to the menu…")
 
 
 def add_common_options(parser: argparse.ArgumentParser) -> None:
@@ -1662,9 +1876,13 @@ def build_parser() -> argparse.ArgumentParser:
     for command in ("install", "update", "repair"):
         p = sub.add_parser(command, help=f"{command.capitalize()} the application")
         add_common_options(p)
-    p = sub.add_parser("uninstall", help="Remove managed application files; always keep DO_NOT_SHARE")
+    p = sub.add_parser("uninstall", help="Remove managed application files; keep or purge app data explicitly")
     add_common_options(p)
     p.add_argument("--remove-client-cache", action="store_true", help="Also remove recognized RobloxVersion cache; never remove DO_NOT_SHARE")
+    data_choice = p.add_mutually_exclusive_group()
+    data_choice.add_argument("--keep-data", dest="keep_data", action="store_true", help="Keep DO_NOT_SHARE and RobloxVersion (default)")
+    data_choice.add_argument("--purge-data", dest="keep_data", action="store_false", help="Remove app data inside the install root after confirmation")
+    p.set_defaults(keep_data=True)
     p = sub.add_parser("status", help="Show install and desktop-integration status")
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
     p = sub.add_parser("desktop", help="Manage the user-local .desktop launcher and roblox:// URI handler")
@@ -1719,7 +1937,13 @@ def main(argv: list[str] | None = None) -> int:
                     note("Cancelled; no changes were made.")
             return 0
         if args.command == "uninstall":
-            remove_install(target, yes=args.yes, dry_run=args.dry_run, remove_client_cache=args.remove_client_cache)
+            remove_install(
+                target,
+                yes=args.yes,
+                dry_run=args.dry_run,
+                remove_client_cache=args.remove_client_cache,
+                keep_data=args.keep_data,
+            )
             return 0
         if args.command in {"install", "update", "repair"}:
             if args.dry_run and args.source:

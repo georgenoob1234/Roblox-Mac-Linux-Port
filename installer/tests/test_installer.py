@@ -7,6 +7,7 @@ GitHub release or Roblox client is downloaded.
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import importlib.util
 import io
 import json
@@ -22,6 +23,7 @@ INSTALLER = Path(__file__).resolve().parents[1] / "installer.py"
 spec = importlib.util.spec_from_file_location("safe_installer", INSTALLER)
 installer = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
+sys.modules[spec.name] = installer
 spec.loader.exec_module(installer)
 
 REQUIRED = sorted(installer.REQUIRED_FILES)
@@ -130,9 +132,13 @@ def test_install_update_reinstall_uninstall_and_recovery() -> None:
         (target / "run.sh").write_text("#!/bin/sh\n# user edit\n")
         (target / "user-not-owned.txt").write_text("keep\n")
         source2 = make_release(root, "two")
+        (target / "RobloxVersion").mkdir()
+        (target / "RobloxVersion/.version").write_text("client-one\n")
         run_cli(home, "update", "--source", str(source2), "--prefix", str(target), "--yes")
         assert (target / "FFlags.json").read_text() == '{"UserFlag":true}\n'
         assert b"version two" in (target / "run.sh").read_bytes()
+        assert (target / "RobloxVersion/.version").read_text() == "client-one\n"
+        assert (target / "DO_NOT_SHARE/cookies/native.sqlite").read_bytes() == b"keep-login"
         backups = list((target.parent / installer.BACKUP_PREFIX).glob("*/run.sh"))
         assert backups and backups[-1].read_text().find("user edit") >= 0
         assert (target / "user-not-owned.txt").read_text() == "keep\n"
@@ -162,14 +168,86 @@ def test_install_update_reinstall_uninstall_and_recovery() -> None:
         # Uninstall keeps data, the user file, modified backups, and unrelated
         # desktop associations. Reinstallation into the remaining directory
         # must also keep the existing data without merging it.
-        run_cli(home, "uninstall", "--prefix", str(target), "--yes")
+        kept = run_cli(home, "uninstall", "--prefix", str(target), "--yes")
         assert (target / "DO_NOT_SHARE/cookies/native.sqlite").read_bytes() == b"keep-login"
         assert (target / "user-not-owned.txt").read_text() == "keep\n"
+        assert not (home / "data/applications/roblox-mac-port.desktop").exists()
+        assert f"Preserved data path: {target / 'DO_NOT_SHARE'}" in kept.stdout
         assert target.is_dir()
         run_cli(home, "install", "--source", str(source), "--prefix", str(target), "--yes")
         assert (target / "DO_NOT_SHARE/cookies/native.sqlite").read_bytes() == b"keep-login"
         run_cli(home, "uninstall", "--prefix", str(target), "--dry-run")
         assert (target / installer.MANIFEST_NAME).is_file()
+
+
+def test_state_aware_menu_and_desktop_choice() -> None:
+    with tempfile.TemporaryDirectory(prefix="installer-menu-") as tmp:
+        root = Path(tmp)
+        home = root / "home"
+        home.mkdir()
+        os.environ.update(env_for(home))
+        target = home / "install"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            installer.print_title(animated=False)
+        title = output.getvalue()
+        assert "MAC   LINUX   PORT" in title and len(title.splitlines()) == len(installer.TITLE_LINES)
+        assert "Safe installer" not in title and "updater" not in title
+        fresh = installer.InstallationState(target=target, manifest=None, latest_tag="v2.0.0")
+        assert installer.menu_choices(fresh) == [("1", "Install"), ("2", "Exit")]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            installer.render_state(fresh)
+            installer.print_menu(fresh)
+        rendered = output.getvalue()
+        assert "Release:      v2.0.0 ready to download" in rendered
+        assert "[1] Install" in rendered and "Update" not in rendered and "Uninstall" not in rendered
+
+        manifest = {"version": "v1.0.0", "files": {}}
+        update = installer.InstallationState(target=target, manifest=manifest, latest_tag="v2.0.0")
+        assert installer.menu_choices(update) == [("1", "Update"), ("2", "Uninstall"), ("3", "Exit")]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            installer.render_update_notice(update)
+            installer.print_menu(update)
+        rendered = output.getvalue()
+        assert "Update available: v1.0.0 -> v2.0.0" in rendered
+        assert "Install the latest release now?" in rendered
+
+        current = installer.InstallationState(target=target, manifest={"version": "v2.0.0", "files": {}}, latest_tag="v2.0.0")
+        assert installer.menu_choices(current) == [("1", "Uninstall"), ("2", "Exit")]
+        assert installer.menu_choices(current, update_declined=True)[0] == ("1", "Update")
+
+        original_confirm = installer.confirm
+        try:
+            installer.confirm = lambda *_args, **_kwargs: True
+            assert installer.ask_desktop_integration() is True
+            installer.confirm = lambda *_args, **_kwargs: False
+            assert installer.ask_desktop_integration() is False
+        finally:
+            installer.confirm = original_confirm
+
+        source = make_release(root, "declined")
+        installer.run_install_or_update(
+            target, source, None, yes=True, confirmed=True, install_desktop_integration=False,
+        )
+        assert (target / installer.MANIFEST_NAME).is_file()
+        assert not (home / "data/applications/roblox-mac-port.desktop").exists()
+
+        purge_target = home / "purge-install"
+        run_cli(home, "install", "--source", str(source), "--prefix", str(purge_target), "--yes")
+        (purge_target / "DO_NOT_SHARE/cookies").mkdir(parents=True)
+        (purge_target / "DO_NOT_SHARE/cookies/native.sqlite").write_bytes(b"delete-me")
+        (purge_target / "RobloxVersion").mkdir()
+        (purge_target / "RobloxVersion/.version").write_text("delete-me\n")
+        (purge_target / "keep-unrelated.txt").write_text("keep\n")
+        (purge_target / "run.sh").write_text("user-modified\n")
+        run_cli(home, "uninstall", "--prefix", str(purge_target), "--yes", "--purge-data")
+        assert not (purge_target / "DO_NOT_SHARE").exists()
+        assert not (purge_target / "RobloxVersion").exists()
+        assert (purge_target / "keep-unrelated.txt").read_text() == "keep\n"
+        assert not (home / "data/applications/roblox-mac-port.desktop").exists()
+        assert not list((purge_target.parent / installer.BACKUP_PREFIX).glob("*"))
 
 
 def test_symlink_archive_checksum_and_download_failures() -> None:

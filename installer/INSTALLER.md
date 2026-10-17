@@ -10,6 +10,11 @@ script from the official repository and runs `install --yes`. To inspect the
 bootstrap first, use the `curl`, `less`, and `sh` commands in the top-level
 README.
 
+Running `python3 installer/installer.py` without arguments in a terminal opens
+the state-aware menu. It shows only the actions that fit the detected state,
+offers an update before the menu when a newer release is available, and asks
+whether desktop links should be enabled during a fresh install.
+
 ## Install
 
 For a normal installation, run the root bootstrap. For an already extracted
@@ -89,6 +94,14 @@ Uninstall removes only unchanged files recorded in the manifest. It preserves
 installation directory stays in place. `--remove-client-cache` may remove a
 recognized `RobloxVersion` and non-transactional staging cache, but it never
 removes `DO_NOT_SHARE`.
+
+The interactive menu asks whether to keep your data. The default-safe CLI
+equivalent is `--keep-data`; use `--purge-data` only when you explicitly want
+the app-owned `DO_NOT_SHARE`, `RobloxVersion`, `.update-work`, and managed
+configuration removed from the install root. Unknown files and symlinks that
+could redirect outside the root are preserved and reported. Preserved data is
+left at the install path and can be deleted manually later if you change your
+mind.
 
 Use `--dry-run` with install, update, uninstall, or desktop actions to preview
 changes without modifying files. Installer logs are stored at

@@ -1830,6 +1830,7 @@ def interactive_menu() -> int:
                 elif action == "Uninstall":
                     keep_data = confirm("Keep your Roblox data for a future reinstall?", default=True)
                     remove_install(target, yes=True, keep_data=keep_data)
+                    # Do not reopen the install menu after a completed uninstall.
                     print("\nUninstall complete. Goodbye!")
                     return 0
         except InstallerError as exc:

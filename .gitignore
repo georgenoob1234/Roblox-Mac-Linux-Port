@@ -1,8 +1,11 @@
 /*
 !/.gitignore
 !/README.md
+!/install.sh
 !/.actionlint.yaml
 !/.github/
 !/RobloxLinuxDev/
 !/RobloxLinuxRelease/
+!/installer/
 **/DO_NOT_SHARE/
+**/__pycache__/

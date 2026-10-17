@@ -38,6 +38,9 @@ jobs:
       - name: Run pointer unlock regression tests
         run: python3 -B RobloxLinuxDev/runtime/package/check-pointer-unlock.py
 
+      - name: Run safe installer regression tests
+        run: python3 -B installer/tests/test_installer.py
+
   # ---------------------------------------------------------------------------
   # Full build — self-hosted CachyOS VM, gated by repository variable.
   #

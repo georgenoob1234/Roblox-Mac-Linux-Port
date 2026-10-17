@@ -4,7 +4,53 @@
 
 An experimental, unofficial runner for the Intel macOS Roblox client on x86_64 Linux, using Darling, Wayland and Vulkan.
 
-**[Download RobloxLinuxRelease.tar.gz](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/releases/)**, extract it, run `./install-uri-handler.sh` once from `RobloxLinuxRelease`, then open Roblox from your desktop application menu.
+## Install for one user
+
+The supported per-user installer downloads the latest published
+`RobloxLinuxRelease.tar.gz` from this repository, verifies its published
+SHA-256 checksum, and installs it under
+`~/.local/opt/roblox-mac-linux-port`. It also installs a user-local desktop
+launcher, icon, and `roblox://` / `roblox-player:` associations when there is
+no ownership conflict. No root privileges or `sudo` are required.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/georgenoob1234/Roblox-Mac-Linux-Port/main/install.sh | sh
+```
+
+After installation, the application-owned CLI is:
+
+```sh
+python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" update --yes
+python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" status
+python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" uninstall --yes
+```
+
+Uninstall removes only unchanged files recorded in the install manifest. It
+preserves `DO_NOT_SHARE` (cookies, settings, caches and logs) by default,
+along with user-modified and unexpected files. The directory is left behind
+when preserved data remains.
+
+The interactive installer asks whether to keep your data. The explicit CLI
+equivalent is `--keep-data` (the default); use
+`uninstall --yes --purge-data` only when you want app-owned data removed from
+the install root. Unknown files and unsafe symlinks are still preserved.
+
+If you prefer to inspect the bootstrap before running it:
+
+```bash
+curl -fsSLo install.sh https://raw.githubusercontent.com/georgenoob1234/Roblox-Mac-Linux-Port/main/install.sh
+less install.sh
+sh install.sh
+```
+
+The command executes a remote script and then downloads a release from GitHub.
+The bootstrap uses HTTPS and a pinned checksum for the installer, but both the
+script and checksum are hosted by this repository; a compromised repository
+account could replace them. Review the script first if you do not trust the
+source. Detailed conflict, recovery, desktop integration, and dry-run
+instructions are in [`installer/INSTALLER.md`](installer/INSTALLER.md).
+
+**[Download RobloxLinuxRelease.tar.gz](https://github.com/georgenoob1234/Roblox-Mac-Linux-Port/releases/)** for a manual release download. The per-user installer above performs the verified extraction and desktop integration for you.
 
 ```text
 RobloxLinuxDev/        Source, dependency pins, patches and build scripts

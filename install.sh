@@ -37,9 +37,9 @@ umask 077
 
 installer="$TMPDIR_INSTALL/installer.py"
 checksum="$TMPDIR_INSTALL/installer.py.sha256"
-curl -fsSL --retry 3 -- "$BASE_URL/installer.py" -o "$installer" ||
+curl -fsSL --retry 3 -o "$installer" "$BASE_URL/installer.py" ||
     fail "could not download the installer from $BASE_URL/installer.py"
-curl -fsSL --retry 3 -- "$BASE_URL/installer.py.sha256" -o "$checksum" ||
+curl -fsSL --retry 3 -o "$checksum" "$BASE_URL/installer.py.sha256" ||
     fail "could not download the installer checksum from $BASE_URL/installer.py.sha256"
 
 actual=$($HASH_TOOL "$installer" | awk '{print tolower($1)}') || fail 'could not hash the downloaded installer.'

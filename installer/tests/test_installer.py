@@ -191,7 +191,8 @@ def test_state_aware_menu_and_desktop_choice() -> None:
         with contextlib.redirect_stdout(output):
             installer.print_title(animated=False)
         title = output.getvalue()
-        assert "MAC   LINUX   PORT" in title and len(title.splitlines()) == len(installer.TITLE_LINES)
+        assert "███████████" in title and "▒▒███▒▒▒▒▒███" in title
+        assert len(title.splitlines()) == len(installer.TITLE_LINES)
         assert "Safe installer" not in title and "updater" not in title
         fresh = installer.InstallationState(target=target, manifest=None, latest_tag="v2.0.0")
         assert installer.menu_choices(fresh) == [("1", "Install"), ("2", "Exit")]

@@ -22,7 +22,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -1635,12 +1634,17 @@ def status(target: Path) -> None:
 
 
 TITLE_LINES = (
-    "  ____   ___  ____   ___  ___  __  __",
-    " |  _ \\ / _ \\| __ ) / _ \\|_ _||  \\/  |",
-    " | |_) | | | |  _ \\| | | || | | |\\/| |",
-    " |  _ <| |_| | |_) | |_| || | | |  | |",
-    " |_| \\_\\\\___/|____/ \\___/|___||_|  |_|",
-    "             M A C   L I N U X   P O R T",
+    "███████████            █████     ████                      ",
+    "▒▒███▒▒▒▒▒███          ▒▒███     ▒▒███                      ",
+    " ▒███    ▒███   ██████  ▒███████  ▒███   ██████  █████ █████",
+    " ▒██████████   ███▒▒███ ▒███▒▒███ ▒███  ███▒▒███▒▒███ ▒▒███ ",
+    " ▒███▒▒▒▒▒███ ▒███ ▒███ ▒███ ▒███ ▒███ ▒███ ▒███ ▒▒▒█████▒  ",
+    " ▒███    ▒███ ▒███ ▒███ ▒███ ▒███ ▒███ ▒███ ▒███  ███▒▒▒███ ",
+    " █████   █████▒▒██████  ████████  █████▒▒██████  █████ █████",
+    "▒▒▒▒▒   ▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒▒▒▒▒  ▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒▒ ▒▒▒▒▒ ",
+    "                                                            ",
+    "                                                            ",
+    "                                                            ",
 )
 
 
@@ -1684,32 +1688,11 @@ def color_enabled() -> bool:
     )
 
 
-def rgb(text: str, red: int, green: int, blue: int) -> str:
-    if not color_enabled():
-        return text
-    return f"\033[38;2;{red};{green};{blue}m{text}\033[0m"
-
-
-def print_title(animated: bool = True) -> None:
-    """Print a compact ASCII splash, animating only in a capable TTY."""
-    animate = animated and color_enabled() and sys.stdin.isatty()
-    frames = 5 if animate else 1
-    for frame in range(frames):
-        if animate:
-            print("\033[2J\033[H", end="")
-        for row, line in enumerate(TITLE_LINES):
-            if animate:
-                shine = (frame * 8 + row * 5) % max(1, len(line))
-                rendered = "".join(
-                    rgb(ch, 255, 42 + (70 if abs(index - shine) < 3 else 0), 42 + (70 if abs(index - shine) < 3 else 0))
-                    if ch != " " else ch
-                    for index, ch in enumerate(line)
-                )
-            else:
-                rendered = _color("1;31", line)
-            print(rendered)
-        if animate and frame + 1 < frames:
-            time.sleep(0.07)
+def print_title(animated: bool = False) -> None:
+    """Print the supplied static splash artwork."""
+    del animated
+    for line in TITLE_LINES:
+        print(_color("1;31", line))
 
 
 def print_banner() -> None:

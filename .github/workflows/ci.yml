@@ -32,6 +32,9 @@ jobs:
       - name: Run CI lint
         run: sh .github/scripts/ci-lint.sh
 
+      - name: Run dependency sync regression tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-dependency-sync.py
+
   # ---------------------------------------------------------------------------
   # Full build — self-hosted CachyOS VM, gated by repository variable.
   #

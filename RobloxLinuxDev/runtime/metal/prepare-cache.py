@@ -78,7 +78,11 @@ def prepare(item):
         subprocess.run(['spirv-val','--target-env','vulkan1.2',str(dest.with_suffix('.spv'))],check=True,capture_output=True,env=env)
         dest.with_suffix('.json').write_text(json.dumps(meta))
         return index,key,None
-    except (ValueError,KeyError,OSError,subprocess.CalledProcessError) as e:return index,None,str(e)
+    except subprocess.CalledProcessError as e:
+        # spirv-val's verdict names the exact broken rule; report it, not just the exit status.
+        detail=(e.stderr or b'').decode('utf-8','replace').strip()
+        return index,None,f'spirv-val rejected the adapted module: {detail or e}'
+    except (ValueError,KeyError,OSError) as e:return index,None,str(e)
 
 def main():
     global PACK, OUT, SOURCE

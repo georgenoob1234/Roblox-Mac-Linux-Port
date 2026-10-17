@@ -1,5 +1,6 @@
 #!/bin/sh
 # One-command, per-user installer bootstrap. Safe to run from a pipe.
+# Downloads use curl output options before the URL for POSIX compatibility.
 set -eu
 
 REPOSITORY=georgenoob1234/Roblox-Mac-Linux-Port

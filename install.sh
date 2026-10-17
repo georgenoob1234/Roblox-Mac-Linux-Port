@@ -55,4 +55,11 @@ esac
 [ "$actual" = "$EXPECTED_SHA256" ] || fail 'the downloaded installer does not match the pinned SHA-256.'
 [ "$actual" = "$expected" ] || fail 'the downloaded installer does not match its checksum file.'
 
-python3 "$installer" install --yes
+if [ -t 1 ] && [ -t 2 ] && [ -r /dev/tty ] && [ -z "${CI:-}" ]; then
+    # The shell reads the curl pipe on stdin; give the Python UI the real
+    # terminal so the same command can offer install/update/uninstall menus.
+    python3 "$installer" </dev/tty
+else
+    # CI, redirected output, and other noninteractive callers remain usable.
+    python3 "$installer" install --yes
+fi

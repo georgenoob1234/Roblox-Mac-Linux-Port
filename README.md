@@ -17,6 +17,11 @@ no ownership conflict. No root privileges or `sudo` are required.
 curl -fsSL https://raw.githubusercontent.com/georgenoob1234/Roblox-Mac-Linux-Port/main/install.sh | sh
 ```
 
+When run from a terminal, this command opens the installer menu. A fresh
+machine offers **Install** and **Exit**; later runs detect the installation and
+offer the appropriate update or uninstall actions. The menu also asks whether
+to add the launcher and Roblox links to the application menu.
+
 After installation, the application-owned CLI is:
 
 ```sh

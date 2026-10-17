@@ -6,9 +6,10 @@ manifest. `DO_NOT_SHARE` is never removed, replaced, or followed through a
 symlink.
 
 The one-command bootstrap at [`../install.sh`](../install.sh) downloads this
-script from the official repository and runs `install --yes`. To inspect the
-bootstrap first, use the `curl`, `less`, and `sh` commands in the top-level
-README.
+script from the official repository and opens its state-aware menu when a
+terminal is available. In CI or another noninteractive shell it uses
+`install --yes`. To inspect the bootstrap first, use the `curl`, `less`, and
+`sh` commands in the top-level README.
 
 Running `python3 installer/installer.py` without arguments in a terminal opens
 the state-aware menu. It shows only the actions that fit the detected state,

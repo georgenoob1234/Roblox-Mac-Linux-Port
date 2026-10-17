@@ -1823,7 +1823,8 @@ def interactive_menu() -> int:
                 if action == "Install":
                     integrate = ask_desktop_integration()
                     interactive_install(target, state, integrate)
-                    update_declined = False
+                    print("\nInstallation complete. Goodbye!")
+                    return 0
                 elif action == "Update":
                     interactive_install(target, state, state.desktop_managed)
                     update_declined = False

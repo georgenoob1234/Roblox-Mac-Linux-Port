@@ -82,6 +82,17 @@ else
     echo '(no Darling overlay directory)'
 fi
 
+# --- Release script consistency -------------------------------------------------------------
+echo '== Release script consistency =='
+for script in bootstrap.sh update-roblox.sh run.sh; do
+    src="RobloxLinuxDev/runtime/package/$script"
+    rel="RobloxLinuxRelease/$script"
+    if ! cmp -s "$src" "$rel"; then
+        echo "FAIL: release script out of sync: $rel differs from $src" >&2
+        fail=1
+    fi
+done
+
 if [ "$fail" -ne 0 ]; then
     echo 'FAIL: one or more lint checks failed' >&2
     exit 1

@@ -43,7 +43,10 @@ start_progress() {
     mkfifo "$UI_FIFO" 2>/dev/null || { UI_FIFO=; return 0; }
     # Read/write keeps startup non-blocking even when GTK is unavailable.
     exec 8<>"$UI_FIFO"
-    "$UI_APP" --bootstrapper-ui --progress "$DATA" 8>&- <"$UI_FIFO" >/dev/null 2>&1 & UI_PID=$!
+    # AppImage-spawning children never inherit FD 9 (the instance lock): the
+    # AppImage runtime's FUSE daemon outlives its command (it keeps the mount
+    # for reuse) and would strand the lock after this process exits.
+    "$UI_APP" --bootstrapper-ui --progress "$DATA" 8>&- 9>&- <"$UI_FIFO" >/dev/null 2>&1 & UI_PID=$!
     rm -f -- "$UI_FIFO"
     UI_FD=1
 }
@@ -87,6 +90,112 @@ notify() {
 settings_get() { python3 "$HELPER" settings "$DATA" get "$1"; }
 settings_set() { python3 "$HELPER" settings "$DATA" set "$1" "$2"; }
 installed_version() { cat "$HERE/RobloxVersion/.version" 2>/dev/null || true; }
+
+# >>> update transaction recovery (must stay byte-identical in bootstrap.sh
+# and run.sh; check-update-recovery.py compares the marked blocks) >>>
+# Repair a client swap interrupted by a crash or power loss. update-roblox.sh
+# stages into $WORK, syncs the staged data, and writes the durable
+# $WORK/TXN marker immediately before the two swap renames: the marker's
+# existence means "commit started". The phase is derived from the filesystem
+# rather than trusted from the marker text, in this priority order:
+#   no TXN          staging is disposable; the swap never touched the client.
+#   client valid    keep the verified client; discard the transaction.
+#   next valid      finish the install the transaction committed to.
+#   previous valid  roll back to the last known good client.
+#   nothing valid   fail loudly, keeping every byte of evidence.
+# Invariants: a backup is only restored after full validation; the installed
+# client is only replaced once its validated replacement is ready; the
+# transaction directory is only deleted after the installed client's
+# directory entry has been synced. Only $WORK and the client directory are
+# ever touched, never DO_NOT_SHARE. Idempotent: safe before every launch.
+WORK=$HERE/.update-work
+_upd_log() { echo "roblox: $*" >&2; }
+_upd_fsync_dir() {
+    python3 - "$@" <<'PY' || return 1
+import os, sys
+for path in sys.argv[1:]:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+}
+_upd_client_valid() {
+    [ -x "$HERE/RobloxVersion/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$HERE/RobloxVersion/.version" ] &&
+    [ -f "$HERE/RobloxVersion/spv-cache-v1/report.json" ]
+}
+_upd_next_valid() {
+    [ -x "$WORK/next/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$WORK/next/.version" ] &&
+    [ -f "$WORK/next/spv-cache-v1/report.json" ]
+}
+_upd_previous_valid() {
+    [ -x "$WORK/previous/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$WORK/previous/.version" ] &&
+    [ -f "$WORK/previous/spv-cache-v1/report.json" ]
+}
+# Install a validated transaction client (next or previous) over the
+# installed one, then drop the transaction once the install is durable.
+_upd_install() {
+    _upd_src=$1
+    _upd_what=$2
+    # The installed client failed validation and is unusable, but it is only
+    # removed after the replacement is validated and ready to move in.
+    if [ -e "$HERE/RobloxVersion" ] && ! rm -rf -- "$HERE/RobloxVersion"; then
+        _upd_log 'could not clear the unusable installed client.'
+        return 1
+    fi
+    if ! mv "$_upd_src" "$HERE/RobloxVersion"; then
+        _upd_log "could not install $_upd_what."
+        return 1
+    fi
+    # Only delete the backup and marker once the install is durably in place.
+    if _upd_fsync_dir "$HERE" "$WORK"; then
+        rm -rf -- "$WORK" ||
+            _upd_log 'warning: could not discard the finished update state.'
+    else
+        _upd_log 'warning: could not sync the release directory; update state is kept for the next launch.'
+    fi
+    return 0
+}
+recover_interrupted_update() {
+    [ -d "$WORK" ] || return 0
+    if [ ! -e "$WORK/TXN" ]; then
+        # No commit was recorded, so staging is disposable whether or not a
+        # client is installed; the swap never touched the installed client.
+        rm -rf -- "$WORK" ||
+            _upd_log 'warning: could not discard the stale update staging.'
+        return 0
+    fi
+    if _upd_client_valid; then
+        # The swap finished (or never started): keep the verified client and
+        # drop the transaction, syncing first so the backup is never deleted
+        # while the install rename could still be lost to power loss.
+        if _upd_fsync_dir "$HERE"; then
+            rm -rf -- "$WORK" ||
+                _upd_log 'warning: could not discard the finished update state.'
+            _upd_log 'recovered an interrupted update (kept the verified installed client).'
+        else
+            _upd_log 'warning: could not sync the release directory; update state is kept for the next launch.'
+        fi
+        return 0
+    fi
+    if _upd_next_valid; then
+        _upd_install "$WORK/next" 'the staged update' || return 1
+        _upd_log 'recovered an interrupted update (completed the downloaded client).'
+        return 0
+    fi
+    if _upd_previous_valid; then
+        _upd_install "$WORK/previous" 'the previous client' || return 1
+        _upd_log 'recovered an interrupted update (restored the previous client).'
+        return 0
+    fi
+    _upd_log 'an interrupted update left no usable client; reinstall from a fresh release.'
+    return 1
+}
+# <<< update transaction recovery <<<
 
 _created_boot_alias=0
 ensure_alias() {
@@ -133,16 +242,20 @@ launch() {
     export ROBLOX_MAC_CURSOR_APPEARANCE=$cur
 
     if [ -n "$uri" ]; then
-        exec env ROBLOX_MAC_LOCK_HELD=1 "$APP" --uri "$uri" "$@"
+        env ROBLOX_MAC_LOCK_HELD=1 "$APP" --uri "$uri" "$@" 9>&-
+        _status=$?
+        exit $_status
     fi
-    exec env ROBLOX_MAC_LOCK_HELD=1 "$APP" "$@"
+    env ROBLOX_MAC_LOCK_HELD=1 "$APP" "$@" 9>&-
+    _status=$?
+    exit $_status
 }
 
 ask_update() {
     latest=$1
     installed=$2
     if [ -n "$UI_APP" ]; then
-        choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" >/dev/null 2>&1; printf '%s' "$?" )
+        choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" 9>&- >/dev/null 2>&1; printf '%s' "$?" )
         case "$choice" in
             0) return 0;;
             2) settings_set skipped_version "$latest" >/dev/null 2>&1 || true;;
@@ -174,7 +287,7 @@ first_run() {
     say 'Setting up Roblox for the first time; this may take a minute.'
     # The warm-up runs in a subshell so it allocates its own throwaway alias
     # directory. This prevents the warm-up's stage symlinks from contaminating
-    # the alias that the actual game launch will receive.
+    # the alias that the actual game launch will receive from run.sh.
     # The warm-up does not own the instance lock. Close FD 9 before exec so a
     # Darling/AppImage child cannot strand the lock if timeout has to kill it.
     if ! (unset ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA
@@ -201,7 +314,7 @@ check_latest() {
     fi
     check_output=$DATA/.check.$$
     rm -f -- "$check_output"
-    timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version >"$check_output" 2>/dev/null &
+    timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version 9>&- >"$check_output" 2>/dev/null &
     check_pid=$!
     while kill -0 "$check_pid" 2>/dev/null; do
         if cancelled; then kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true; rm -f -- "$check_output"; return 125; fi
@@ -213,7 +326,7 @@ check_latest() {
     settings_set last_check "$now" >/dev/null 2>&1 || true
     if [ -n "$latest" ]; then
         settings_set last_known_latest "$latest" >/dev/null 2>&1 || true
-        display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
+        display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 9>&- 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
         [ -z "$display" ] || settings_set last_known_latest_display "$display" >/dev/null 2>&1 || true
         printf '%s\n' "$latest"
     else
@@ -263,6 +376,7 @@ case "$command" in
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
+        recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
@@ -277,6 +391,7 @@ case "$command" in
         if ! flock -n -E 73 9; then
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
+        recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
@@ -297,6 +412,7 @@ if ! flock -n -E 73 9; then
     notify 'Roblox is already running.' 'Roblox is already running'
     exit 0
 fi
+recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
 start_progress
 first_run || { finish_progress; exit 1; }
 installed=$(installed_version)

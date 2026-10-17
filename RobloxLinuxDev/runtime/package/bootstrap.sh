@@ -91,48 +91,111 @@ settings_get() { python3 "$HELPER" settings "$DATA" get "$1"; }
 settings_set() { python3 "$HELPER" settings "$DATA" set "$1" "$2"; }
 installed_version() { cat "$HERE/RobloxVersion/.version" 2>/dev/null || true; }
 
+# >>> update transaction recovery (must stay byte-identical in bootstrap.sh
+# and run.sh; check-update-recovery.py compares the marked blocks) >>>
 # Repair a client swap interrupted by a crash or power loss. update-roblox.sh
-# stages into $WORK and writes the durable $WORK/TXN marker right before it
-# renames RobloxVersion aside; that marker with a missing RobloxVersion is the
-# commit point this finishes or rolls back. It only touches $WORK and the client
-# directory, never DO_NOT_SHARE, and is safe to call before every launch.
+# stages into $WORK, syncs the staged data, and writes the durable
+# $WORK/TXN marker immediately before the two swap renames: the marker's
+# existence means "commit started". The phase is derived from the filesystem
+# rather than trusted from the marker text, in this priority order:
+#   no TXN          staging is disposable; the swap never touched the client.
+#   client valid    keep the verified client; discard the transaction.
+#   next valid      finish the install the transaction committed to.
+#   previous valid  roll back to the last known good client.
+#   nothing valid   fail loudly, keeping every byte of evidence.
+# Invariants: a backup is only restored after full validation; the installed
+# client is only replaced once its validated replacement is ready; the
+# transaction directory is only deleted after the installed client's
+# directory entry has been synced. Only $WORK and the client directory are
+# ever touched, never DO_NOT_SHARE. Idempotent: safe before every launch.
 WORK=$HERE/.update-work
-next_valid() {
-    [ -x "$WORK/next/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
-    [ -f "$WORK/next/.version" ] &&
-    [ -f "$WORK/next/spv-cache-v1/report.json" ]
+_upd_log() { echo "roblox: $*" >&2; }
+_upd_fsync_dir() {
+    python3 - "$@" <<'PY' || return 1
+import os, sys
+for path in sys.argv[1:]:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
 }
-client_valid() {
+_upd_client_valid() {
     [ -x "$HERE/RobloxVersion/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
     [ -f "$HERE/RobloxVersion/.version" ] &&
     [ -f "$HERE/RobloxVersion/spv-cache-v1/report.json" ]
 }
-recover_interrupted_update() {
-    [ -d "$WORK" ] || return 0
-    if [ -e "$WORK/TXN" ] && [ ! -e "$HERE/RobloxVersion" ]; then
-        if next_valid; then
-            mv "$WORK/next" "$HERE/RobloxVersion" ||
-                { echo 'roblox: could not install the staged update.' >&2; return 1; }
-            say 'recovered an interrupted update (completed the downloaded client).'
-        elif [ -d "$WORK/previous" ]; then
-            mv "$WORK/previous" "$HERE/RobloxVersion" ||
-                { echo 'roblox: could not restore the previous client.' >&2; return 1; }
-            say 'recovered an interrupted update (restored the previous client).'
-        else
-            echo 'roblox: an interrupted update left no usable client; reinstall from a fresh release.' >&2
-            return 1
-        fi
+_upd_next_valid() {
+    [ -x "$WORK/next/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$WORK/next/.version" ] &&
+    [ -f "$WORK/next/spv-cache-v1/report.json" ]
+}
+_upd_previous_valid() {
+    [ -x "$WORK/previous/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] &&
+    [ -f "$WORK/previous/.version" ] &&
+    [ -f "$WORK/previous/spv-cache-v1/report.json" ]
+}
+# Install a validated transaction client (next or previous) over the
+# installed one, then drop the transaction once the install is durable.
+_upd_install() {
+    _upd_src=$1
+    _upd_what=$2
+    # The installed client failed validation and is unusable, but it is only
+    # removed after the replacement is validated and ready to move in.
+    if [ -e "$HERE/RobloxVersion" ] && ! rm -rf -- "$HERE/RobloxVersion"; then
+        _upd_log 'could not clear the unusable installed client.'
+        return 1
     fi
-    if client_valid; then
-        rm -rf -- "$WORK"
-    elif [ ! -e "$WORK/TXN" ]; then
-        # No commit started, so staging is disposable whether or not a client
-        # is installed. A missing client is a normal first run: drop the stale
-        # staging and let the bootstrapper reach its download/check path.
-        rm -rf -- "$WORK"
+    if ! mv "$_upd_src" "$HERE/RobloxVersion"; then
+        _upd_log "could not install $_upd_what."
+        return 1
+    fi
+    # Only delete the backup and marker once the install is durably in place.
+    if _upd_fsync_dir "$HERE" "$WORK"; then
+        rm -rf -- "$WORK" ||
+            _upd_log 'warning: could not discard the finished update state.'
+    else
+        _upd_log 'warning: could not sync the release directory; update state is kept for the next launch.'
     fi
     return 0
 }
+recover_interrupted_update() {
+    [ -d "$WORK" ] || return 0
+    if [ ! -e "$WORK/TXN" ]; then
+        # No commit was recorded, so staging is disposable whether or not a
+        # client is installed; the swap never touched the installed client.
+        rm -rf -- "$WORK" ||
+            _upd_log 'warning: could not discard the stale update staging.'
+        return 0
+    fi
+    if _upd_client_valid; then
+        # The swap finished (or never started): keep the verified client and
+        # drop the transaction, syncing first so the backup is never deleted
+        # while the install rename could still be lost to power loss.
+        if _upd_fsync_dir "$HERE"; then
+            rm -rf -- "$WORK" ||
+                _upd_log 'warning: could not discard the finished update state.'
+            _upd_log 'recovered an interrupted update (kept the verified installed client).'
+        else
+            _upd_log 'warning: could not sync the release directory; update state is kept for the next launch.'
+        fi
+        return 0
+    fi
+    if _upd_next_valid; then
+        _upd_install "$WORK/next" 'the staged update' || return 1
+        _upd_log 'recovered an interrupted update (completed the downloaded client).'
+        return 0
+    fi
+    if _upd_previous_valid; then
+        _upd_install "$WORK/previous" 'the previous client' || return 1
+        _upd_log 'recovered an interrupted update (restored the previous client).'
+        return 0
+    fi
+    _upd_log 'an interrupted update left no usable client; reinstall from a fresh release.'
+    return 1
+}
+# <<< update transaction recovery <<<
 
 _created_boot_alias=0
 ensure_alias() {

@@ -106,10 +106,19 @@ if [ "${RELEASE:-0}" = 1 ]; then
     PRIVATE=$STATE/DO_NOT_SHARE
     # Ignore inherited home/cache paths; staging overrides must stay in this folder.
     DATA=$(realpath -m -- "$DATA")
+    # $STATE/.update-work is the launcher-managed staging beside the client:
+    # update-roblox.sh points ROBLOX_MAC_DATA inside it while a new client is
+    # downloaded and verified, so the exception is a canonical prefix match on
+    # that one directory. Nothing else may keep data outside DO_NOT_SHARE.
+    STAGING=$(realpath -m -- "$STATE/.update-work")
     if [ -n "${ROBLOX_MAC_ALIAS_DIR:-}" ] && [ "$DATA" = "$ROBLOX_MAC_ALIAS_DIR/data" ]; then
         :
     else
-        case "$DATA" in "$PRIVATE"|"$PRIVATE"/*) ;; *) echo 'Release data must stay inside DO_NOT_SHARE.' >&2; exit 2;; esac
+        case "$DATA" in
+            "$PRIVATE"|"$PRIVATE"/*) ;;
+            "$STAGING"|"$STAGING"/*) ;;
+            *) echo 'Release data must stay inside DO_NOT_SHARE.' >&2; exit 2;;
+        esac
     fi
     mkdir -p "$PRIVATE"
     chmod 700 "$PRIVATE"
@@ -219,6 +228,15 @@ if [ "${1:-}" != "--inside" ]; then
         REAL_DATA=${STATE:-$ROOT}/DO_NOT_SHARE
     fi
     mkdir -p "$REAL_DATA"
+    # A stale AppImage/FUSE mount below the data directory makes the
+    # in-namespace bind-mount of $REAL_DATA fail with EINVAL (a killed run
+    # can leave one under $REAL_DATA/tmp). Detach leftovers before launching;
+    # findmnt, not find: stale FUSE entries fail lstat and get skipped.
+    findmnt -rn -o TARGET 2>/dev/null | grep -F "$REAL_DATA/" | while IFS= read -r _stale_mount; do
+        fusermount3 -uz "$_stale_mount" 2>/dev/null ||
+            fusermount -uz "$_stale_mount" 2>/dev/null ||
+            umount -l "$_stale_mount" 2>/dev/null || true
+    done
 
     # Introduce a secure, per-launch, short filesystem alias for the real data directory.
     # Linux sockaddr_un.sun_path is 108 bytes and the last one must stay NUL, so no socket

@@ -43,6 +43,31 @@ with tempfile.TemporaryDirectory(prefix='roblox release ') as tmp:
     rejected = subprocess.run([root / 'bin/roblox-mac', '--show-config'], capture_output=True,
         env={**env, 'ROBLOX_MAC_DATA': str(folder / 'outside')})
     assert rejected.returncode == 2 and not (folder / 'outside').exists()
+    # The updater stages beside the client; a release run accepts a data path
+    # outside DO_NOT_SHARE only inside the launcher-managed .update-work
+    # directory (update-roblox.sh points ROBLOX_MAC_DATA there for the download
+    # and for shader preparation) or as a live-launch alias's data directory.
+    fakecurl = folder / 'confine-bin'
+    fakecurl.mkdir()
+    (fakecurl / 'curl').write_text('#!/bin/sh\nexit 1\n')
+    (fakecurl / 'curl').chmod(0o755)
+    staging = release / '.update-work'
+    (staging / 'data').mkdir(parents=True)
+    for staged_data in (staging / 'data', staging / 'next' / 'runtime'):
+        staged = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+            env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+                 'ROBLOX_MAC_DATA': str(staged_data)})
+        assert b'Release data must stay inside DO_NOT_SHARE.' not in staged.stderr, staged.stderr
+    alias = os.path.realpath(staging)
+    aliased = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+        env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+             'ROBLOX_MAC_ALIAS_DIR': alias, 'ROBLOX_MAC_DATA': alias + '/data'})
+    assert b'Release data must stay inside DO_NOT_SHARE.' not in aliased.stderr, aliased.stderr
+    stranger = subprocess.run([root / 'bin/roblox-mac', '--download-client'], capture_output=True,
+        env={**env, 'PATH': str(fakecurl) + ':' + env['PATH'],
+             'ROBLOX_MAC_DATA': str(release / 'stranger-data')})
+    assert stranger.returncode == 2 and b'Release data must stay inside DO_NOT_SHARE.' in stranger.stderr
+    shutil.rmtree(staging)
     assert config['APP'] == str(version / 'RobloxPlayer.app')
     assert config['FFLAGS'] == str(flags)
     assert config['SHADER_CACHE'] == str(version / 'spv-cache-v1')
@@ -83,7 +108,12 @@ with tempfile.TemporaryDirectory(prefix='roblox release ') as tmp:
     image.write_text('''#!/bin/sh
 set -eu
 [ "$APPIMAGELAUNCHER_DISABLE" = 1 ] && [ "$_FORCE_HEADLESS" = 1 ]
-[ "$TARGET_APPIMAGE" = "$0" ] && [ "${APPIMAGE_TARGET_DIR-unset}" = unset ]
+[ "$TARGET_APPIMAGE" = "$0" ]
+# run.sh must hand every AppImage invocation a mount directory outside the
+# release folder, and so outside DO_NOT_SHARE: a FUSE mount below the data
+# directory makes the launch-time bind-mount fail with EINVAL.
+[ -n "${APPIMAGE_TARGET_DIR:-}" ] && [ -d "$APPIMAGE_TARGET_DIR" ]
+case "$APPIMAGE_TARGET_DIR" in "$(dirname -- "$0")"/*) exit 9;; esac
 [ "$TMPDIR" = "$(dirname "$0")/DO_NOT_SHARE/tmp" ] && [ -d "$TMPDIR" ]
 [ "$1" != --debug ] || shift
 case "$1" in
@@ -143,6 +173,40 @@ esac
         env={**env, 'PATH': str(fakebin) + ':' + env['PATH'], 'TEST_ARCHIVE': str(archive), 'ROBLOX_MAC_DATA': str(version)})
     assert result.returncode and b'Unsafe client archive' in result.stderr
     assert original.read_bytes() == before and not (folder / 'escaped').exists()
+
+    # Real downloader: a CDN connection reset must be retried, not fatal.
+    good = folder / 'good.zip'
+    exe = zipfile.ZipInfo('RobloxPlayer.app/Contents/MacOS/RobloxPlayer')
+    exe.create_system = 3
+    exe.external_attr = 0o100755 << 16
+    with zipfile.ZipFile(good, 'w') as z:
+        z.writestr(exe, b'#!/bin/sh\n')
+    state = folder / 'curl-state'
+    curl.write_text('''#!/bin/sh
+case "$1" in *I*) exit 0;; esac
+case "$*" in
+*client-version*) echo '{"clientVersionUpload":"version-abcd"}';;
+*)
+    n=$(cat "$TEST_STATE" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    printf '%s\\n' "$n" > "$TEST_STATE"
+    if [ "$n" -lt 3 ]; then
+        echo 'curl: (35) Recv failure: Connection reset by peer' >&2
+        exit 35
+    fi
+    cp "$TEST_ARCHIVE" "$3"
+    ;;
+esac
+''')
+    (version / '.version').write_text('version-old')
+    result = subprocess.run([root / 'scripts/fetch-client.sh'], capture_output=True,
+        env={**env, 'PATH': str(fakebin) + ':' + env['PATH'], 'TEST_ARCHIVE': str(good),
+             'TEST_STATE': str(state), 'ROBLOX_MAC_DATA': str(version)})
+    assert result.returncode == 0, result.stderr
+    assert (version / '.version').read_text() == 'version-abcd'
+    assert state.read_text().strip() == '3', state.read_text()
+    assert (version / 'RobloxPlayer.app/Contents/MacOS/RobloxPlayer').exists()
+
     pack = version / 'RobloxPlayer.app/Contents/Resources/shaders/shaders_metal_osx.pack'
     pack.parent.mkdir(parents=True)
     pack.write_bytes(b'')

@@ -70,28 +70,44 @@ URL="https://setup.rbxcdn.com/mac/$V-RobloxPlayer.zip"
 total=$(curl -fsSLI "$URL" 2>/dev/null | awk 'tolower($1) == "content-length:" {gsub("\r", "", $2); print $2; exit}') || total=
 case "$total" in ''|*[!0-9]*) total=0;; esac
 progress downloading 25 "Downloading Roblox" 0 "$total"
-curl -fsSL -o "$tmp/c.zip" "$URL" &
-curl_pid=$!
-while kill -0 "$curl_pid" 2>/dev/null; do
-    if cancelled; then
-        kill "$curl_pid" 2>/dev/null || true
-        wait "$curl_pid" 2>/dev/null || true
-        progress cancelled 0 "Download cancelled" 0 "$total" false
-        exit 125
+# A CDN connection reset must not fail the whole update: retry the fetch a
+# bounded number of times, restarting the download each attempt.
+attempt=1
+max_attempts=3
+while :; do
+    curl -fsSL -o "$tmp/c.zip" "$URL" &
+    curl_pid=$!
+    while kill -0 "$curl_pid" 2>/dev/null; do
+        if cancelled; then
+            kill "$curl_pid" 2>/dev/null || true
+            wait "$curl_pid" 2>/dev/null || true
+            progress cancelled 0 "Download cancelled" 0 "$total" false
+            exit 125
+        fi
+        # 2>/dev/null must precede the input redirection: the poll can run before
+        # curl has created c.zip, and a failed < open would otherwise print a
+        # spurious "No such file or directory" for the not-yet-existing file.
+        done_bytes=$(wc -c 2>/dev/null < "$tmp/c.zip" || echo 0)
+        case "$total" in
+            0) percent=-1;;
+            *) percent=$((25 + done_bytes * 45 / total)); [ "$percent" -gt 70 ] && percent=70;;
+        esac
+        progress downloading "$percent" "Downloading Roblox" "$done_bytes" "$total"
+        sleep 0.25
+    done
+    if wait "$curl_pid"; then
+        break
     fi
-    done_bytes=$(wc -c < "$tmp/c.zip" 2>/dev/null || echo 0)
-    case "$total" in
-        0) percent=-1;;
-        *) percent=$((25 + done_bytes * 45 / total)); [ "$percent" -gt 70 ] && percent=70;;
-    esac
-    progress downloading "$percent" "Downloading Roblox" "$done_bytes" "$total"
-    sleep 0.25
+    if [ "$attempt" -ge "$max_attempts" ]; then
+        progress failed 0 "Download failed" 0 "$total" false
+        exit 1
+    fi
+    attempt=$(( attempt + 1 ))
+    rm -f -- "$tmp/c.zip"
+    progress downloading 25 "Downloading Roblox" 0 "$total"
+    sleep 2
 done
-if ! wait "$curl_pid"; then
-    progress failed 0 "Download failed" 0 "$total" false
-    exit 1
-fi
-done_bytes=$(wc -c < "$tmp/c.zip" 2>/dev/null || echo 0)
+done_bytes=$(wc -c 2>/dev/null < "$tmp/c.zip" || echo 0)
 progress downloading 70 "Download complete" "$done_bytes" "$total"
 python3 - "$tmp/c.zip" <<'PY'
 import pathlib, stat, sys, zipfile

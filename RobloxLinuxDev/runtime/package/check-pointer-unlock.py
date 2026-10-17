@@ -22,18 +22,23 @@ Asserted invariants on `runtime/browser/wayland.cpp` apply_capture:
   1. Idempotence guard: the function returns early when the requested
      state already matches the proxy state, so a redundant unlock can
      never destroy a null proxy.
-  2. Unlock branch sequence: destroy zwp_locked_pointer_v1 and
+  2. Constraint target: the pointer constraint is installed on the GTK
+     toplevel Wayland surface obtained from gtk_widget_get_window(window).
+  3. Unlock branch sequence: destroy zwp_locked_pointer_v1 and
      zwp_relative_pointer_v1, queue inactive capture state, update the
-     capture cursor, release the SDL capture, and THEN commit the
-     constrained GTK toplevel — the compositor-side release.
-  3. The unlock commit sits before the trailing wl_display_flush that
+     capture cursor, release the SDL capture, and THEN commit that exact
+     same GTK toplevel surface — the compositor-side release.
+  4. Committing an unrelated surface, moving the commit before destruction,
+     or removing it causes the harness to fail.
+  5. The unlock commit sits before the trailing wl_display_flush that
      publishes it.
-  4. Lock branch: install the constraint, then commit (activation is
-     latched at that commit — the part that always worked).
-  5. native/wayland.cpp (the optimized build the game actually loads)
+  6. Lock branch: install the constraint on the toplevel surface, then
+     commit (activation is latched at that commit — the part that always worked).
+  7. native/wayland.cpp (the optimized build the game actually loads)
      keeps #including the shared browser backend, so capture-path fixes
      reach the running game.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -76,7 +81,56 @@ def problems_for(browser: str, native: str) -> list:
         "unlock requests cannot destroy a null proxy",
     )
 
-    # 2. Unlock branch: destroy -> state/cursor/SDL release -> toplevel commit.
+    # 2. Lock branch: constraint must be installed on the GTK toplevel Wayland
+    #    surface obtained from gtk_widget_get_window(window), then committed.
+    lock_surface_match = re.search(
+        r'(\w+)\s*=\s*gdk_wayland_window_get_wl_surface\s*\(\s*gtk_widget_get_window\s*\(\s*window\s*\)\s*\)',
+        lock_branch,
+    )
+    lock_surface_var = lock_surface_match.group(1) if lock_surface_match else None
+    lock_pointer_match = re.search(
+        r'zwp_pointer_constraints_v1_lock_pointer\s*\(\s*[^,]+,\s*([^,\s\)]+)',
+        lock_branch,
+    )
+    require(
+        lock_surface_match is not None
+        and lock_pointer_match is not None
+        and lock_pointer_match.group(1) == lock_surface_var,
+        "apply_capture lock branch must install the pointer constraint on the "
+        "GTK toplevel Wayland surface obtained from gtk_widget_get_window(window)",
+    )
+
+    lock_commits = list(
+        re.finditer(r'wl_surface_commit\s*\(\s*([^,\s\)]+)\s*\)', lock_branch)
+    )
+    install_pos = lock_pointer_match.start() if lock_pointer_match else None
+    require(
+        bool(lock_commits)
+        and install_pos is not None
+        and any(
+            m.start() > install_pos and m.group(1) == lock_surface_var
+            for m in lock_commits
+        ),
+        "apply_capture lock branch must wl_surface_commit the toplevel surface "
+        "after lock_pointer — constraint activation is latched at that commit",
+    )
+
+    # 3. Unlock branch: obtain the same GTK toplevel surface from
+    #    gtk_widget_get_window(window).
+    unlock_surface_match = re.search(
+        r'(\w+)\s*=\s*gdk_wayland_window_get_wl_surface\s*\(\s*gtk_widget_get_window\s*\(\s*window\s*\)\s*\)',
+        unlock_branch,
+    )
+    unlock_surface_var = (
+        unlock_surface_match.group(1) if unlock_surface_match else None
+    )
+    require(
+        unlock_surface_match is not None,
+        "apply_capture unlock branch must obtain the GTK toplevel Wayland "
+        "surface from gtk_widget_get_window(window)",
+    )
+
+    # 4. Unlock branch sequence: destroy -> state/cursor/SDL release -> commit.
     unlock_steps = [
         "zwp_locked_pointer_v1_destroy",
         "zwp_relative_pointer_v1_destroy",
@@ -112,27 +166,51 @@ def problems_for(browser: str, native: str) -> list:
         "Lock exit)",
     )
 
-    # 3. The release commit must precede the flush that publishes it.
-    commit_pos = seen.get("wl_surface_commit")
+    # 5. Unlock commit: commit that exact surface after destroying both pointer
+    #    objects. Committing an unrelated surface, moving the commit before
+    #    destruction, or removing it causes the harness to fail.
+    locked_destroy = position(unlock_branch, "zwp_locked_pointer_v1_destroy")
+    relative_destroy = position(unlock_branch, "zwp_relative_pointer_v1_destroy")
+    destroy_end = (
+        max(pos for pos in (locked_destroy, relative_destroy) if pos is not None)
+        if (locked_destroy is not None or relative_destroy is not None)
+        else None
+    )
+
+    unlock_commits = list(
+        re.finditer(r'wl_surface_commit\s*\(\s*([^,\s\)]+)\s*\)', unlock_branch)
+    )
+    require(
+        bool(unlock_commits),
+        "apply_capture unlock branch must commit the constrained GTK toplevel surface",
+    )
+    if unlock_commits:
+        require(
+            unlock_surface_var is not None
+            and all(m.group(1) == unlock_surface_var for m in unlock_commits),
+            "apply_capture unlock branch must commit the exact constrained GTK toplevel "
+            f"surface ({unlock_surface_var or 'obtained from gtk_widget_get_window(window)'}); "
+            "committing an unrelated surface is invalid",
+        )
+        require(
+            locked_destroy is not None
+            and relative_destroy is not None
+            and destroy_end is not None
+            and all(m.start() > destroy_end for m in unlock_commits),
+            "the unlock wl_surface_commit must occur after destroying both "
+            "zwp_locked_pointer_v1 and zwp_relative_pointer_v1",
+        )
+
+    # 6. The release commit must precede the flush that publishes it.
     flush_pos = position(unlock_branch, "wl_display_flush")
     require(
-        commit_pos is not None and flush_pos is not None and commit_pos < flush_pos,
+        flush_pos is not None
+        and (not unlock_commits or all(m.start() < flush_pos for m in unlock_commits)),
         "the unlock wl_surface_commit must occur before the trailing "
         "wl_display_flush that publishes the release to the compositor",
     )
 
-    # 4. Lock branch: install the constraint, then commit.
-    install = position(lock_branch, "zwp_pointer_constraints_v1_lock_pointer")
-    lock_commit = position(lock_branch, "wl_surface_commit")
-    require(
-        install is not None
-        and lock_commit is not None
-        and lock_commit > install,
-        "apply_capture lock branch must wl_surface_commit the toplevel after "
-        "lock_pointer — constraint activation is latched at that commit",
-    )
-
-    # 5. The optimized build the game loads must compile the shared backend.
+    # 7. The optimized build the game loads must compile the shared backend.
     require(
         '#include "../runtime/browser/wayland.cpp"' in native,
         'native/wayland.cpp must keep #include "../runtime/browser/wayland.cpp" '
@@ -164,6 +242,18 @@ MUTATIONS = [
                 "if(early_surface)wl_surface_commit(early_surface);"
                 "zwp_locked_pointer_v1_destroy(locked_pointer);"
                 "locked_pointer=nullptr;",
+            ),
+            n,
+        ),
+    ),
+    (
+        "commit wrong surface on unlock",
+        lambda b, n: (
+            b.replace(
+                UNLOCK_COMMIT,
+                "auto wrong_surface=gdk_wayland_window_get_wl_surface("
+                "gtk_widget_get_window(socket_view));"
+                "if(wrong_surface)wl_surface_commit(wrong_surface);",
             ),
             n,
         ),

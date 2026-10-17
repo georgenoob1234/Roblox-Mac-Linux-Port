@@ -39,6 +39,22 @@ index 78b4b47..b631bde 100644
      };
      let lanes = AIR_EXECUTION_GROUPS
          .iter()
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index 6272be6..567116b 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -1125,6 +1125,11 @@ impl Emitter {
+         // substrate. A build failure (a block with no terminator) is a fail-visible error, not a
+         // text-walk fallback. Measured dead broadly (0 build failures / 16942 frontier + 0 / 15,336 banked).
+         crate::native::tir::canonicalize_single_predecessor_phis(&mut body_blocks);
++        // Lower the poison-lane `<4 x T>` read-back of an array-of-`<3 x T>` allocation to the
++        // `<3 x T>` load its `[0, 1, 2]` shuffle always narrows to. Runs on the finalized carriers
++        // before the graph is built; inert on every module that already translated (the shape has
++        // no emission path — see `rewrite_array3_prefix_vector4_loads`).
++        crate::native::tir::rewrite_array3_prefix_vector4_loads(&mut body_blocks);
+         let tir = crate::native::tir::build_from_blocks(&body_blocks)?;
+         {
+             let tir = &tir;
 diff --git a/src/native/emitter/ops/air_calls.rs b/src/native/emitter/ops/air_calls.rs
 index 505a6dd..7150be8 100644
 --- a/src/native/emitter/ops/air_calls.rs
@@ -57,6 +73,163 @@ index 505a6dd..7150be8 100644
                          call.callee
                      ));
                  }
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+index 03022b4..ebfb082 100644
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -7547,6 +7547,152 @@ entry:
+     assert!(!asm.contains("OpBitcast %_ptr_"), "{asm}");
+ }
+ 
++/// The corpus failure this family regresses: a `<4 x float>` load reading back the leading
++/// `<3 x float>` element of an `[N x <3 x float>]` allocation through an identity bitcast, with
++/// Metal's poison-lane widening on the store and the `[0, 1, 2]` shuffle on the read. The array
++/// pointee made the `<4 x float>` result non-bitcastable ("cannot reinterpret load ... with
++/// non-bitcastable pointee Array(Vector(Float, 3), N)"); the pre-emission carrier rewrite lowers
++/// the load to the `<3 x float>` its shuffle always selects.
++#[test]
++fn native_array3_prefix_vector4_load_narrowed_by_prefix_shuffle_reads_leading_vector() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <3 x float> @load_widened_prefix() {
++entry:
++  %buf = alloca [8 x <3 x float>], align 16
++  %alias = bitcast ptr %buf to ptr
++  %wide = load <4 x float>, ptr %alias, align 16
++  %narrow = shufflevector <4 x float> %wide, <4 x float> undef, <3 x i32> <i32 0, i32 1, i32 2>
++  ret <3 x float> %narrow
++}
++"#;
++    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
++    assert!(!asm.contains("non-bitcastable"), "{asm}");
++    // Exactly one load — of the leading `<3 x float>` element — and the shuffle is gone.
++    assert_eq!(asm.matches("OpLoad").count(), 1, "{asm}");
++    assert!(asm.contains("OpTypeVector %3 3"), "{asm}");
++    assert!(!asm.contains("OpVectorShuffle"), "{asm}");
++    assert!(!asm.contains("OpBitcast %_ptr_"), "{asm}");
++}
++
++/// The same store/load round-trip the failing fragment shaders perform, end to end: widen a
++/// `<3 x float>` (poison fourth lane), store `<4 x float>` through the array's base alias, read it
++/// back with the `<4 x float>` load + prefix shuffle, and consume the narrowed vector. Translation
++/// must succeed and produce spirv-val-clean SPIR-V.
++#[test]
++fn native_array3_prefix_vector4_store_load_roundtrip_validates() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define void @sample_transition(ptr addrspace(1) %out, ptr addrspace(1) %srcbuf) {
++entry:
++  %buf = alloca [8 x <3 x float>], align 16
++  %src = load <3 x float>, ptr addrspace(1) %srcbuf, align 4
++  %wide = shufflevector <3 x float> %src, <3 x float> undef, <4 x i32> <i32 0, i32 1, i32 2, i32 poison>
++  %alias = bitcast ptr %buf to ptr
++  store <4 x float> %wide, ptr %alias, align 16
++  %read = load <4 x float>, ptr %alias, align 16
++  %value = shufflevector <4 x float> %read, <4 x float> undef, <3 x i32> <i32 0, i32 1, i32 2>
++  store <3 x float> %value, ptr addrspace(1) %out, align 4
++  ret void
++}
++
++!air.kernel = !{!0}
++!0 = !{ptr @sample_transition, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 12, !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float3", !"air.arg_name", !"out"}
++!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 12, !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float3", !"air.arg_name", !"src"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_array3_prefix_roundtrip_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
++    let asm = disassemble(&spv).expect("disassemble");
++    assert!(!asm.contains("non-bitcastable"), "{asm}");
++    assert!(asm.contains("OpLoad"), "{asm}");
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++}
++
++/// The rewrite must not fire when the load's fourth lane is observed anywhere: the `<4 x float>`
++/// read-back keeps its (unsupported) non-bitcastable status instead of silently narrowing.
++#[test]
++fn native_array3_prefix_vector4_load_fourth_lane_use_keeps_rejection() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define float @fourth_lane_read() {
++entry:
++  %buf = alloca [8 x <3 x float>], align 16
++  %alias = bitcast ptr %buf to ptr
++  %wide = load <4 x float>, ptr %alias, align 16
++  %narrow = shufflevector <4 x float> %wide, <4 x float> undef, <3 x i32> <i32 0, i32 1, i32 2>
++  %lane3 = extractelement <4 x float> %wide, i32 3
++  %first = extractelement <3 x float> %narrow, i32 0
++  %sum = fadd float %lane3, %first
++  ret float %sum
++}
++"#;
++    let error = emit_vulkan_spirv(ll)
++        .expect_err("a fourth-lane consumer must keep the load unsupported")
++        .to_string();
++    assert!(
++        error.contains("non-bitcastable pointee Array(Vector(Float, 3), 8) to Vector(Float, 4)"),
++        "{error}"
++    );
++}
++
++/// A single-use shuffle whose mask is not the prefix `[0, 1, 2]` still observes lane 3, so the
++/// rewrite must not narrow that load either.
++#[test]
++fn native_array3_prefix_vector4_load_nonprefix_shuffle_keeps_rejection() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <3 x float> @nonprefix_shuffle() {
++entry:
++  %buf = alloca [8 x <3 x float>], align 16
++  %alias = bitcast ptr %buf to ptr
++  %wide = load <4 x float>, ptr %alias, align 16
++  %shifted = shufflevector <4 x float> %wide, <4 x float> undef, <3 x i32> <i32 1, i32 2, i32 3>
++  ret <3 x float> %shifted
++}
++"#;
++    let error = emit_vulkan_spirv(ll)
++        .expect_err("a non-prefix mask must keep the load unsupported")
++        .to_string();
++    assert!(
++        error.contains("non-bitcastable pointee Array(Vector(Float, 3), 8) to Vector(Float, 4)"),
++        "{error}"
++    );
++}
++
++/// Ordinary array-of-`<3 x float>` loads keep their existing shape: the leading-vector aggregate
++/// path emits an access chain to element 0 and one direct `OpLoad`, with no reinterpret noise.
++#[test]
++fn native_array3_vector3_load_unchanged() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++define <3 x float> @load_leading_float3() {
++entry:
++  %buf = alloca [8 x <3 x float>], align 16
++  %v = load <3 x float>, ptr %buf, align 16
++  ret <3 x float> %v
++}
++"#;
++    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
++    assert!(!asm.contains("non-bitcastable"), "{asm}");
++    assert_eq!(asm.matches("OpLoad").count(), 1, "{asm}");
++    assert!(asm.contains("OpTypeVector %3 3"), "{asm}");
++    assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
++    assert!(!asm.contains("OpBitcast"), "{asm}");
++}
++
+ #[test]
+ fn native_scalar_array_load_rebuilds_same_shape_vector() {
+     let ll = r#"
 diff --git a/src/native/tests/intrinsics.rs b/src/native/tests/intrinsics.rs
 index 9522635..22e0eff 100644
 --- a/src/native/tests/intrinsics.rs
@@ -140,6 +313,257 @@ index e97db0f..db379cc 100644
      }
      let _ = std::fs::remove_dir_all(tmp);
  }
+diff --git a/src/native/tir/mod.rs b/src/native/tir/mod.rs
+index 4dba9e8..e9322d7 100644
+--- a/src/native/tir/mod.rs
++++ b/src/native/tir/mod.rs
+@@ -128,6 +128,246 @@ pub(in crate::native) fn canonicalize_single_predecessor_phis(
+     }
+ }
+ 
++/// Rewrite a `<4 x T>` load that reads back the leading `<3 x T>` element of an
++/// `Array(Vector(T, 3), N)` allocation, when the load's only consumer is a `[0, 1, 2]` shuffle.
++///
++/// Metal codegen stores a `<3 x T>` vector by widening it to `<4 x T>` with a poison fourth lane,
++/// and reads it back as a `<4 x T>` load immediately narrowed by a `shufflevector` selecting lanes
++/// `[0, 1, 2]`. The pointer's recorded logical pointee stays the declared `Array(Vector(T, 3), N)`,
++/// so the emitter cannot reinterpret the `<4 x T>` result against that pointee and translation
++/// fails ("cannot reinterpret load ... non-bitcastable pointee").
++///
++/// The rewrite replaces the load with a `<3 x T>` load at the same pointer (same result name, same
++/// alignment), removes the now-use-free shuffle, and redirects every use of the shuffle's result to
++/// the load through the typed carrier rename. Lanes 0-2 are the same values at the same address;
++/// the only lane dropped is the poison one the widening introduced, which the shuffle already
++/// discards. The rewritten `<3 x T>` load from the array pointee then flows through the existing
++/// leading-vector aggregate load path.
++///
++/// Preconditions, all verified on the typed carriers:
++/// * the load's pointer is a local that resolves through identity pointer bitcasts ONLY to the
++///   `alloca` of `Array(Vector(T, 3), N)` with the load's element type `T` matching exactly and
++///   `N >= 1` — the declared layout, never an inferred view;
++/// * the parsed load payload is present and agrees with the carrier's resolved result type and
++///   alignment — a `volatile`/`atomic` spelling puts its keyword before the loaded type, which
++///   breaks `parse_load`, so a present consistent payload proves the load is neither;
++/// * the load's result has exactly ONE use, the `shufflevector` whose operand 0 is the load result
++///   (mask indices below 4 select operand-0 lanes only, so the second operand is irrelevant), with
++///   result type `<3 x T>`, appearing after the load in the finalized block order.
++///
++/// Any other shape — a fourth-lane consumer, a non-`[0, 1, 2]` mask, a non-alloca pointer
++/// provenance, mismatched element types — keeps its previous fail-visible status. A module with no
++/// `<4 x T>` load returns before allocating: this pointee/result combination has no emission path
++/// today, so the rewrite is inert on every already-translating module.
++pub(in crate::native) fn rewrite_array3_prefix_vector4_loads(
++    blocks: &mut [crate::native::cfg::BodyBlock],
++) {
++    let has_vector4_load = blocks.iter().any(|block| {
++        block.typed.as_ref().is_some_and(|typed| {
++            typed.insts.iter().any(|inst| {
++                inst.opcode == TirOpcode::Load
++                    && matches!(inst.result_ty, Some(LlType::Vector(_, 4)))
++            })
++        })
++    });
++    if !has_vector4_load {
++        return;
++    }
++
++    let mut alloca_pointees: HashMap<String, LlType> = HashMap::new();
++    let mut identity_aliases: HashMap<String, String> = HashMap::new();
++    let mut use_counts: HashMap<String, u32> = HashMap::new();
++    // Prefix-shuffle candidates keyed by their operand-0 SSA name: (block, instruction, result).
++    let mut prefix_shuffles: HashMap<String, (usize, usize, String)> = HashMap::new();
++    for (block_index, block) in blocks.iter().enumerate() {
++        let Some(typed) = block.typed.as_ref() else {
++            continue;
++        };
++        for (inst_index, inst) in typed.insts.iter().enumerate() {
++            if let TirInstData::Alloca(Some(pointee)) = &inst.data.payload {
++                if let Some(result) = &inst.result {
++                    alloca_pointees.insert(result.clone(), pointee.clone());
++                }
++            }
++            if let Some((result, base)) = inst.identity_ptr_bitcast() {
++                identity_aliases.insert(result.to_string(), base.to_string());
++            }
++            if inst.opcode == TirOpcode::ShuffleVector
++                && inst
++                    .shuffle_mask()
++                    .as_ref()
++                    .is_some_and(|(lanes, mask)| *lanes == 3 && mask.as_slice() == [0, 1, 2])
++            {
++                let operand0 = inst.operands.first().and_then(|operand| match operand {
++                    TirOperand::Value { name, .. } => Some(name.clone()),
++                    _ => None,
++                });
++                if let (Some(result), Some(operand0)) = (&inst.result, operand0) {
++                    prefix_shuffles.insert(operand0, (block_index, inst_index, result.clone()));
++                }
++            }
++            inst.visit_uses(|name| {
++                *use_counts.entry(name.to_string()).or_default() += 1;
++            });
++        }
++        // Terminators are uses too — the same set `prune_unused_geps` counts.
++        match &typed.terminator {
++            TirTerminator::BrCond { cond, .. } => {
++                *use_counts.entry(cond.clone()).or_default() += 1;
++            }
++            TirTerminator::Switch { selector, .. } => {
++                *use_counts.entry(selector.clone()).or_default() += 1;
++            }
++            TirTerminator::Ret(Some(value)) => {
++                *use_counts.entry(value.clone()).or_default() += 1;
++            }
++            _ => {}
++        }
++    }
++
++    struct LoadRewrite {
++        load_block: usize,
++        load_inst: usize,
++        shuffle_block: usize,
++        shuffle_inst: usize,
++        vector3_ty: LlType,
++        shuffle_result: String,
++        load_result: String,
++    }
++    let mut rewrites = Vec::new();
++    for (load_block, block) in blocks.iter().enumerate() {
++        let Some(typed) = block.typed.as_ref() else {
++            continue;
++        };
++        for (load_inst, inst) in typed.insts.iter().enumerate() {
++            if inst.opcode != TirOpcode::Load {
++                continue;
++            }
++            let Some(load_result) = &inst.result else {
++                continue;
++            };
++            let (Some(result_ty), Some(load)) = (&inst.result_ty, inst.load().as_deref()) else {
++                continue;
++            };
++            let LlType::Vector(elem, 4) = result_ty else {
++                continue;
++            };
++            let elem = (**elem).clone();
++            if load.result_ty != *result_ty || load.align != inst.mem_align() {
++                continue;
++            }
++            let LlValue::Local(ptr_name) = &load.ptr.value else {
++                continue;
++            };
++            if !inst.operands.first().is_some_and(
++                |operand| matches!(operand, TirOperand::Value { name, .. } if name == ptr_name),
++            ) {
++                continue;
++            }
++            // The declared array-of-vector3 layout: resolve the pointer through identity bitcasts
++            // only, down to the `alloca` whose allocated type IS that layout.
++            let mut root = ptr_name.clone();
++            let mut visited = HashSet::new();
++            while visited.insert(root.clone()) {
++                match identity_aliases.get(&root) {
++                    Some(base) => root = base.clone(),
++                    None => break,
++                }
++            }
++            let Some(LlType::Array(element, count)) = alloca_pointees.get(&root) else {
++                continue;
++            };
++            if *count == 0 {
++                continue;
++            }
++            let LlType::Vector(element_lanes, 3) = &**element else {
++                continue;
++            };
++            if **element_lanes != elem {
++                continue;
++            }
++            // Exactly one use, and that use is the prefix shuffle.
++            if use_counts.get(load_result) != Some(&1) {
++                continue;
++            }
++            let Some((shuffle_block, shuffle_inst, shuffle_result)) =
++                prefix_shuffles.get(load_result.as_str())
++            else {
++                continue;
++            };
++            let (shuffle_block, shuffle_inst, shuffle_result) =
++                (*shuffle_block, *shuffle_inst, shuffle_result.clone());
++            let shuffle_result_ty = blocks
++                .get(shuffle_block)
++                .and_then(|block| block.typed.as_ref())
++                .and_then(|typed| typed.insts.get(shuffle_inst))
++                .and_then(|inst| inst.result_ty.clone());
++            if shuffle_result_ty != Some(LlType::Vector(Box::new(elem.clone()), 3)) {
++                continue;
++            }
++            // Def-before-use in the finalized block order: the load precedes its single consumer.
++            if shuffle_block < load_block
++                || (shuffle_block == load_block && shuffle_inst < load_inst)
++            {
++                continue;
++            }
++            rewrites.push(LoadRewrite {
++                load_block,
++                load_inst,
++                shuffle_block,
++                shuffle_inst,
++                vector3_ty: LlType::Vector(Box::new(elem), 3),
++                shuffle_result,
++                load_result: load_result.clone(),
++            });
++        }
++    }
++    if rewrites.is_empty() {
++        return;
++    }
++
++    let mut shuffle_removals: HashMap<usize, Vec<usize>> = HashMap::new();
++    let mut renames: HashMap<String, String> = HashMap::new();
++    for rewrite in &rewrites {
++        let vector3_ty = rewrite.vector3_ty.clone();
++        let load_result = rewrite.load_result.clone();
++        if let Some(inst) = blocks
++            .get_mut(rewrite.load_block)
++            .and_then(|block| block.typed_mut())
++            .and_then(|typed| typed.insts.get_mut(rewrite.load_inst))
++        {
++            inst.result_ty = Some(vector3_ty.clone());
++            if let TirInstData::Memory { load, .. } = &mut inst.data.payload {
++                if let Some(load) = load.as_mut() {
++                    load.result_ty = vector3_ty;
++                }
++            }
++        }
++        shuffle_removals
++            .entry(rewrite.shuffle_block)
++            .or_default()
++            .push(rewrite.shuffle_inst);
++        renames.insert(rewrite.shuffle_result.clone(), load_result);
++    }
++    for (block_index, mut indices) in shuffle_removals {
++        indices.sort_unstable();
++        indices.dedup();
++        if let Some(typed) = blocks
++            .get_mut(block_index)
++            .and_then(|block| block.typed_mut())
++        {
++            for index in indices.into_iter().rev() {
++                typed.insts.remove(index);
++            }
++        }
++    }
++    for block in blocks.iter_mut() {
++        if let Some(typed) = block.typed_mut() {
++            typed.rename(&renames);
++        }
++    }
++}
++
+ /// Fold literal conditional branches on the owned typed CFG, remove blocks made unreachable by
+ /// those branches, and repair the surviving phi predecessor sets before merge planning. This is the
+ /// source-graph counterpart of late SPIR-V constant-branch pruning: planners and the emitter never
 diff --git a/src/passes/air_calls/images/sample.rs b/src/passes/air_calls/images/sample.rs
 index c87ced7..3ff66e6 100644
 --- a/src/passes/air_calls/images/sample.rs

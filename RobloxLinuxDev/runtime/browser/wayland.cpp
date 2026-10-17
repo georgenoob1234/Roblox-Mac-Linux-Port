@@ -229,6 +229,12 @@ static void apply_capture(const char *reason) {
         zwp_locked_pointer_v1_destroy(locked_pointer);locked_pointer=nullptr;
         zwp_relative_pointer_v1_destroy(relative_pointer);relative_pointer=nullptr;
         queue_capture_state(false);update_capture_cursor();SDL_CaptureMouse(false);
+        // KWin releases a persistent pointer constraint at the constrained
+        // surface's next commit; during gameplay only the SDL subsurface
+        // commits, so commit the parent here or the compositor lock
+        // outlives the destroy until the next focus change.
+        auto release_surface=gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window));
+        if(release_surface)wl_surface_commit(release_surface);
     }
     wl_display_flush(display);
     if(pointer_trace())g_printerr("POINTER helper %s requested=%d focused=%d pending=%d actual=%d\n",

@@ -35,6 +35,9 @@ jobs:
       - name: Run dependency sync regression tests
         run: python3 -B RobloxLinuxDev/runtime/package/check-dependency-sync.py
 
+      - name: Run pointer unlock regression tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-pointer-unlock.py
+
   # ---------------------------------------------------------------------------
   # Full build — self-hosted CachyOS VM, gated by repository variable.
   #

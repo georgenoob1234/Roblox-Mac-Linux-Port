@@ -192,6 +192,7 @@ def test_state_aware_menu_and_desktop_choice() -> None:
             installer.print_title(animated=False)
         title = output.getvalue()
         assert "███████████" in title and "▒▒███▒▒▒▒▒███" in title
+        assert "M A C   L I N U X   P O R T" in title
         assert len(title.splitlines()) == len(installer.TITLE_LINES)
         assert "Safe installer" not in title and "updater" not in title
         fresh = installer.InstallationState(target=target, manifest=None, latest_tag="v2.0.0")

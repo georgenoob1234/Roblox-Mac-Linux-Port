@@ -1983,6 +1983,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
     p = sub.add_parser("release-status", help="Query the canonical latest release metadata")
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("release-version", help="Print the installed release version")
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
     p = sub.add_parser("desktop", help="Manage the user-local .desktop launcher and roblox:// URI handler")

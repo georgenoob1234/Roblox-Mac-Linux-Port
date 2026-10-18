@@ -14,6 +14,7 @@ installer = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 sys.modules[spec.name] = installer
 spec.loader.exec_module(installer)
+assert installer.build_parser().parse_args(["release-status", "--prefix", "/tmp/port", "--json"]).json is True
 
 
 def release(root: Path, version: str) -> Path:

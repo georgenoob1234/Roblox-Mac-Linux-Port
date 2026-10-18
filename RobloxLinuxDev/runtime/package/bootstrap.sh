@@ -376,20 +376,37 @@ do_port_update() {
         return 1
     fi
     event checking 5 'Checking the latest port release' 0 0 true
-    if ! timeout --foreground --kill-after=5s "${ROBLOX_MAC_PORT_UPDATE_TIMEOUT:-30m}" sh -c \
-        'exec "$@"' sh env ROBLOX_MAC_PROGRESS_FD=8 \
-            ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
-            ROBLOX_MAC_LOCK_HELD=1 \
-            python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop; then
-        if cancelled; then
+    # The installer owns the cancellation decision. It polls the marker during
+    # its cancellable phases, stops honouring it at the commit boundary, and
+    # reports an accepted cancellation with its own terminal status (125), so
+    # this wrapper never guesses from the marker file -- a late request, or a
+    # marker left over from an earlier operation, must not change the result
+    # of an update that actually committed.
+    #
+    # It is deliberately not wrapped in `timeout`: a signal during the
+    # non-cancellable commit phase is exactly what leaves run.sh or
+    # installer.py missing. The installer bounds its own cancellable phases
+    # instead (network socket timeouts plus ROBLOX_MAC_PORT_UPDATE_TIMEOUT,
+    # default 30m, applied only before the commit boundary), and an
+    # interruption of the commit itself is repaired by the launcher's
+    # recovery entry point on the next start.
+    env ROBLOX_MAC_PROGRESS_FD=8 \
+        ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
+        ROBLOX_MAC_LOCK_HELD=1 \
+        python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop
+    _port_update_status=$?
+    case "$_port_update_status" in
+        0)
+            event update 100 'Port update complete' 0 0 false
+            return 0;;
+        125)
             event cancelled 0 'Port update cancelled; the current release was kept' 0 0 false
-            return 125
-        fi
-        event failed 0 'Port update failed; the current release was kept' 0 0 false
-        return 1
-    fi
-    event update 100 'Port update complete' 0 0 false
-    return 0
+            say 'Port update cancelled; the current release was kept.'
+            return 125;;
+    esac
+    event failed 0 'Port update failed; the current release was kept' 0 0 false
+    say 'Port update failed; the current release was kept.'
+    return 1
 }
 
 status_json() { python3 "$HELPER" status "$DATA" "$HERE/RobloxVersion"; }
@@ -453,7 +470,6 @@ case "$command" in
         fi
         start_progress
         do_port_update; result=$?; finish_progress; exec 9>&-
-        [ "$UI_CANCELLED" -eq 1 ] && result=125
         exit "$result";;
     port-update-settings)
         [ "$#" -eq 1 ] || { echo 'Usage: run.sh port-update-settings' >&2; exit 2; }

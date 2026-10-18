@@ -2,6 +2,12 @@
 # Terminal launcher with diagnostics. --diagnose checks the system without starting Roblox.
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# This read-only query must run before launch-only TMPDIR, mount, alias, and
+# lock setup. It is used by Settings refreshes and must leave no temp state.
+if [ "${1:-}" = port-version ]; then
+    [ "$#" -eq 1 ] || { echo 'Usage: run.sh port-version' >&2; exit 2; }
+    exec python3 "$HERE/bootstrap.py" port-version "$HERE"
+fi
 # AppImageLauncher can relocate the image or run a memfd whose parent is /.
 # Keep the original image, and keep the AppImage runtime's mounts outside
 # DO_NOT_SHARE: a FUSE mount below it makes the launch-time in-namespace
@@ -9,6 +15,45 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 umask 077
 mkdir -p "$HERE/DO_NOT_SHARE/tmp"
 chmod 700 "$HERE/DO_NOT_SHARE"
+# Repair an interrupted port-file transaction before any payload file is used.
+# The transaction, its journal and its backups live next to the install
+# directory, and its recovery entry point is kept outside the payload, so this
+# still works when the interruption left run.sh or installer.py itself
+# missing. Recovery runs under the instance lock: the port files are never
+# rewritten under a running Roblox, and a double launch still reports "already
+# running" and leaves the repair to a later launch.
+port_transaction_pending() {
+    for _txn in "$HERE"/../.roblox-mac-port-txn-*; do
+        if [ -d "$_txn" ]; then return 0; fi
+    done
+    return 1
+}
+run_port_recovery() {
+    _state=${XDG_STATE_HOME:-${HOME:-}/.local/state}
+    _helper=$_state/roblox-mac-linux-port/recovery/recover.sh
+    if [ -x "$_helper" ]; then
+        ROBLOX_MAC_LOCK_HELD=1 "$_helper" "$HERE"
+    elif [ -f "$HERE/installer.py" ]; then
+        ROBLOX_MAC_LOCK_HELD=1 python3 "$HERE/installer.py" recover --prefix "$HERE"
+    else
+        echo 'roblox: an interrupted port update must be repaired before launching, but its recovery helper is missing. Reinstall the port.' >&2
+        return 1
+    fi
+}
+recover_port_transaction() {
+    port_transaction_pending || return 0
+    _port_recovery_status=0
+    (
+        exec 9>"$HERE/DO_NOT_SHARE/instance.lock" || exit 3
+        flock -n -E 73 9 || exit 4
+        run_port_recovery
+    ) || _port_recovery_status=$?
+    case "$_port_recovery_status" in
+        0|4) return 0;;
+    esac
+    return 1
+}
+recover_port_transaction || exit 1
 export APPIMAGELAUNCHER_DISABLE=1 _FORCE_HEADLESS=1
 export TARGET_APPIMAGE=$HERE/RobloxLinux.AppImage
 [ -n "${APPIMAGE_TARGET_DIR:-}" ] && [ -d "${APPIMAGE_TARGET_DIR:-}" ] || unset APPIMAGE_TARGET_DIR
@@ -229,8 +274,6 @@ case "${1:-}" in
         "$HERE/RobloxLinux.AppImage" "$@"
         _status=$?
         exit $_status;;
-    port-version)
-        exec python3 "$HERE/bootstrap.py" port-version "$HERE";;
 esac
 [ -t 2 ] || export ROBLOX_MAC_NO_TERMINAL=1
 "$HERE/bootstrap.sh" "$@"

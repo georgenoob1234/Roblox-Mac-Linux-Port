@@ -17,11 +17,14 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -83,6 +86,15 @@ PROTECTED_NAMES = {"DO_NOT_SHARE", "RobloxVersion", ".update-work"}
 USER_CONFIG_FILES = {"FFlags.json"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MAX_RELEASE_BYTES = 4 * 1024 * 1024 * 1024
+RECOVERY_DIR_NAME = "recovery"
+# Documented terminal status for a cancellation that was accepted before the
+# commit boundary. The launcher relies on this status (and never on a marker
+# file) to decide whether an operation reported cancellation.
+EXIT_CANCELLED = 125
+# Cancellable phases poll for cancellation on a timer so a stalled download or
+# staging step cannot pin an update indefinitely without an answer.
+PORT_UPDATE_POLL_SECONDS = 0.5
+DEFAULT_PORT_UPDATE_TIMEOUT_SECONDS = 1800.0
 
 
 def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
@@ -168,6 +180,15 @@ def fail(message: str) -> "NoReturn":
 
 class InstallerError(RuntimeError):
     pass
+
+
+class CancelledError(InstallerError):
+    """A cancellation accepted before the transaction touched any file.
+
+    Raised with its own terminal status (EXIT_CANCELLED) so the launcher and
+    the GTK UI never have to infer "cancelled" from a marker file, which a
+    late request or a previous operation may have left behind.
+    """
 
 
 @contextlib.contextmanager
@@ -870,6 +891,157 @@ def check_local_space(source: Path, target: Path, names: list[str], dry_run: boo
         fail(f"Not enough free space beside the install location. Need about {required // (1024*1024)} MiB for staging; only {free // (1024*1024)} MiB is free.")
 
 
+_PORT_UPDATE_TIMEOUT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$")
+_PORT_UPDATE_TIMEOUT_FACTORS = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def port_update_budget_seconds() -> float:
+    """Total time allowed for the cancellable phases of a port update.
+
+    Mirrors the shell's historical ROBLOX_MAC_PORT_UPDATE_TIMEOUT (default 30
+    minutes, optional s/m/h suffix). It bounds only the work performed before
+    the commit boundary; the transaction itself is never interrupted by it.
+    """
+    raw = os.environ.get("ROBLOX_MAC_PORT_UPDATE_TIMEOUT", "")
+    match = _PORT_UPDATE_TIMEOUT_RE.match(raw) if raw else None
+    if not match:
+        return DEFAULT_PORT_UPDATE_TIMEOUT_SECONDS
+    return max(0.0, float(match.group(1)) * _PORT_UPDATE_TIMEOUT_FACTORS[match.group(2).lower()])
+
+
+class _PreCommitWatchdog:
+    """Answer a stalled cancellable phase without ever touching the commit.
+
+    Replacing the port files in place is not interruptible: a signal or a kill
+    during that commit phase is exactly what leaves run.sh or installer.py
+    missing. The timer is therefore armed for the cancellable phases only --
+    it polls the cancellation marker so a stalled download still reacts to
+    Cancel, fails the operation if no progress is possible within the budget,
+    and is disarmed at the commit boundary.
+    """
+
+    def __init__(self, budget_seconds: float) -> None:
+        self.budget = budget_seconds
+        self.deadline = 0.0
+        self.armed = False
+        self._previous_handler: Any = None
+
+    def _interval(self) -> float:
+        if self.budget <= 0:
+            return 0.001
+        return max(0.001, min(PORT_UPDATE_POLL_SECONDS, self.budget / 4.0))
+
+    def _tick(self, _signum: int, _frame: Any) -> None:
+        # Cancellation is checked first so an accepted request keeps its own
+        # terminal status instead of being reported as a timeout failure.
+        if cancellation_requested():
+            raise CancelledError("Port update cancelled.")
+        if time.monotonic() >= self.deadline:
+            raise InstallerError(
+                "The port update stopped making progress and was aborted before changing any files."
+            )
+
+    def arm(self) -> None:
+        if self.armed or not hasattr(signal, "setitimer"):
+            return
+        if threading.current_thread() is not threading.main_thread():
+            return
+        try:
+            self._previous_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, self._tick)
+            self.deadline = time.monotonic() + self.budget
+            signal.setitimer(signal.ITIMER_REAL, self._interval(), self._interval())
+        except (ValueError, OSError, AttributeError):
+            return
+        self.armed = True
+
+    def disarm(self) -> None:
+        if not self.armed:
+            return
+        self.armed = False
+        with contextlib.suppress(ValueError, OSError, AttributeError):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        with contextlib.suppress(ValueError, OSError, TypeError):
+            if self._previous_handler is not None:
+                signal.signal(signal.SIGALRM, self._previous_handler)
+
+
+_active_watchdog: "_PreCommitWatchdog | None" = None
+
+
+def arm_pre_commit_watchdog() -> None:
+    global _active_watchdog
+    if _active_watchdog is not None:
+        return
+    watchdog = _PreCommitWatchdog(port_update_budget_seconds())
+    watchdog.arm()
+    _active_watchdog = watchdog
+
+
+def disarm_pre_commit_watchdog() -> None:
+    global _active_watchdog
+    watchdog, _active_watchdog = _active_watchdog, None
+    if watchdog is not None:
+        watchdog.disarm()
+
+
+def recovery_helper_dir() -> Path:
+    return state_root() / RECOVERY_DIR_NAME
+
+
+def recovery_helper_script() -> Path:
+    return recovery_helper_dir() / "recover.sh"
+
+
+def recovery_helper_installer() -> Path:
+    return recovery_helper_dir() / "installer.py"
+
+
+def _shell_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _recovery_wrapper(target: Path) -> bytes:
+    return (
+        "#!/bin/sh\n"
+        "# Standalone recovery entry point for an interrupted port update.\n"
+        "# It lives outside the install directory so it still works when the\n"
+        "# interruption left installer.py or run.sh itself missing. Generated\n"
+        "# by installer.py; do not edit. Usage: recover.sh [PREFIX]\n"
+        "set -eu\n"
+        "HERE=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
+        f"prefix=${{1:-{_shell_single_quote(str(target))}}}\n"
+        "exec python3 \"$HERE/installer.py\" recover --prefix \"$prefix\"\n"
+    ).encode("utf-8")
+
+
+def publish_recovery_helper(target: Path) -> None:
+    """Keep a payload-independent recovery entry point outside the install dir.
+
+    A port update replaces installer.py and run.sh in place, so an interrupted
+    transaction can leave the install directory without a usable launcher or
+    installer. This copy of the running installer is written to the installer
+    state directory before the first destination file changes, and is
+    refreshed on every install or update. It reuses the journal, the backups
+    and the recovery code of the normal flow; it is not a second transaction
+    format.
+    """
+    running = Path(__file__).resolve()
+    if running.is_symlink() or not running.is_file():
+        fail("Cannot safely locate the running installer script.")
+    directory = recovery_helper_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = lstat_or_none(directory)
+    if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        fail(f"Recovery helper directory is not a real directory: {directory}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        fail(f"Recovery helper directory is owned by another user: {directory}")
+    with contextlib.suppress(OSError):
+        directory.chmod(0o700)
+    atomic_write(recovery_helper_installer(), running.read_bytes(), 0o755)
+    atomic_write(recovery_helper_script(), _recovery_wrapper(target), 0o755)
+
+
 def run_install_or_update(target: Path, source: Path, release_tag: str | None,
                           dry_run: bool = False, migrate_data: bool | None = None,
                           force_desktop: bool = False, yes: bool = False,
@@ -883,6 +1055,7 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
     if not dry_run:
+        publish_recovery_helper(target)
         recover_transactions(target)
     existing_manifest = load_manifest(target) if check_target_root(target) else None
     if existing_manifest is None and target.exists():
@@ -943,7 +1116,12 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             target_created = True
             fsync_dir(target.parent)
         if cancellation_requested():
-            fail("Port update cancelled.")
+            raise CancelledError("Port update cancelled.")
+        # Commit boundary: from here the transaction is not interruptible, so
+        # stop the poll/deadline timer before the first destination file is
+        # replaced. A late cancellation request is ignored and the operation
+        # reports its real outcome instead.
+        disarm_pre_commit_watchdog()
         progress_event("installing", 94, "Installing the verified port files", 0, 0, False)
         apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
     except Exception:
@@ -955,6 +1133,8 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             with contextlib.suppress(OSError):
                 target.rmdir()
         raise
+    finally:
+        disarm_pre_commit_watchdog()
     good(f"Application files installed at {target}")
     progress_event("complete", 100, "Port update complete", 0, 0, False)
 
@@ -1581,7 +1761,7 @@ def download_file(url: str, destination: Path, expected_size: int = 0) -> None:
             last_report = 0
             while True:
                 if cancellation_requested():
-                    fail("Port update cancelled.")
+                    raise CancelledError("Port update cancelled.")
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
@@ -1608,7 +1788,7 @@ def download_file(url: str, destination: Path, expected_size: int = 0) -> None:
 
 def extract_release_archive(archive_path: Path, destination: Path) -> Path:
     if cancellation_requested():
-        fail("Port update cancelled.")
+        raise CancelledError("Port update cancelled.")
     progress_event("staging", 84, "Staging the verified release", 0, 0, True)
     destination.mkdir(parents=True, exist_ok=True)
     try:
@@ -1617,7 +1797,7 @@ def extract_release_archive(archive_path: Path, destination: Path) -> Path:
             root_candidates: set[str] = set()
             for member in tar.getmembers():
                 if cancellation_requested():
-                    fail("Port update cancelled.")
+                    raise CancelledError("Port update cancelled.")
                 raw = member.name
                 path = PurePosixPath(raw)
                 if path.is_absolute() or ".." in path.parts or not path.parts:
@@ -1663,7 +1843,7 @@ def extract_release_archive(archive_path: Path, destination: Path) -> Path:
 def get_source_for_action(action: str, target: Path, source_arg: str | None,
                           dry_run: bool = False) -> tuple[Path | None, str | None, tempfile.TemporaryDirectory | None]:
     if cancellation_requested():
-        fail("Port update cancelled.")
+        raise CancelledError("Port update cancelled.")
     if source_arg:
         source = check_source_root(source_arg, target)
         safe_payload_names(source)
@@ -1986,6 +2166,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("release-version", help="Print the installed release version")
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
+    p = sub.add_parser("recover", help="Recover an interrupted application-file transaction")
+    p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
     p = sub.add_parser("desktop", help="Manage the user-local .desktop launcher and roblox:// URI handler")
     p.add_argument("action", choices=("install", "uninstall"))
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
@@ -2016,6 +2198,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "release-version":
             release_version(target)
+            return 0
+        if args.command == "recover":
+            assert_not_running(target)
+            recover_transactions(target)
             return 0
         if args.command == "desktop":
             if args.action == "install":
@@ -2070,17 +2256,21 @@ def main(argv: list[str] | None = None) -> int:
             check_platform()
             if not args.dry_run:
                 target.parent.mkdir(parents=True, exist_ok=True)
-            source, tag, temp_obj = get_source_for_action(args.command, target, args.source, args.dry_run)
-            if args.dry_run and source is None:
-                print(f"Would update {APP_NAME} to {tag} at {target}; no download or file changes performed.")
-                return 0
+            arm_pre_commit_watchdog()
             try:
-                run_install_or_update(target, source, tag, dry_run=args.dry_run, yes=args.yes,
-                                      force_desktop=args.force_desktop, confirmed=confirmed,
-                                      install_desktop_integration=not args.no_desktop)
+                source, tag, temp_obj = get_source_for_action(args.command, target, args.source, args.dry_run)
+                if args.dry_run and source is None:
+                    print(f"Would update {APP_NAME} to {tag} at {target}; no download or file changes performed.")
+                    return 0
+                try:
+                    run_install_or_update(target, source, tag, dry_run=args.dry_run, yes=args.yes,
+                                          force_desktop=args.force_desktop, confirmed=confirmed,
+                                          install_desktop_integration=not args.no_desktop)
+                finally:
+                    if temp_obj:
+                        temp_obj.cleanup()
             finally:
-                if temp_obj:
-                    temp_obj.cleanup()
+                disarm_pre_commit_watchdog()
             return 0
     return 0
 
@@ -2088,6 +2278,9 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except CancelledError as exc:
+        warn(str(exc))
+        sys.exit(EXIT_CANCELLED)
     except InstallerError as exc:
         warn(str(exc))
         sys.exit(1)

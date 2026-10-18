@@ -42,6 +42,23 @@ files.
 python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" update --yes
 python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" status
 python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" repair --yes
+python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" recover
+```
+
+`recover` only replays or rolls back an interrupted file transaction; it does
+not download a release or modify `DO_NOT_SHARE`/`RobloxVersion`.
+
+Because an update replaces `installer.py` and `run.sh` themselves, the
+installer also keeps a standalone recovery entry point outside the install
+directory, at `$XDG_STATE_HOME/roblox-mac-linux-port/recovery/recover.sh` (or
+`~/.local/state/roblox-mac-linux-port/recovery/recover.sh`). It is refreshed
+before every transaction and still works when `run.sh` or `installer.py` was
+interrupted mid-replacement; `run.sh` calls it automatically before using any
+other file. Run it directly if the launcher itself was interrupted:
+
+```sh
+"$HOME/.local/state/roblox-mac-linux-port/recovery/recover.sh" \
+  "$HOME/.local/opt/roblox-mac-linux-port"
 ```
 
 Updates download the latest official GitHub release and verify its published
@@ -60,6 +77,15 @@ Updates stage and hash the payload before an atomic switch. If an operation is
 interrupted, the next install, update, repair, or uninstall finds the journal,
 rolls back safely, and keeps evidence when recovery is incomplete. Close Roblox
 before changing the installation.
+
+Cancellation is decided by the installer, not by the launcher. It accepts a
+cancel request (the `Cancel` button in the progress window, written to a marker
+file) during download and staging, stops honouring one once the commit begins,
+and reports an accepted cancellation with exit status 125. A late or stale
+request therefore cannot turn a committed update into a reported cancellation,
+and the launcher never kills the installer during the non-cancellable commit
+phase. The cancellable phases are bounded instead (network socket timeouts plus
+`ROBLOX_MAC_PORT_UPDATE_TIMEOUT`, default 30m).
 
 `FFlags.json` is user configuration. Its contents survive updates and
 uninstallation; remove it yourself before an update only when you intentionally

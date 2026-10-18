@@ -42,7 +42,7 @@ typedef struct {
     char *root, *cancel_file;
     GtkWidget *window, *phase, *status, *progress, *cancel;
     guint show_id, close_id;
-    gboolean done, cancellable, cancelled, closed;
+    gboolean done, cancellable, cancelled, closed, authoritative;
     int result;
 } ProgressState;
 
@@ -133,7 +133,7 @@ static void progress_request_cancel(ProgressState *state, GtkWidget *button) {
     state->cancelled = TRUE; state->cancellable = FALSE;
     g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL);
     if (button) { gtk_button_set_label(GTK_BUTTON(button), "Cancelling…"); gtk_widget_set_sensitive(button, FALSE); }
-    label_text(state->status, "Cancelling; keeping the installed client…");
+    label_text(state->status, "Cancelling…");
 }
 static void progress_cancel(GtkButton *button, gpointer data) { progress_request_cancel(data, GTK_WIDGET(button)); }
 static gboolean progress_delete(GtkWidget *window, GdkEvent *event, gpointer data) {
@@ -236,6 +236,9 @@ static void progress_event(ProgressState *state, const char *line) {
     if (!g_strcmp0(phase, "launching") || !g_strcmp0(phase, "update") ||
         !g_strcmp0(phase, "cancelled") || !g_strcmp0(phase, "failed")) {
         state->done = TRUE;
+        /* The producer owns the outcome. A late or rejected cancellation
+         * request must not turn a reported success into a local "cancelled". */
+        state->authoritative = TRUE;
         state->result = !g_strcmp0(phase, "failed") ? 1 : (!g_strcmp0(phase, "cancelled") ? 4 : 0);
         if (state->window && !state->close_id) state->close_id = g_timeout_add(350, progress_hide, state);
         else if (!state->window) progress_close(state, state->result);
@@ -261,7 +264,7 @@ static int run_progress(const char *root) {
     apply_css();
     ProgressState *state = g_new0(ProgressState, 1); state->result = 1; state->root = g_strdup(root); state->cancel_file = g_build_filename(root, ".bootstrap-cancel", NULL);
     state->show_id = g_timeout_add(UI_DELAY_MS, progress_show, state); GIOChannel *channel = g_io_channel_unix_new(STDIN_FILENO); g_io_channel_set_encoding(channel, NULL, NULL); g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL); g_io_add_watch(channel, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL, progress_input, state); gtk_main();
-    int result = state->cancelled ? 4 : state->result; g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state); return result;
+    int result = state->authoritative ? state->result : (state->cancelled ? 4 : state->result); g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state); return result;
 }
 
 static void dialog_finish(DialogState *state, int result) { state->result = result; gtk_main_quit(); }

@@ -59,6 +59,7 @@ The headless interface is:
 sh run.sh status
 sh run.sh check
 sh run.sh update                 # newline-delimited JSON progress
+sh run.sh update-settings        # internal Settings handoff; accepts no extra arguments
 sh run.sh --launcher             # open the full launcher on Play
 sh run.sh --settings             # open the full launcher on Settings
 sh run.sh get auto_update
@@ -86,7 +87,12 @@ The bundled GTK3 bootstrapper shows delayed first-run/update progress and the
 ask-mode decision dialog. Its full launcher has Play, Settings and Info pages;
 the installed menu entry opens Play, while `sh run.sh --settings` opens
 Settings. Settings can be opened while Roblox is running; its Update now action
-is disabled with a reason until the game closes. Update events include byte
+is disabled with a reason until the game closes. Settings checks run in the
+background and refresh the authoritative status without blocking the window.
+When Update now is selected, Settings closes before the dedicated progress
+window opens. The internal `update-settings` handoff waits for the updater's
+real exit status, then opens Settings exactly once after success, failure or
+cancellation. Update events include byte
 counts when the download exposes Content-Length; verification and shader
 preparation use a pulsing bar. Cancel during checking, downloading,
 verification or shader preparation removes staging data, keeps the previous

@@ -190,7 +190,11 @@ if [ "${1:-}" = --launcher ]; then
     [ -z "$URI" ] && [ "$#" -eq 1 ] || { echo 'Usage: run.sh --launcher' >&2; exit 2; }
     open_launcher_ui --launcher
 fi
-export ROBLOX_MAC_UI_APP=$TARGET_APPIMAGE
+if [ "${ROBLOX_MAC_NO_PROGRESS:-0}" = 1 ]; then
+    unset ROBLOX_MAC_UI_APP
+else
+    export ROBLOX_MAC_UI_APP=$TARGET_APPIMAGE
+fi
 _is_internal_updater() {
     for _arg in "$@"; do
         case "$_arg" in

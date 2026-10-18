@@ -10,7 +10,11 @@ HELPER=$HERE/bootstrap.py
 MARKER=$DATA/first-run.initialized
 URI_MAX_AGE=${ROBLOX_MAC_URI_MAX_AGE:-600}
 EVENTS=${ROBLOX_MAC_EVENTS:-0}
-UI_APP=${ROBLOX_MAC_UI_APP:-}
+if [ "${ROBLOX_MAC_NO_PROGRESS:-0}" = 1 ]; then
+    UI_APP=
+else
+    UI_APP=${ROBLOX_MAC_UI_APP:-}
+fi
 UI_FD=0
 UI_PID=
 UI_FIFO=
@@ -60,7 +64,7 @@ finish_progress() {
         [ -e "${ROBLOX_MAC_CANCEL_FILE:-}" ] && UI_CANCELLED=1
         [ "$ui_result" -eq 0 ] || [ "$ui_result" -eq 4 ] || notify 'Bootstrapper UI unavailable; launching without updating.' 'Roblox'
     fi
-    [ "$UI_CANCELLED" -eq 1 ] || rm -f -- "${ROBLOX_MAC_CANCEL_FILE:-}" 2>/dev/null || true
+    rm -f -- "${ROBLOX_MAC_CANCEL_FILE:-}" 2>/dev/null || true
     UI_FD=0; UI_PID=; UI_FIFO=
 }
 notify() {
@@ -320,10 +324,15 @@ check_latest() {
         if cancelled; then kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true; rm -f -- "$check_output"; return 125; fi
         sleep 0.1
     done
-    wait "$check_pid" 2>/dev/null || true
+    wait "$check_pid" 2>/dev/null
+    check_status=$?
     latest=$(sed -n '/^version-[0-9a-f][0-9a-f]*$/p' "$check_output" 2>/dev/null | tail -n 1 || true)
     rm -f -- "$check_output"
     settings_set last_check "$now" >/dev/null 2>&1 || true
+    if [ "$check_status" -ne 0 ]; then
+        [ -n "$latest" ] && printf '%s\n' "$latest"
+        return 1
+    fi
     if [ -n "$latest" ]; then
         settings_set last_known_latest "$latest" >/dev/null 2>&1 || true
         display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 9>&- 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
@@ -331,6 +340,7 @@ check_latest() {
         printf '%s\n' "$latest"
     else
         settings_get last_known_latest
+        return 1
     fi
 }
 
@@ -343,10 +353,12 @@ do_update() {
             ROBLOX_MAC_PROGRESS_FD=8 ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
             sh "$HERE/update-roblox.sh"; then
         if cancelled; then
+            event cancelled 0 'Update cancelled; keeping the installed client' 0 0 false
             say 'Update cancelled; the installed client was kept.'
             notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
             return 125
         fi
+        event failed 0 'Update failed; keeping the installed client' 0 0 false
         say 'Update failed or timed out; the installed client was kept.'
         notify 'Roblox update failed; the installed client was kept.' 'Roblox update failed'
         return 1
@@ -382,6 +394,7 @@ case "$command" in
         event checking 25 'Checking for updates'
         latest=$(check_latest); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; notify 'Update check cancelled.' 'Roblox'; exit 125; }
+        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; status_json; exit 1; }
         finish_progress
         exec 9>&-
         status_json; exit 0;;
@@ -397,8 +410,17 @@ case "$command" in
         event checking 25 'Checking for updates'
         latest=$(check_latest); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; exit 125; }
+        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; exit 1; }
         [ -n "$latest" ] || { say 'No latest version is known; update check failed.'; finish_progress; exit 1; }
         do_update; result=$?; finish_progress; [ "$UI_CANCELLED" -eq 1 ] && result=125; exit "$result";;
+    update-settings)
+        [ "$#" -eq 1 ] || { echo 'Usage: run.sh update-settings' >&2; exit 2; }
+        sh "$HERE/run.sh" update
+        update_result=$?
+        sh "$HERE/run.sh" --settings
+        settings_result=$?
+        [ "$settings_result" -eq 0 ] || exit "$settings_result"
+        exit "$update_result";;
     launch)
         :;;
     *)

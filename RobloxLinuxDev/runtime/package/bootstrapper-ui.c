@@ -404,10 +404,11 @@ static int run_launcher(const char *root, gboolean settings_page) {
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0); gtk_container_add(GTK_CONTAINER(state->window), outer); GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4); gtk_widget_set_size_request(sidebar, 190, -1); gtk_style_context_add_class(gtk_widget_get_style_context(sidebar), "sidebar"); gtk_box_pack_start(GTK_BOX(outer), sidebar, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(sidebar), label("Roblox Mac Linux Port", "brand"), FALSE, FALSE, 0); GtkWidget *nav = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3); gtk_box_pack_start(GTK_BOX(sidebar), nav, FALSE, FALSE, 0); GSList *group = NULL; GtkWidget *play_nav = nav_button("▶  Play", "play", state, &group); GtkWidget *settings_nav = nav_button("⚙  Settings", "settings", state, &group); GtkWidget *info_nav = nav_button("●  Info", "info", state, &group); gtk_box_pack_start(GTK_BOX(nav), play_nav, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(nav), settings_nav, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(nav), info_nav, FALSE, FALSE, 0);
     state->stack = gtk_stack_new(); gtk_stack_set_transition_type(GTK_STACK(state->stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE); gtk_box_pack_start(GTK_BOX(outer), state->stack, TRUE, TRUE, 0);
     GtkWidget *play = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18); gtk_container_set_border_width(GTK_CONTAINER(play), 42); gchar *icon_path = find_icon_path(root); GError *icon_error = NULL; GdkPixbuf *pixbuf = icon_path ? gdk_pixbuf_new_from_file_at_scale(icon_path, 160, 160, TRUE, &icon_error) : NULL; GtkWidget *image = pixbuf ? gtk_image_new_from_pixbuf(pixbuf) : gtk_image_new(); if (pixbuf) g_object_unref(pixbuf); g_clear_error(&icon_error); g_free(icon_path); gtk_widget_set_halign(image, GTK_ALIGN_CENTER); gtk_box_pack_start(GTK_BOX(play), image, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(play), label("Roblox Mac Linux Port", "title"), FALSE, FALSE, 0); state->play_version = label("Client version: —", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_version, FALSE, FALSE, 0); state->play_status = label("Checking…", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_status, FALSE, FALSE, 0); GtkWidget *play_button = gtk_button_new_with_mnemonic("_Play"); gtk_style_context_add_class(gtk_widget_get_style_context(play_button), "accent"); g_signal_connect(play_button, "clicked", G_CALLBACK(play_launch), state); gtk_box_pack_start(GTK_BOX(play), play_button, FALSE, FALSE, 0); GtkWidget *log_button = gtk_button_new_with_mnemonic("Open last _log"); g_signal_connect(log_button, "clicked", G_CALLBACK(open_log), state); gtk_box_pack_start(GTK_BOX(play), log_button, FALSE, FALSE, 0); gtk_stack_add_named(GTK_STACK(state->stack), play, "play");
-    GtkWidget *settings_page_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
+    gtk_container_set_border_width(GTK_CONTAINER(settings), 42);
     GtkWidget *update_header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_style_context_add_class(gtk_widget_get_style_context(update_header), "update-header");
-    gtk_box_pack_start(GTK_BOX(settings_page_box), update_header, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(settings), update_header, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(update_header), label("Settings", "title"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(update_header), label("Updates and launch behavior", "subtitle"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(update_header), label("Roblox updates", "section-title"), FALSE, FALSE, 4);
@@ -436,8 +437,6 @@ static int run_launcher(const char *root, gboolean settings_page) {
     state->message = label(NULL, "status");
     gtk_box_pack_start(GTK_BOX(update_header), state->message, FALSE, FALSE, 0);
 
-    GtkWidget *settings = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14);
-    gtk_container_set_border_width(GTK_CONTAINER(settings), 42);
     gtk_box_pack_start(GTK_BOX(settings), label("Launch behavior", "section-title"), FALSE, FALSE, 0);
     GtkWidget *grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
@@ -489,8 +488,7 @@ static int run_launcher(const char *root, gboolean settings_page) {
     GtkWidget *settings_scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(settings_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(settings_scroll), settings);
-    gtk_box_pack_start(GTK_BOX(settings_page_box), settings_scroll, TRUE, TRUE, 0);
-    gtk_stack_add_named(GTK_STACK(state->stack), settings_page_box, "settings");
+    gtk_stack_add_named(GTK_STACK(state->stack), settings_scroll, "settings");
     GtkWidget *info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(info), 42); gtk_box_pack_start(GTK_BOX(info), label("About Roblox Mac Linux Port", "title"), FALSE, FALSE, 0); state->info_client = label("Client version: —", "subtitle"); gtk_box_pack_start(GTK_BOX(info), state->info_client, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(info), label("Runtime build: bundled Darling + Wayland/Vulkan AppImage", "subtitle"), FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(info), label("An experimental Intel macOS Roblox client runner for Linux using Darling, Wayland and Vulkan.", NULL), FALSE, FALSE, 0); char *paths = g_strdup_printf("Release: %s\nData and logs: %s/DO_NOT_SHARE", root, root); gtk_box_pack_start(GTK_BOX(info), label(paths, "muted"), FALSE, FALSE, 0); g_free(paths); gtk_box_pack_start(GTK_BOX(info), label("Logs can contain account details; review them before sharing.", "muted"), FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(info), label("Project: https://github.com/georgenoob1234/Roblox-Mac-Linux-Port", "muted"), FALSE, FALSE, 0); gtk_stack_add_named(GTK_STACK(state->stack), info, "info");
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(settings_page ? settings_nav : play_nav), TRUE); gtk_widget_show_all(state->window); settings_refresh(state); gtk_main(); if (state->launch_check_id) g_source_remove(state->launch_check_id); g_free(state->root); g_free(state); return 0;
 }

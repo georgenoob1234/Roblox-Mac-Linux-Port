@@ -91,10 +91,25 @@ RECOVERY_DIR_NAME = "recovery"
 # commit boundary. The launcher relies on this status (and never on a marker
 # file) to decide whether an operation reported cancellation.
 EXIT_CANCELLED = 125
+# Documented terminal status for an update whose files were committed but whose
+# backup cleanup could not finish. The new release is installed; only cleanup
+# remains, and recovery retries it. It must never be reported as a failure that
+# kept the previous release, and a committed install is never rolled back just
+# because deleting obsolete backups failed.
+EXIT_CLEANUP_PENDING = 3
 # Cancellable phases poll for cancellation on a timer so a stalled download or
 # staging step cannot pin an update indefinitely without an answer.
 PORT_UPDATE_POLL_SECONDS = 0.5
 DEFAULT_PORT_UPDATE_TIMEOUT_SECONDS = 1800.0
+# Shared cancellation handshake. The launcher resets the state to "open" before
+# an operation, the installer owns the transition to "committing" at the commit
+# boundary, and the GTK UI reads the same file under the same lock. Whoever
+# holds the lock first wins, so a request cannot be accepted after the commit
+# has begun and the UI cannot show a refused request as an accepted cancel.
+CANCEL_STATE_OPEN = "open"
+CANCEL_STATE_COMMITTING = "committing"
+CANCEL_STATE_COMMITTED = "committed"
+CANCEL_STATE_CANCELLED = "cancelled"
 
 
 def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
@@ -114,6 +129,102 @@ def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
 def cancellation_requested() -> bool:
     marker = os.environ.get("ROBLOX_MAC_CANCEL_FILE", "")
     return bool(marker and os.path.exists(marker))
+
+
+def cancel_state_file() -> str:
+    """The launcher's shared cancellation state file, or "" when absent.
+
+    When the launcher does not provide it (a standalone CLI run, or an older
+    launcher) the installer falls back to the plain marker file, so direct
+    `installer.py update` invocations keep working unchanged.
+    """
+    return os.environ.get("ROBLOX_MAC_CANCEL_STATE_FILE", "")
+
+
+def read_cancel_state() -> str:
+    path = cancel_state_file()
+    if not path:
+        return ""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+@contextlib.contextmanager
+def cancel_state_lock() -> Iterator[bool]:
+    """Serialise a cancellation request against the commit transition.
+
+    The launcher, the installer and the GTK UI all take this flock around the
+    read-modify-write of the state file, so exactly one side wins at the
+    boundary: a request recorded while the state is still "open" is honoured,
+    and a request that arrives once "committing" is recorded is refused. Yields
+    True when the lock was taken, and False when the protocol is unavailable so
+    callers fall back to the marker alone.
+    """
+    if not cancel_state_file():
+        yield False
+        return
+    lock_path = Path(cancel_state_file() + ".lock")
+    fd = -1
+    locked = False
+    try:
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+        except OSError:
+            yield False
+            return
+        lock_st = lstat_or_none(lock_path)
+        if lock_st is not None and (stat.S_ISLNK(lock_st.st_mode) or lock_st.st_uid != os.getuid()):
+            yield False
+            return
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        locked = True
+        yield True
+    finally:
+        if fd >= 0:
+            if locked:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def write_cancel_state(value: str) -> None:
+    """Atomically record the shared cancellation state; never fatal."""
+    path = cancel_state_file()
+    if not path:
+        return
+    try:
+        atomic_write(Path(path), (value + "\n").encode("utf-8"), 0o600)
+    except (OSError, InstallerError):
+        pass
+
+
+def cancel_boundary() -> bool:
+    """Atomically decide whether a cancellation request wins the boundary.
+
+    Returns True when a request recorded before the transition must abort the
+    operation before any destination file changes, and False once the installer
+    has recorded that it owns the commit. The decision and the state transition
+    happen inside one lock, so a request can never be accepted (and shown as
+    accepted by the UI) after the commit has begun.
+    """
+    with cancel_state_lock() as locked:
+        if cancellation_requested():
+            if locked:
+                write_cancel_state(CANCEL_STATE_CANCELLED)
+            return True
+        if locked:
+            write_cancel_state(CANCEL_STATE_COMMITTING)
+        return False
+
+
+def mark_commit_completed() -> None:
+    """Record a durable commit so stale state can never look cancellable."""
+    with cancel_state_lock() as locked:
+        if locked and read_cancel_state() in (CANCEL_STATE_COMMITTING, CANCEL_STATE_COMMITTED):
+            write_cancel_state(CANCEL_STATE_COMMITTED)
 
 
 def _color(code: str, value: str) -> str:
@@ -188,6 +299,17 @@ class CancelledError(InstallerError):
     Raised with its own terminal status (EXIT_CANCELLED) so the launcher and
     the GTK UI never have to infer "cancelled" from a marker file, which a
     late request or a previous operation may have left behind.
+    """
+
+
+class CleanupPendingError(InstallerError):
+    """The release was committed; only obsolete-backup cleanup failed.
+
+    It carries its own terminal status (EXIT_CLEANUP_PENDING) so the launcher
+    reports "applied, cleanup pending" instead of the failure wording that
+    claims the previous release was kept -- which would be false, because the
+    new files are already live. The committed transaction is left in place for
+    recovery to finish the cleanup.
     """
 
 
@@ -699,7 +821,13 @@ def recover_transactions(target: Path) -> None:
             good("Recovered the previous installation state.")
         elif state == "committed":
             warn("Finishing cleanup from a previously completed installation transaction.")
-            finalize_transaction(target, txn, journal)
+            try:
+                finalize_transaction(target, txn, journal)
+            except Exception as exc:
+                # The committed release is valid; only obsolete-backup cleanup
+                # failed. Keep the evidence for a later retry rather than
+                # blocking the launch or rolling back a finished installation.
+                warn(f"Cleanup from a completed transaction is still pending: {exc}")
         else:
             fail(f"Unknown installer transaction state in {journal_path}; refusing to guess.")
 
@@ -796,7 +924,13 @@ def build_operations(target: Path, old_manifest: dict[str, Any] | None, new_mani
 
 def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | None,
                       new_manifest: dict[str, Any] | None, staged_payload: Path | None,
-                      target_created: bool = False, preserve_modified: bool = True) -> None:
+                      target_created: bool = False, preserve_modified: bool = True) -> bool:
+    """Swap the managed files under a journal, then clean up.
+
+    Returns True when the files were committed but the obsolete-backup cleanup
+    could not finish. That is not a failed update: the new files are live and
+    the committed transaction is left for recovery to clean up.
+    """
     manifest_path = target / MANIFEST_NAME
     old_manifest_exists = lstat_or_none(manifest_path) is not None
     old_manifest_hash = sha256_file(manifest_path) if old_manifest_exists else None
@@ -840,13 +974,23 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
             fsync_dir(target)
         journal["state"] = "committed"
         write_journal(txn, journal)
+        mark_commit_completed()
     except Exception:
         try:
             rollback_transaction(target, txn, journal)
         except Exception as recovery_exc:
             warn(f"Automatic rollback was incomplete: {recovery_exc}")
         raise
-    finalize_transaction(target, txn, journal, preserve_modified=preserve_modified)
+    # The swap is durable: from here the new release is what is installed, so
+    # a cleanup failure must never be reported (or treated) as a failed update
+    # or trigger a rollback. The committed journal keeps the evidence and
+    # recovery retries the cleanup on the next start.
+    try:
+        finalize_transaction(target, txn, journal, preserve_modified=preserve_modified)
+    except Exception as exc:
+        warn(f"The release is applied, but its leftover cleanup is incomplete and will be retried: {exc}")
+        return True
+    return False
 
 
 def check_platform() -> None:
@@ -1115,15 +1259,16 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             target.mkdir(parents=False, mode=0o755)
             target_created = True
             fsync_dir(target.parent)
-        if cancellation_requested():
-            raise CancelledError("Port update cancelled.")
-        # Commit boundary: from here the transaction is not interruptible, so
-        # stop the poll/deadline timer before the first destination file is
-        # replaced. A late cancellation request is ignored and the operation
-        # reports its real outcome instead.
+        # Commit boundary: disarm the watchdog, then settle the cancellation
+        # race under the shared lock. A request recorded while the state was
+        # still "open" wins and aborts safely; a request that loses is refused
+        # (the launcher's UI reads the same state and will not show it as
+        # accepted), and the transaction then commits without interruption.
         disarm_pre_commit_watchdog()
+        if cancel_boundary():
+            raise CancelledError("Port update cancelled.")
         progress_event("installing", 94, "Installing the verified port files", 0, 0, False)
-        apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
+        cleanup_pending = apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
     except Exception:
         # If the transaction did not start, remove only our own staging area.
         if txn.exists() and lstat_or_none(txn / "journal.json") is None:
@@ -1136,7 +1281,9 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
     finally:
         disarm_pre_commit_watchdog()
     good(f"Application files installed at {target}")
-    progress_event("complete", 100, "Port update complete", 0, 0, False)
+    progress_event("complete", 100,
+                   "Port update applied; finishing cleanup on the next start" if cleanup_pending
+                   else "Port update complete", 0, 0, False)
 
     # Data is migrated only if the destination has no data directory. It is
     # copied (never moved), so the original remains recoverable until the user
@@ -1186,6 +1333,12 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
         good("Done. Launch 'Roblox (Mac Linux Port)' from your application menu, or run run.sh from the install folder.")
     else:
         good("Done. Launch with run.sh from the install folder, or enable desktop integration later.")
+    if cleanup_pending:
+        # The release is live; only obsolete backups remain. Report this as an
+        # applied update with pending cleanup so the launcher never claims the
+        # previous release was kept (it was not) or that everything is tidy.
+        raise CleanupPendingError(
+            f"The update was applied at {target}, but its leftover cleanup is incomplete and will be retried.")
 
 
 def confirm(prompt: str, default: bool = False) -> bool:
@@ -2281,6 +2434,9 @@ if __name__ == "__main__":
     except CancelledError as exc:
         warn(str(exc))
         sys.exit(EXIT_CANCELLED)
+    except CleanupPendingError as exc:
+        warn(str(exc))
+        sys.exit(EXIT_CLEANUP_PENDING)
     except InstallerError as exc:
         warn(str(exc))
         sys.exit(1)

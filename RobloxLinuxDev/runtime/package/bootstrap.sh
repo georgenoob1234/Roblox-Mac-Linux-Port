@@ -8,6 +8,14 @@ APP=$HERE/RobloxLinux.AppImage
 STATE=$DATA/bootstrapper.json
 HELPER=$HERE/bootstrap.py
 MARKER=$DATA/first-run.initialized
+# Shared cancellation handshake with the installer and the GTK UI. The marker
+# records a request; the state file records whether cancellation is still
+# accepted ("open") or the commit has begun ("committing"/"committed"). The
+# installer and the UI settle the boundary under <state>.lock; this script only
+# resets the state before an operation, which it does while holding the
+# instance lock, so no other operation can be running.
+CANCEL_MARKER=$DATA/.bootstrap-cancel
+CANCEL_STATE=$DATA/.bootstrap-cancel-state
 URI_MAX_AGE=${ROBLOX_MAC_URI_MAX_AGE:-600}
 EVENTS=${ROBLOX_MAC_EVENTS:-0}
 if [ "${ROBLOX_MAC_NO_PROGRESS:-0}" = 1 ]; then
@@ -22,6 +30,23 @@ UI_CANCELLED=0
 UI_RESULT=0
 
 cancelled() { [ -n "${ROBLOX_MAC_CANCEL_FILE:-}" ] && [ -e "$ROBLOX_MAC_CANCEL_FILE" ]; }
+
+# Atomically record the shared cancellation state. The write is refused when the
+# path is a symlink or is not ours, so a planted link cannot redirect it. The
+# temporary file plus rename keeps a concurrent reader from seeing a partial
+# value; the flock spans the whole read-modify-write so the installer and the UI
+# cannot interleave at the boundary.
+cancel_state_write() {
+    [ -e "$CANCEL_STATE" ] && { [ -h "$CANCEL_STATE" ] && return 0; }
+    if [ -e "$CANCEL_STATE" ]; then
+        owner=$(stat -c %u -- "$CANCEL_STATE" 2>/dev/null || printf '')
+        [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] && return 0
+    fi
+    tmp=$CANCEL_STATE.tmp.$$
+    printf '%s\n' "$1" > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$CANCEL_STATE" 2>/dev/null || rm -f -- "$tmp"
+}
 
 say() { echo "roblox: $*" >&2; }
 event() {
@@ -39,9 +64,14 @@ PY
 }
 start_progress() {
     [ -n "$UI_APP" ] || return 0
-    ROBLOX_MAC_CANCEL_FILE=$DATA/.bootstrap-cancel
-    export ROBLOX_MAC_CANCEL_FILE
+    ROBLOX_MAC_CANCEL_FILE=$CANCEL_MARKER
+    ROBLOX_MAC_CANCEL_STATE_FILE=$CANCEL_STATE
+    export ROBLOX_MAC_CANCEL_FILE ROBLOX_MAC_CANCEL_STATE_FILE
+    # Drop any request and state left by a previous operation before the new
+    # one can observe them: a stale "committing" must never make a fresh
+    # update look uncancellable, and a stale marker must never cancel it.
     rm -f -- "$ROBLOX_MAC_CANCEL_FILE"
+    cancel_state_write open
     UI_FIFO=$DATA/.bootstrap-progress.$$
     rm -f -- "$UI_FIFO"
     mkfifo "$UI_FIFO" 2>/dev/null || { UI_FIFO=; return 0; }
@@ -378,10 +408,12 @@ do_port_update() {
     event checking 5 'Checking the latest port release' 0 0 true
     # The installer owns the cancellation decision. It polls the marker during
     # its cancellable phases, stops honouring it at the commit boundary, and
-    # reports an accepted cancellation with its own terminal status (125), so
-    # this wrapper never guesses from the marker file -- a late request, or a
-    # marker left over from an earlier operation, must not change the result
-    # of an update that actually committed.
+    # reports an accepted cancellation with its own terminal status (125). The
+    # GTK UI and the installer settle the boundary through the shared
+    # CANCEL_STATE file under CANCEL_LOCK, so this wrapper never guesses from
+    # the marker file -- a late request, or a marker left over from an earlier
+    # operation, must not change the result of an update that actually
+    # committed.
     #
     # It is deliberately not wrapped in `timeout`: a signal during the
     # non-cancellable commit phase is exactly what leaves run.sh or
@@ -392,12 +424,21 @@ do_port_update() {
     # recovery entry point on the next start.
     env ROBLOX_MAC_PROGRESS_FD=8 \
         ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
+        ROBLOX_MAC_CANCEL_STATE_FILE="${ROBLOX_MAC_CANCEL_STATE_FILE:-}" \
         ROBLOX_MAC_LOCK_HELD=1 \
         python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop
     _port_update_status=$?
     case "$_port_update_status" in
         0)
             event update 100 'Port update complete' 0 0 false
+            return 0;;
+        3)
+            # The new release is committed and live; only obsolete-backup
+            # cleanup could not finish. Report it as applied -- never with the
+            # failure wording, which would wrongly claim the old release was
+            # kept and the change never happened.
+            event update 100 'Port update applied; finishing cleanup on the next start' 0 0 false
+            say 'Port update applied; leftover cleanup will finish on the next start.'
             return 0;;
         125)
             event cancelled 0 'Port update cancelled; the current release was kept' 0 0 false

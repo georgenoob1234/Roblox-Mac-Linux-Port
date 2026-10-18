@@ -2,15 +2,19 @@
 #include <json-glib/json-glib.h>
 #include <gio/gio.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <signal.h>
 #include <time.h>
 
 #define UI_DELAY_MS 450
 #define DIALOG_TIMEOUT_SECONDS 30
+#define CANCEL_POLL_MS 250
 
 static const char *UI_CSS =
     "window { background-color: @theme_bg_color; color: @theme_fg_color; }"
@@ -39,9 +43,9 @@ static void apply_css(void) {
 }
 
 typedef struct {
-    char *root, *cancel_file;
+    char *root, *cancel_file, *cancel_state;
     GtkWidget *window, *phase, *status, *progress, *cancel;
-    guint show_id, close_id;
+    guint show_id, close_id, cancel_poll_id;
     gboolean done, cancellable, cancelled, closed, authoritative;
     int result;
 } ProgressState;
@@ -124,16 +128,75 @@ static void progress_close(ProgressState *state, int result) {
     state->closed = TRUE; state->result = result;
     if (state->show_id) { g_source_remove(state->show_id); state->show_id = 0; }
     if (state->close_id) { g_source_remove(state->close_id); state->close_id = 0; }
+    if (state->cancel_poll_id) { g_source_remove(state->cancel_poll_id); state->cancel_poll_id = 0; }
     if (state->window) gtk_widget_destroy(state->window);
     gtk_main_quit();
 }
 static gboolean progress_hide(gpointer data) { ProgressState *state = data; progress_close(state, state->result); return G_SOURCE_REMOVE; }
+/* Shared cancellation handshake. The launcher writes "open" before an
+ * operation and the installer flips it to "committing" at the commit boundary,
+ * both under <state>.lock. The UI takes the same lock around its
+ * check-and-request, so it can never record -- and therefore never show -- an
+ * accepted cancellation after the commit has begun. A missing or unreadable
+ * state file means an older launcher without this protocol; the marker alone is
+ * then still the contract, exactly as before. */
+static gboolean cancel_state_open(const char *state_path) {
+    if (!state_path || !*state_path) return TRUE;
+    char *contents = NULL;
+    if (!g_file_get_contents(state_path, &contents, NULL, NULL)) return TRUE;
+    g_strstrip(contents);
+    gboolean open = !*contents || !g_strcmp0(contents, "open");
+    g_free(contents);
+    return open;
+}
+static int cancel_state_lock_fd(const char *state_path) {
+    if (!state_path || !*state_path) return -1;
+    char *path = g_strdup_printf("%s.lock", state_path);
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    g_free(path);
+    return fd;
+}
+/* Record a cancellation request only while the state is still "open". Returns
+ * FALSE when the request was refused because the commit already owns the
+ * transition, so the caller must not present it as accepted. */
+static gboolean progress_try_request_cancel(ProgressState *state) {
+    int fd = cancel_state_lock_fd(state->cancel_state);
+    if (fd < 0) return g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL);
+    gboolean accepted = FALSE;
+    if (flock(fd, LOCK_EX) == 0) {
+        if (cancel_state_open(state->cancel_state))
+            accepted = g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL);
+        flock(fd, LOCK_UN);
+    }
+    close(fd);
+    return accepted;
+}
 static void progress_request_cancel(ProgressState *state, GtkWidget *button) {
     if (!state->cancellable || state->cancelled) return;
+    if (!progress_try_request_cancel(state)) {
+        /* The installer already owns the commit. Never claim the request was
+         * accepted; reflect the real, authoritative outcome instead. */
+        if (button) gtk_widget_set_sensitive(button, FALSE);
+        label_text(state->status, "This update is already being applied and can no longer be cancelled.");
+        return;
+    }
     state->cancelled = TRUE; state->cancellable = FALSE;
-    g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL);
     if (button) { gtk_button_set_label(GTK_BUTTON(button), "Cancelling…"); gtk_widget_set_sensitive(button, FALSE); }
     label_text(state->status, "Cancelling…");
+}
+/* The state file is authoritative, so poll it instead of trusting that the
+ * non-cancellable progress event has already been processed: the commit may
+ * have begun while that event is still queued. */
+static gboolean progress_poll_cancel(gpointer data) {
+    ProgressState *state = data;
+    if (state->closed || state->done) return G_SOURCE_REMOVE;
+    if (state->cancel && !state->cancelled && state->cancellable &&
+        !cancel_state_open(state->cancel_state)) {
+        state->cancellable = FALSE;
+        gtk_widget_set_sensitive(state->cancel, FALSE);
+    }
+    return G_SOURCE_CONTINUE;
 }
 static void progress_cancel(GtkButton *button, gpointer data) { progress_request_cancel(data, GTK_WIDGET(button)); }
 static gboolean progress_delete(GtkWidget *window, GdkEvent *event, gpointer data) {
@@ -217,7 +280,9 @@ static gboolean progress_show(gpointer data) {
     state->status = label("Setting up Roblox…", NULL); gtk_box_pack_start(GTK_BOX(box), state->status, FALSE, FALSE, 0);
     state->progress = gtk_progress_bar_new(); gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(state->progress), TRUE); gtk_box_pack_start(GTK_BOX(box), state->progress, FALSE, FALSE, 0);
     state->cancel = gtk_button_new_with_mnemonic("_Cancel"); gtk_widget_set_halign(state->cancel, GTK_ALIGN_END); g_signal_connect(state->cancel, "clicked", G_CALLBACK(progress_cancel), state); gtk_box_pack_start(GTK_BOX(box), state->cancel, FALSE, FALSE, 0);
-    gtk_widget_set_sensitive(state->cancel, FALSE); gtk_widget_show_all(state->window); return G_SOURCE_REMOVE;
+    gtk_widget_set_sensitive(state->cancel, FALSE); gtk_widget_show_all(state->window);
+    state->cancel_poll_id = g_timeout_add(CANCEL_POLL_MS, progress_poll_cancel, state);
+    return G_SOURCE_REMOVE;
 }
 static void progress_event(ProgressState *state, const char *line) {
     JsonObject *object = parse_json(line); if (!object) return;
@@ -262,9 +327,9 @@ static gboolean progress_input(GIOChannel *channel, GIOCondition condition, gpoi
 static int run_progress(const char *root) {
     if (!gtk_init_check(NULL, NULL)) return 3;
     apply_css();
-    ProgressState *state = g_new0(ProgressState, 1); state->result = 1; state->root = g_strdup(root); state->cancel_file = g_build_filename(root, ".bootstrap-cancel", NULL);
+    ProgressState *state = g_new0(ProgressState, 1); state->result = 1; state->root = g_strdup(root); state->cancel_file = g_build_filename(root, ".bootstrap-cancel", NULL); state->cancel_state = g_build_filename(root, ".bootstrap-cancel-state", NULL);
     state->show_id = g_timeout_add(UI_DELAY_MS, progress_show, state); GIOChannel *channel = g_io_channel_unix_new(STDIN_FILENO); g_io_channel_set_encoding(channel, NULL, NULL); g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL); g_io_add_watch(channel, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL, progress_input, state); gtk_main();
-    int result = state->authoritative ? state->result : (state->cancelled ? 4 : state->result); g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state); return result;
+    int result = state->authoritative ? state->result : (state->cancelled ? 4 : state->result); g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state->cancel_state); g_free(state); return result;
 }
 
 static void dialog_finish(DialogState *state, int result) { state->result = result; gtk_main_quit(); }

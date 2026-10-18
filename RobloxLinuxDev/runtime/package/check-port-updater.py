@@ -10,12 +10,14 @@ publishes outside the payload.
 from __future__ import annotations
 
 import importlib.util
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -42,10 +44,18 @@ def emit(phase, percent, message, cancellable):
             "message": message, "bytes_done": 0, "bytes_total": 0,
             "cancellable": cancellable}) + "\\n").encode())
 marker = os.environ.get("ROBLOX_MAC_CANCEL_FILE", "")
+state = os.environ.get("ROBLOX_MAC_CANCEL_STATE_FILE", "")
 emit("downloading", 30, "Downloading", True)
 if os.environ.get("PORT_STUB_REQUIRE_NO_MARKER") == "1" and marker and os.path.exists(marker):
     emit("failed", 0, "A stale cancellation marker was not cleared", False)
     raise SystemExit(1)
+if os.environ.get("PORT_STUB_REQUIRE_OPEN_STATE") == "1":
+    current = ""
+    if state and os.path.exists(state):
+        current = open(state).read().strip()
+    if current != "open" or (marker and os.path.exists(marker)):
+        emit("failed", 0, "Stale cancellation state was not cleared: " + repr(current), False)
+        raise SystemExit(1)
 if os.environ.get("PORT_STUB_POLL_CANCEL") == "1":
     for _ in range(30):
         if marker and os.path.exists(marker):
@@ -56,8 +66,12 @@ emit("installing", 94, "Installing", False)
 if os.environ.get("PORT_STUB_LATE_CANCEL") == "1" and marker:
     open(marker, "w").write("late\\n")
 result = int(os.environ.get("PORT_STUB_RESULT", "0"))
-emit({0: "complete", 125: "cancelled"}.get(result, "failed"),
-     100 if result == 0 else 0, "done", False)
+_phase, _message = {
+    0: ("complete", "Port update complete"),
+    3: ("complete", "Port update applied; finishing cleanup on the next start"),
+    125: ("cancelled", "done"),
+}.get(result, ("failed", "done"))
+emit(_phase, 100 if result in (0, 3) else 0, _message, False)
 raise SystemExit(result)
 '''
 
@@ -700,6 +714,29 @@ exit 3
     assert settings_log.read_text().splitlines() == ["settings"]
     assert not marker.exists()
 
+    # The same reset also clears a stale *state* file: a leftover "committing"
+    # from an interrupted operation must not make a fresh update look
+    # uncancellable, and a leftover request must not cancel it.
+    state_file = handoff / "DO_NOT_SHARE/.bootstrap-cancel-state"
+    state_file.write_text("committing\n")
+    marker.write_text("stale\n")
+    stale_state = handoff_run({"PORT_STUB_RESULT": "0", "PORT_STUB_REQUIRE_OPEN_STATE": "1"})
+    assert stale_state.returncode == 0, (stale_state.returncode, stale_state.stderr)
+    assert settings_log.read_text().splitlines() == ["settings"]
+    assert not marker.exists()
+    assert state_file.read_text().strip() == "open"
+
+    # An update that committed but could not finish its backup cleanup is
+    # reported as applied: there must be no "failed"/"kept the previous
+    # release" wording, and Settings still reopen.
+    cleanup = handoff_run({"PORT_STUB_RESULT": "3"})
+    assert cleanup.returncode == 0, (cleanup.returncode, cleanup.stderr)
+    assert settings_log.read_text().splitlines() == ["settings"]
+    last_event = json.loads(event_log.read_text().splitlines()[-1])
+    assert last_event["phase"] == "update", last_event
+    assert "cleanup" in last_event["message"], last_event
+    assert "failed" not in phases(), phases()
+
     # A cancel requested through the progress window during the cancellable
     # phase reaches the installer, which reports the accepted cancellation the
     # wrapper forwards; Settings is still reopened.
@@ -714,6 +751,339 @@ exit 3
     assert cancelled_ui.returncode == 125, (cancelled_ui.returncode, cancelled_ui.stderr)
     assert settings_log.read_text().splitlines() == ["settings"]
     assert not marker.exists()
+
+    # ------------------------------------------------------------------
+    # The commit boundary is settled by a lock-protected state file shared
+    # with the GTK UI -- not by progress-event delivery. These cases drive the
+    # exact boundary; a marker written after the "installing" event would not
+    # prove anything.
+    # ------------------------------------------------------------------
+    def ui_cancel_request(state_path: Path, request_marker: Path) -> bool:
+        """Mirror of bootstrapper-ui.c's progress_try_request_cancel().
+
+        It takes the same lock, reads the same state, and records the request
+        only while the state is still "open" -- so if this returns False the UI
+        would have refused and shown the refusal, never "Cancelling…".
+        """
+        fd = os.open(str(state_path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                current = state_path.read_text().strip()
+            except OSError:
+                current = ""
+            if current in ("", "open"):
+                request_marker.write_text("cancel\n")
+                return True
+            return False
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def read_state(state_path: Path) -> str:
+        try:
+            return state_path.read_text().strip()
+        except OSError:
+            return ""
+
+    def with_boundary_hook(hook):
+        """Patch the call made immediately before the boundary decision."""
+        original = installer.disarm_pre_commit_watchdog
+        fired = {"done": False}
+
+        def wrapper():
+            if not fired["done"]:
+                fired["done"] = True
+                hook()
+            return original()
+
+        installer.disarm_pre_commit_watchdog = wrapper
+        return lambda: setattr(installer, "disarm_pre_commit_watchdog", original)
+
+    def with_commit_hook(hook):
+        """Patch the commit itself, which only runs after the boundary is won."""
+        original = installer.apply_transaction
+        seen = {}
+
+        def wrapper(*args, **kwargs):
+            hook(seen)
+            return original(*args, **kwargs)
+
+        installer.apply_transaction = wrapper
+        return lambda: setattr(installer, "apply_transaction", original), seen
+
+    boundary_state = root / "boundary-state"
+    boundary_marker = root / "boundary-marker"
+    saved_cancel_env = {key: os.environ.get(key) for key in
+                        ("ROBLOX_MAC_CANCEL_STATE_FILE", "ROBLOX_MAC_CANCEL_FILE")}
+    os.environ["ROBLOX_MAC_CANCEL_STATE_FILE"] = str(boundary_state)
+    os.environ["ROBLOX_MAC_CANCEL_FILE"] = str(boundary_marker)
+    def fresh(name: str) -> Path:
+        """A target already on the old release, with a clean "open" state.
+
+        This mirrors start_progress, which clears a previous operation's marker
+        and state before a new one begins.
+        """
+        path = root / name
+        boundary_state.write_text("open\n")
+        boundary_marker.unlink(missing_ok=True)
+        install_quietly(path, real1, "v1.0.0")
+        # The baseline install crossed a boundary of its own; restore the
+        # pre-operation state the launcher would have written.
+        boundary_state.write_text("open\n")
+        boundary_marker.unlink(missing_ok=True)
+        return path
+
+    try:
+        # (1) Cancellation wins immediately before the commit: the UI records
+        # the request at the instant before the boundary, while the state is
+        # still "open". The operation must abort, keep the old release, leave
+        # no transaction/backup behind, and report the cancellation status.
+        wins = fresh("boundary-cancel-wins")
+        wins_baseline = managed_snapshot(wins)
+        accepted = {"value": None}
+
+        def request_at_boundary():
+            accepted["value"] = ui_cancel_request(boundary_state, boundary_marker)
+
+        restore = with_boundary_hook(request_at_boundary)
+        try:
+            try:
+                install_quietly(wins, real2, "v2.0.0")
+            except installer.CancelledError:
+                pass
+            else:
+                raise AssertionError("a request recorded before the boundary was not honoured")
+        finally:
+            restore()
+        assert accepted["value"] is True, accepted
+        assert read_state(boundary_state) == "cancelled", read_state(boundary_state)
+        assert managed_snapshot(wins) == wins_baseline, "the old release must be intact"
+        assert not list(wins.parent.glob(installer.TXN_PREFIX + "*")), "no transaction may remain"
+
+        # (2) Commit wins immediately before a cancellation request: the state
+        # is already "committing" when the click arrives, so the request must
+        # be refused -- the UI must not claim it was accepted -- and the new
+        # release must complete.
+        commits = fresh("boundary-commit-wins")
+
+        def request_after_boundary(s):
+            s["state_at_commit"] = read_state(boundary_state)
+            s["accepted_late"] = ui_cancel_request(boundary_state, boundary_marker)
+            s["marker_after"] = boundary_marker.exists()
+
+        restore, seen = with_commit_hook(request_after_boundary)
+        try:
+            install_quietly(commits, real2, "v2.0.0")
+        finally:
+            restore()
+        assert seen["state_at_commit"] == "committing", seen
+        assert seen["accepted_late"] is False, seen
+        assert seen["marker_after"] is False, "a refused request must not record a marker"
+        assert read_state(boundary_state) == "committed", read_state(boundary_state)
+        assert installer.installed_port_version(commits) == "v2.0.0"
+        assert (commits / "run.sh").read_bytes() == (real2 / "run.sh").read_bytes()
+
+        # (3) The request arrives while the UI has not yet processed the
+        # non-cancellable "installing" event -- the exact defect. The state
+        # file, not event delivery, must decide: the request is refused even
+        # though the button was still enabled.
+        pending = fresh("boundary-event-pending")
+        delivered = {}
+        original_progress = installer.progress_event
+
+        def observe_progress(phase, percent, message, bytes_done=0, bytes_total=0, cancellable=True):
+            if phase == "installing":
+                # Emitted, but the UI has deliberately not acted on it, so its
+                # Cancel button is still enabled in this scenario.
+                delivered["installing_emitted"] = True
+                delivered["ui_processed"] = False
+            return original_progress(phase, percent, message, bytes_done, bytes_total, cancellable)
+
+        def request_before_processing(s):
+            s["state_during_unprocessed_event"] = read_state(boundary_state)
+            s["accepted"] = ui_cancel_request(boundary_state, boundary_marker)
+
+        installer.progress_event = observe_progress
+        restore, seen = with_commit_hook(request_before_processing)
+        try:
+            install_quietly(pending, real2, "v2.0.0")
+        finally:
+            installer.progress_event = original_progress
+            restore()
+        assert delivered.get("installing_emitted") is True, delivered
+        assert delivered.get("ui_processed") is False, delivered
+        assert seen["state_during_unprocessed_event"] == "committing", seen
+        assert seen["accepted"] is False, seen
+        assert not boundary_marker.exists()
+        assert installer.installed_port_version(pending) == "v2.0.0"
+
+        # (4) A late cancellation marker does not change a successful result.
+        late_success = fresh("boundary-late-marker")
+
+        def mark_late(s):
+            boundary_marker.write_text("late\n")
+
+        restore, seen = with_commit_hook(mark_late)
+        try:
+            install_quietly(late_success, real2, "v2.0.0")
+        finally:
+            restore()
+        assert boundary_marker.exists()
+        assert read_state(boundary_state) == "committed"
+        assert installer.installed_port_version(late_success) == "v2.0.0"
+        boundary_marker.unlink()
+
+        # (5) A genuine failure past the boundary stays a failure: it must not
+        # be reported as the cancellation that was (correctly) refused, and the
+        # committed-then-failed transaction must roll back to the old release.
+        failing = fresh("boundary-commit-failure")
+        failing_baseline = managed_snapshot(failing)
+        original_replace = installer.os.replace
+        calls = {"n": 0}
+
+        def fail_mid_commit(src, dst):
+            if Path(dst).parent == failing and Path(src).parent.name == "payload":
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    boundary_marker.write_text("late\n")
+                    raise OSError("simulated failure after the boundary")
+            return original_replace(src, dst)
+
+        installer.os.replace = fail_mid_commit
+        try:
+            try:
+                install_quietly(failing, real2, "v2.0.0")
+            except Exception as exc:
+                assert not isinstance(exc, installer.CancelledError), exc
+                assert "simulated failure after the boundary" in str(exc), exc
+            else:
+                raise AssertionError("a post-boundary failure was ignored")
+        finally:
+            installer.os.replace = original_replace
+        assert managed_snapshot(failing) == failing_baseline, "a failed commit must roll back"
+        assert not list(failing.parent.glob(installer.TXN_PREFIX + "*"))
+        boundary_marker.unlink()
+
+        # (6) A subsequent update is unaffected by the state the cancelled
+        # operation left behind: the launcher resets it to "open".
+        follow = fresh("boundary-follow-up")
+        # The state a cancelled operation leaves behind.
+        boundary_state.write_text("cancelled\n")
+        boundary_marker.write_text("stale\n")
+        # start_progress performs exactly this reset before every operation.
+        boundary_marker.unlink()
+        installer.write_cancel_state(installer.CANCEL_STATE_OPEN)
+        install_quietly(follow, real2, "v2.0.0")
+        assert installer.installed_port_version(follow) == "v2.0.0"
+        assert read_state(boundary_state) == "committed"
+
+        # The boundary and the request are mutually exclusive: over many
+        # simultaneous attempts, an accepted request is always honoured and a
+        # commit never coexists with one.
+        cancelled_trials = 0
+        for _ in range(80):
+            boundary_state.write_text("open\n")
+            boundary_marker.unlink(missing_ok=True)
+            race = {}
+            start = threading.Barrier(2)
+
+            def installer_side():
+                start.wait()
+                race["boundary"] = installer.cancel_boundary()
+
+            def ui_side():
+                start.wait()
+                race["request"] = ui_cancel_request(boundary_state, boundary_marker)
+
+            threads = [threading.Thread(target=installer_side), threading.Thread(target=ui_side)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            assert not (race["request"] and not race["boundary"]), race
+            if race["boundary"]:
+                assert boundary_marker.exists()
+                assert read_state(boundary_state) == "cancelled"
+                cancelled_trials += 1
+            else:
+                assert race["request"] is False, race
+                assert read_state(boundary_state) == "committing"
+        assert cancelled_trials > 0, "the race never exercised the cancellation-wins path"
+    finally:
+        for key, value in saved_cancel_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        boundary_marker.unlink(missing_ok=True)
+
+    # The GTK UI must take the same lock and consult the same state file, so
+    # the handshake cannot be bypassed by the window itself.
+    ui_source = (PACKAGE / "bootstrapper-ui.c").read_text()
+    assert "flock(fd, LOCK_EX)" in ui_source, "the UI must take the shared cancel lock"
+    assert '"%s.lock"' in ui_source, "the UI must use the shared lock file"
+    assert '.bootstrap-cancel-state' in ui_source, "the UI must read the shared state file"
+    assert "can no longer be cancelled" in ui_source, "the UI must show a refusal, not an accepted cancel"
+
+    # ------------------------------------------------------------------
+    # A cleanup failure after a durable commit is reported as applied, never
+    # as a failed update that kept the previous release.
+    # ------------------------------------------------------------------
+    def fail_finalize(*_args, **_kwargs):
+        raise OSError("simulated cleanup failure")
+
+    def commit_then_fail_cleanup(name: str) -> Path:
+        path = root / name
+        install_quietly(path, real1, "v1.0.0")
+        installer.finalize_transaction = fail_finalize
+        try:
+            try:
+                install_quietly(path, real2, "v2.0.0")
+            except installer.CleanupPendingError as exc:
+                assert "cleanup" in str(exc).lower(), exc
+            else:
+                raise AssertionError("a failed cleanup was reported as a plain success")
+        finally:
+            installer.finalize_transaction = original_finalize
+        return path
+
+    original_finalize = installer.finalize_transaction
+    pending_target = commit_then_fail_cleanup("cleanup-pending")
+    # The new release is live: a committed install is never rolled back because
+    # deleting obsolete backups failed.
+    assert installer.installed_port_version(pending_target) == "v2.0.0"
+    assert (pending_target / "run.sh").read_bytes() == (real2 / "run.sh").read_bytes()
+    # The committed transaction is kept as evidence for the retry.
+    pending_txns = list(pending_target.parent.glob(installer.TXN_PREFIX + "*"))
+    assert len(pending_txns) == 1, pending_txns
+    journal = json.loads((pending_txns[0] / "journal.json").read_text(encoding="utf-8"))
+    assert journal["state"] == "committed", journal["state"]
+    assert (pending_txns[0] / "backup" / "run.sh").is_file(), "cleanup evidence must be retained"
+    # A later recovery finishes the cleanup, idempotently.
+    installer.recover_transactions(pending_target)
+    assert not list(pending_target.parent.glob(installer.TXN_PREFIX + "*"))
+    assert installer.installed_port_version(pending_target) == "v2.0.0"
+    installer.recover_transactions(pending_target)
+    assert installer.installed_port_version(pending_target) == "v2.0.0"
+
+    # A cleanup that keeps failing must not block the launcher and must not
+    # discard the committed release or its evidence.
+    stuck_target = commit_then_fail_cleanup("cleanup-stuck")
+    stuck_txns = list(stuck_target.parent.glob(installer.TXN_PREFIX + "*"))
+    assert len(stuck_txns) == 1, stuck_txns
+    installer.finalize_transaction = fail_finalize
+    try:
+        installer.recover_transactions(stuck_target)  # must not raise
+    finally:
+        installer.finalize_transaction = original_finalize
+    assert installer.installed_port_version(stuck_target) == "v2.0.0"
+    assert list(stuck_target.parent.glob(installer.TXN_PREFIX + "*")) == stuck_txns
+    # And the real recovery entry point finishes it once cleanup can run.
+    recovered = cli(cli_env_map, "recover", "--prefix", str(stuck_target))
+    assert recovered.returncode == 0, (recovered.returncode, recovered.stderr)
+    assert not list(stuck_target.parent.glob(installer.TXN_PREFIX + "*"))
+    assert installer.installed_port_version(stuck_target) == "v2.0.0"
 
 print("PASS port version detection, packaged release metadata, legacy ownership adoption, "
       "cancellation boundaries, payload-independent recovery and preservation")

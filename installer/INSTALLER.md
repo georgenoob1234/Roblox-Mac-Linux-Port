@@ -87,6 +87,23 @@ and the launcher never kills the installer during the non-cancellable commit
 phase. The cancellable phases are bounded instead (network socket timeouts plus
 `ROBLOX_MAC_PORT_UPDATE_TIMEOUT`, default 30m).
 
+The commit boundary is settled through a small shared state file, not by
+progress-event delivery: the launcher writes `open` before an operation, the
+installer records `committing` at the boundary, and the GTK UI reads the same
+file under the same lock before recording a request. Whoever takes the lock
+first wins, so a request that loses to the commit is refused and shown as
+refused, and one that wins still cancels safely. Nothing about the report
+depends on the UI having processed a progress message. A stale marker or state
+from a previous run is cleared before each new operation (under the instance
+lock), so it can never cancel or block a later update.
+
+If the release commits but the obsolete-backup cleanup cannot finish, the
+installer exits with status 3 and the launcher reports the update as applied
+with cleanup pending -- never as a failure that kept the previous release,
+because the new release is already live. The committed transaction is kept as
+evidence and recovery retries the cleanup on the next start; a committed
+installation is never rolled back because deleting old backups failed.
+
 `FFlags.json` is user configuration. Its contents survive updates and
 uninstallation; remove it yourself before an update only when you intentionally
 want the release default.

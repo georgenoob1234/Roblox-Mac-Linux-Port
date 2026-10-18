@@ -11,6 +11,9 @@ import tempfile
 import zipfile
 
 root = Path(__file__).resolve().parents[1]
+build_release = (root / 'package/build-release.sh').read_text()
+assert 'installer/installer.py' in build_release and '.roblox-mac-port-version' in build_release
+assert 'installer.py' in (Path(__file__).resolve().parents[3] / '.github/scripts/verify-release-archive.sh').read_text()
 update_source = (root / 'package/update-roblox.sh').read_text()
 assert 'ROBLOX_MAC_PROGRESS_FD' in update_source and 'ROBLOX_MAC_CANCEL_FILE' in update_source
 assert 'spv-cache-v1' in update_source and 'previous' in update_source

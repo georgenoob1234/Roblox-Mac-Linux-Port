@@ -32,6 +32,7 @@ APP_ID = "roblox-mac-linux-port"
 APP_NAME = "Roblox Mac Linux Port"
 REPOSITORY = "georgenoob1234/Roblox-Mac-Linux-Port"
 MANIFEST_NAME = ".roblox-mac-port-install.json"
+PORT_VERSION_FILE = ".roblox-mac-port-version"
 TXN_PREFIX = ".roblox-mac-port-txn-"
 BACKUP_PREFIX = ".roblox-mac-port-backups"
 DESKTOP_STATE_NAME = "desktop.json"
@@ -56,6 +57,7 @@ PAYLOAD_FILES = {
     "run.sh",
     "update-roblox.sh",
     "installer.py",
+    PORT_VERSION_FILE,
 }
 REQUIRED_FILES = {
     "FFlags.json",
@@ -80,6 +82,26 @@ EXECUTABLE_FILES = {
 PROTECTED_NAMES = {"DO_NOT_SHARE", "RobloxVersion", ".update-work"}
 USER_CONFIG_FILES = {"FFlags.json"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+MAX_RELEASE_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
+                   bytes_total: int = 0, cancellable: bool = True) -> None:
+    raw_fd = os.environ.get("ROBLOX_MAC_PROGRESS_FD", "")
+    if not raw_fd.isdigit():
+        return
+    payload = json.dumps({"phase": phase, "percent": percent, "message": message,
+                          "bytes_done": bytes_done, "bytes_total": bytes_total,
+                          "cancellable": bool(cancellable)}, separators=(",", ":"))
+    try:
+        os.write(int(raw_fd), (payload + "\n").encode())
+    except (OSError, ValueError):
+        pass
+
+
+def cancellation_requested() -> bool:
+    marker = os.environ.get("ROBLOX_MAC_CANCEL_FILE", "")
+    return bool(marker and os.path.exists(marker))
 
 
 def _color(code: str, value: str) -> str:
@@ -305,6 +327,8 @@ def installer_lock() -> Iterator[None]:
 
 
 def assert_not_running(target: Path) -> None:
+    if os.environ.get("ROBLOX_MAC_LOCK_HELD") == "1":
+        return
     data = target / "DO_NOT_SHARE"
     data_st = lstat_or_none(data)
     if data_st is not None and stat.S_ISLNK(data_st.st_mode):
@@ -365,6 +389,44 @@ def load_manifest(target: Path) -> dict[str, Any] | None:
         if name not in PAYLOAD_FILES or not isinstance(info, dict) or not HEX64.fullmatch(str(info.get("sha256", ""))):
             fail(f"Installer manifest contains an unexpected entry ({name!r}). Refusing destructive changes.")
     return manifest
+
+
+def installed_port_version(target: Path) -> str:
+    manifest = load_manifest(target)
+    if manifest:
+        value = str(manifest.get("version") or "").strip()
+        if value and value != "local":
+            return value
+    version_path = target / PORT_VERSION_FILE
+    try:
+        value = version_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return value
+
+
+def infer_legacy_manifest(target: Path) -> dict[str, Any] | None:
+    """Adopt a direct extracted release without claiming unknown files."""
+    if not check_target_root(target):
+        return None
+    files: dict[str, Any] = {}
+    recognized = 0
+    for child in target.iterdir():
+        if child.name in PROTECTED_NAMES or child.name.startswith(TXN_PREFIX) or child.name == MANIFEST_NAME:
+            continue
+        if child.name not in PAYLOAD_FILES:
+            warn(f"Preserving unrelated pre-existing entry without modifying it: {child}")
+            continue
+        st = child.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            fail(f"Legacy port file is not a regular file; refusing to replace it: {child}")
+        files[child.name] = {"sha256": sha256_file(child), "mode": stat.S_IMODE(st.st_mode), "legacy": True}
+        recognized += 1
+    if not recognized or not REQUIRED_FILES.issubset(files):
+        return None
+    return {"schema": 1, "app_id": APP_ID, "app_name": APP_NAME,
+            "install_dir": str(target), "version": installed_port_version(target) or "legacy",
+            "source": "legacy-direct-release", "files": files}
 
 
 def check_source_root(raw: str | Path, target: Path) -> Path:
@@ -699,7 +761,7 @@ def build_operations(target: Path, old_manifest: dict[str, Any] | None, new_mani
                 continue
             operations.append({"path": name, "action": "replace", "had_old": True,
                                "old_hash": current_hash, "new_hash": new_record["sha256"],
-                               "modified": current_hash != old_record["sha256"]})
+                               "modified": bool(old_record.get("legacy")) or current_hash != old_record["sha256"]})
         elif old_record is not None:
             if name in USER_CONFIG_FILES:
                 warn(f"Preserving user configuration on uninstall: {dest}")
@@ -822,7 +884,15 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             target.parent.mkdir(parents=True, exist_ok=True)
     if not dry_run:
         recover_transactions(target)
-    old_manifest = inspect_target(target, {name: {} for name in (set(names) | {"installer.py"})})
+    existing_manifest = load_manifest(target) if check_target_root(target) else None
+    if existing_manifest is None and target.exists():
+        old_manifest = infer_legacy_manifest(target)
+        if old_manifest:
+            note("Adopting the recognized files in this direct release; unknown files and persistent data will be preserved.")
+        else:
+            old_manifest = inspect_target(target, {name: {} for name in (set(names) | {"installer.py"})})
+    else:
+        old_manifest = inspect_target(target, {name: {} for name in (set(names) | {"installer.py"})})
     target_exists = target.exists()
     if target_exists:
         assert_not_running(target)
@@ -872,6 +942,9 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             target.mkdir(parents=False, mode=0o755)
             target_created = True
             fsync_dir(target.parent)
+        if cancellation_requested():
+            fail("Port update cancelled.")
+        progress_event("installing", 94, "Installing the verified port files", 0, 0, False)
         apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
     except Exception:
         # If the transaction did not start, remove only our own staging area.
@@ -883,6 +956,7 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
                 target.rmdir()
         raise
     good(f"Application files installed at {target}")
+    progress_event("complete", 100, "Port update complete", 0, 0, False)
 
     # Data is migrated only if the destination has no data directory. It is
     # copied (never moved), so the original remains recoverable until the user
@@ -1493,20 +1567,33 @@ def download_file(url: str, destination: Path, expected_size: int = 0) -> None:
     if not url.startswith("https://github.com/"):
         fail(f"Refusing to download from an unexpected URL: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": f"{APP_ID}-installer"})
+    if expected_size > MAX_RELEASE_BYTES:
+        fail("The published release is larger than the supported download limit.")
+    progress_event("downloading", 15, "Downloading the Roblox Mac Linux Port release",
+                   0, expected_size, True)
     try:
         with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
             total_header = response.headers.get("Content-Length")
             total = int(total_header) if total_header and total_header.isdigit() else expected_size
+            if total > MAX_RELEASE_BYTES:
+                fail("The release download exceeds the supported size limit.")
             done = 0
             last_report = 0
             while True:
+                if cancellation_requested():
+                    fail("Port update cancelled.")
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 output.write(chunk)
                 done += len(chunk)
+                if done > MAX_RELEASE_BYTES:
+                    fail("The release download exceeds the supported size limit.")
                 if done - last_report >= 8 * 1024 * 1024:
                     last_report = done
+                    percent = min(75, 15 + int(done * 60 / total)) if total else -1
+                    progress_event("downloading", percent, "Downloading the Roblox Mac Linux Port release",
+                                   done, total, True)
                     if sys.stderr.isatty() and total:
                         percent = min(100, int(done * 100 / total))
                         print(f"\r  Downloading release: {percent:3d}% ({done // (1024*1024)} MiB)", end="", file=sys.stderr, flush=True)
@@ -1514,17 +1601,23 @@ def download_file(url: str, destination: Path, expected_size: int = 0) -> None:
             os.fsync(output.fileno())
             if sys.stderr.isatty():
                 print(file=sys.stderr)
+            progress_event("verifying", 78, "Verifying the downloaded release", done, total, True)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         fail(f"Download failed: {exc}")
 
 
 def extract_release_archive(archive_path: Path, destination: Path) -> Path:
+    if cancellation_requested():
+        fail("Port update cancelled.")
+    progress_event("staging", 84, "Staging the verified release", 0, 0, True)
     destination.mkdir(parents=True, exist_ok=True)
     try:
         with tarfile.open(archive_path, "r:gz") as tar:
             seen: set[str] = set()
             root_candidates: set[str] = set()
             for member in tar.getmembers():
+                if cancellation_requested():
+                    fail("Port update cancelled.")
                 raw = member.name
                 path = PurePosixPath(raw)
                 if path.is_absolute() or ".." in path.parts or not path.parts:
@@ -1563,11 +1656,14 @@ def extract_release_archive(archive_path: Path, destination: Path) -> Path:
     missing = sorted(REQUIRED_FILES - {p.name for p in destination.iterdir()})
     if missing:
         fail("Downloaded release is incomplete; missing: " + ", ".join(missing))
+    progress_event("staging", 90, "Release files staged and validated", 0, 0, True)
     return destination
 
 
 def get_source_for_action(action: str, target: Path, source_arg: str | None,
                           dry_run: bool = False) -> tuple[Path | None, str | None, tempfile.TemporaryDirectory | None]:
+    if cancellation_requested():
+        fail("Port update cancelled.")
     if source_arg:
         source = check_source_root(source_arg, target)
         safe_payload_names(source)
@@ -1582,6 +1678,7 @@ def get_source_for_action(action: str, target: Path, source_arg: str | None,
         note(f"Would download verified release {metadata['tag']} from GitHub.")
         return None, metadata["tag"], None
     metadata = latest_release_metadata()
+    progress_event("checking", 5, f"Found release {metadata['tag']}", 0, metadata["size"], True)
     target.parent.mkdir(parents=True, exist_ok=True)
     free_bytes = shutil.disk_usage(target.parent).free
     estimated_peak = max(512 * 1024 * 1024, metadata["size"] * 2 + 64 * 1024 * 1024)
@@ -1594,6 +1691,7 @@ def get_source_for_action(action: str, target: Path, source_arg: str | None,
     note(f"Downloading the official release from {REPOSITORY}…")
     download_file(metadata["url"], archive, metadata["size"])
     actual = sha256_file(archive)
+    progress_event("verifying", 80, "Verifying the release checksum", metadata["size"], metadata["size"], True)
     if actual != metadata["digest"]:
         temp_obj.cleanup()
         fail("SHA-256 verification failed for the downloaded release. The archive was rejected.")
@@ -1631,6 +1729,20 @@ def status(target: Path) -> None:
     extras = [p.name for p in target.iterdir() if p.name not in set(manifest['files']) | {MANIFEST_NAME}]
     if extras:
         print("Other preserved entries: " + ", ".join(sorted(extras)[:12]) + (" …" if len(extras) > 12 else ""))
+
+
+def release_status(target: Path) -> None:
+    latest = latest_release_metadata()
+    print(json.dumps({"installed_version": installed_port_version(target),
+                      "latest_version": latest["tag"],
+                      "asset": "RobloxLinuxRelease.tar.gz",
+                      "asset_url": latest["url"],
+                      "sha256": latest["digest"],
+                      "size": latest["size"]}, separators=(",", ":")))
+
+
+def release_version(target: Path) -> None:
+    print(installed_port_version(target))
 
 
 TITLE_LINES = (
@@ -1846,6 +1958,7 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--yes", action="store_true", help="Assume yes for confirmations; never bypasses file-safety checks")
     parser.add_argument("--dry-run", action="store_true", help="Show planned changes without modifying files")
     parser.add_argument("--force-desktop", action="store_true", help="Back up and replace conflicting desktop files/default URI handlers")
+    parser.add_argument("--no-desktop", action="store_true", help=argparse.SUPPRESS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1867,6 +1980,10 @@ def build_parser() -> argparse.ArgumentParser:
     data_choice.add_argument("--purge-data", dest="keep_data", action="store_false", help="Remove app data inside the install root after confirmation")
     p.set_defaults(keep_data=True)
     p = sub.add_parser("status", help="Show install and desktop-integration status")
+    p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
+    p = sub.add_parser("release-status", help="Query the canonical latest release metadata")
+    p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
+    p = sub.add_parser("release-version", help="Print the installed release version")
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
     p = sub.add_parser("desktop", help="Manage the user-local .desktop launcher and roblox:// URI handler")
     p.add_argument("action", choices=("install", "uninstall"))
@@ -1892,6 +2009,12 @@ def main(argv: list[str] | None = None) -> int:
     with installer_lock():
         if args.command == "status":
             status(target)
+            return 0
+        if args.command == "release-status":
+            release_status(target)
+            return 0
+        if args.command == "release-version":
+            release_version(target)
             return 0
         if args.command == "desktop":
             if args.action == "install":
@@ -1952,7 +2075,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             try:
                 run_install_or_update(target, source, tag, dry_run=args.dry_run, yes=args.yes,
-                                      force_desktop=args.force_desktop, confirmed=confirmed)
+                                      force_desktop=args.force_desktop, confirmed=confirmed,
+                                      install_desktop_integration=not args.no_desktop)
             finally:
                 if temp_obj:
                     temp_obj.cleanup()

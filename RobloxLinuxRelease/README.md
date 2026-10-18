@@ -117,6 +117,12 @@ verification or shader preparation removes staging data, keeps the previous
 client, and returns without launching a browser link. A timeout or an ask-mode
 decline launches without updating. If GTK or a display is not available,
 launches continue without updating and a desktop notification is attempted.
+Settings also has a separate Port updates section. It checks the canonical
+GitHub release metadata and updates only installer-owned release files through
+the verified `installer.py` transaction. `RobloxVersion/`, `DO_NOT_SHARE/`,
+unknown files and modified files are preserved. The port update uses the same
+bootstrapper progress window and returns to Settings after success, failure or
+cancellation.
 The Play page's Open last log action opens the newest diagnostics file; logs can
 contain account details and should not be shared blindly.
 The native UI and media libraries are built or packaged in Ubuntu 24.04. Release

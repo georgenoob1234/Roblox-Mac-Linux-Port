@@ -229,6 +229,8 @@ case "${1:-}" in
         "$HERE/RobloxLinux.AppImage" "$@"
         _status=$?
         exit $_status;;
+    port-version)
+        exec python3 "$HERE/bootstrap.py" port-version "$HERE";;
 esac
 [ -t 2 ] || export ROBLOX_MAC_NO_TERMINAL=1
 "$HERE/bootstrap.sh" "$@"

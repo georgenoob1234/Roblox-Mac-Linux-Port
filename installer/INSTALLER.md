@@ -52,6 +52,10 @@ python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" update \
   --source "$HOME/Downloads/RobloxLinuxRelease" --yes
 ```
 
+The installed release records its port version in `.roblox-mac-port-version`;
+the GTK Settings Port updates section uses the same release metadata, checksum,
+ownership manifest and transaction path as this CLI.
+
 Updates stage and hash the payload before an atomic switch. If an operation is
 interrupted, the next install, update, repair, or uninstall finds the journal,
 rolls back safely, and keeps evidence when recovery is incomplete. Close Roblox

@@ -369,6 +369,29 @@ do_update() {
     event update 100 'Update complete' 0 0 false
 }
 
+do_port_update() {
+    if [ ! -f "$HERE/installer.py" ]; then
+        event failed 0 'Port updater is not included in this release' 0 0 false
+        say 'Port updater is unavailable; install a release containing installer.py.'
+        return 1
+    fi
+    event checking 5 'Checking the latest port release' 0 0 true
+    if ! timeout --foreground --kill-after=5s "${ROBLOX_MAC_PORT_UPDATE_TIMEOUT:-30m}" sh -c \
+        'exec "$@"' sh env ROBLOX_MAC_PROGRESS_FD=8 \
+            ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
+            ROBLOX_MAC_LOCK_HELD=1 \
+            python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop; then
+        if cancelled; then
+            event cancelled 0 'Port update cancelled; the current release was kept' 0 0 false
+            return 125
+        fi
+        event failed 0 'Port update failed; the current release was kept' 0 0 false
+        return 1
+    fi
+    event update 100 'Port update complete' 0 0 false
+    return 0
+}
+
 status_json() { python3 "$HELPER" status "$DATA" "$HERE/RobloxVersion"; }
 
 command=${1:-launch}
@@ -416,6 +439,25 @@ case "$command" in
     update-settings)
         [ "$#" -eq 1 ] || { echo 'Usage: run.sh update-settings' >&2; exit 2; }
         sh "$HERE/run.sh" update
+        update_result=$?
+        sh "$HERE/run.sh" --settings
+        settings_result=$?
+        [ "$settings_result" -eq 0 ] || exit "$settings_result"
+        exit "$update_result";;
+    port-update)
+        EVENTS=1
+        mkdir -p "$DATA"; exec 9>"$DATA/instance.lock"
+        if ! flock -n -E 73 9; then
+            event failed 0 'Close Roblox before updating the port' 0 0 false
+            finish_progress; exit 1
+        fi
+        start_progress
+        do_port_update; result=$?; finish_progress; exec 9>&-
+        [ "$UI_CANCELLED" -eq 1 ] && result=125
+        exit "$result";;
+    port-update-settings)
+        [ "$#" -eq 1 ] || { echo 'Usage: run.sh port-update-settings' >&2; exit 2; }
+        sh "$HERE/run.sh" port-update
         update_result=$?
         sh "$HERE/run.sh" --settings
         settings_result=$?

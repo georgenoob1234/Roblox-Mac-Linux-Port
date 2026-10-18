@@ -70,6 +70,7 @@ def make_release(root: Path, version: str = "one") -> Path:
         path.write_bytes(contents[name])
         if name.endswith((".sh", ".py", ".AppImage")):
             path.chmod(0o755)
+    (source / installer.PORT_VERSION_FILE).write_text(version + "\n")
     (source / "unexpected-source.txt").write_text("ignored\n")
     return source
 
@@ -77,7 +78,7 @@ def make_release(root: Path, version: str = "one") -> Path:
 def assert_manifest(target: Path) -> dict:
     manifest = json.loads((target / installer.MANIFEST_NAME).read_text())
     assert manifest["install_dir"] == str(target)
-    assert set(manifest["files"]) == set(REQUIRED) | {"installer.py"}
+    assert set(manifest["files"]) == set(REQUIRED) | {"installer.py", installer.PORT_VERSION_FILE}
     return manifest
 
 

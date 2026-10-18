@@ -241,6 +241,7 @@ python3 runtime/package/check-uri-handoff.py
 
 # Bootstrapper UI and appearance settings
 python3 runtime/package/check-bootstrapper.py
+python3 runtime/package/check-port-updater.py
 
 # Wayland backend, IME, profiler overlay and desktop cursor tests
 sh runtime/optimized/ui-build.sh
@@ -399,6 +400,8 @@ sha256sum -c RobloxLinuxRelease.tar.gz.sha256
 | `update-roblox.sh` | Downloads/updates the Roblox client and prepares shaders |
 | `run.sh` | Diagnostic launcher |
 | `bootstrap.sh` / `bootstrap.py` | Dependency fetcher (for advanced users) |
+| `installer.py` | Verified per-user release ownership and update transaction |
+| `.roblox-mac-port-version` | Installed port release version metadata |
 | `install-uri-handler.sh` | Registers `roblox://` and `roblox-player:` URI handler |
 | `icon.png` / `icon_bw.png` | Application icons |
 | `README.md` | End-user instructions |

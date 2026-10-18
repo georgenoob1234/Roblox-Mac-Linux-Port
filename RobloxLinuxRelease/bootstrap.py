@@ -16,6 +16,8 @@ DEFAULTS = {
     "last_known_latest_display": "",
     "window_decoration": "auto",
     "cursor_appearance": "system",
+    "port_last_check": 0,
+    "port_latest": "",
 }
 VALID_MODES = {"auto", "ask", "off"}
 VALID_DECORATIONS = {"auto", "system", "gtk", "legacy"}
@@ -48,12 +50,12 @@ def read_settings(data):
         values["check_interval_hours"] = max(0, interval)
     except (TypeError, ValueError):
         values["check_interval_hours"] = DEFAULTS["check_interval_hours"]
-    for key in ("last_check",):
+    for key in ("last_check", "port_last_check"):
         try:
             values[key] = max(0, int(values.get(key, 0)))
         except (TypeError, ValueError):
             values[key] = 0
-    for key in ("skipped_version", "last_known_latest", "last_known_latest_display"):
+    for key in ("skipped_version", "last_known_latest", "last_known_latest_display", "port_latest"):
         value = values.get(key, "")
         values[key] = value if isinstance(value, str) else ""
     if values.get("window_decoration") not in VALID_DECORATIONS:
@@ -179,7 +181,7 @@ def main(argv):
                 raise SystemExit("cursor_appearance must be system or legacy")
             if key == "check_interval_hours":
                 value = max(0, int(value))
-            elif key in {"last_check"}:
+            elif key in {"last_check", "port_last_check"}:
                 value = max(0, int(value))
             values[key] = value
             write_settings(data, values)
@@ -210,6 +212,23 @@ def main(argv):
         return
     if command == "event" and len(argv) == 5:
         emit(argv[2], int(argv[3]), argv[4])
+        return
+    if command == "port-version" and len(argv) == 3:
+        root = Path(argv[2])
+        manifest = root / ".roblox-mac-port-install.json"
+        version_file = root / ".roblox-mac-port-version"
+        value = ""
+        try:
+            raw = json.loads(manifest.read_text())
+            value = str(raw.get("version") or "") if isinstance(raw, dict) else ""
+        except (OSError, ValueError, TypeError):
+            pass
+        if not value or value == "local":
+            try:
+                value = version_file.read_text().strip()
+            except OSError:
+                value = ""
+        print(value)
         return
     if command == "due" and len(argv) == 4:
         values = read_settings(argv[2])

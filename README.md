@@ -30,6 +30,11 @@ python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" status
 python3 "$HOME/.local/opt/roblox-mac-linux-port/installer.py" uninstall --yes
 ```
 
+The GTK Settings page also includes **Port updates**. It checks the canonical
+GitHub release asset (`RobloxLinuxRelease.tar.gz`), verifies its published
+SHA-256, and applies the ownership-aware installer transaction while preserving
+`RobloxVersion/`, `DO_NOT_SHARE/`, and unknown files.
+
 Uninstall removes only unchanged files recorded in the install manifest. It
 preserves `DO_NOT_SHARE` (cookies, settings, caches and logs) by default,
 along with user-modified and unexpected files. The directory is left behind

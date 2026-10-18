@@ -51,12 +51,14 @@ typedef struct {
     GtkWidget *window, *stack, *play_version, *play_status;
     GtkWidget *settings_current, *settings_latest, *settings_checked, *settings_skipped, *info_client;
     GtkWidget *mode, *interval, *update, *message;
+    GtkWidget *port_current, *port_latest, *port_checked, *port_check, *port_update, *port_message;
     GtkWidget *decorations_combo, *cursor_combo, *appearance_hint;
     GtkWidget *check;
-    GSubprocess *check_process;
+    GSubprocess *check_process, *port_process;
     GPid launch_pid;
     guint launch_check_id;
     gboolean running, update_available, check_in_progress, handoff;
+    gboolean port_update_available, port_check_in_progress, port_handoff;
 } LauncherState;
 
 typedef struct { GtkWidget *window; int result; } DialogState;
@@ -286,6 +288,33 @@ static void settings_refresh(LauncherState *state) {
     if (state->decorations_combo) gtk_combo_box_set_active_id(GTK_COMBO_BOX(state->decorations_combo), dec);
     if (state->cursor_combo) gtk_combo_box_set_active_id(GTK_COMBO_BOX(state->cursor_combo), cur);
     gtk_widget_set_sensitive(state->update, !state->check_in_progress && !state->running && state->update_available); gtk_widget_set_tooltip_text(state->update, state->running ? "Close Roblox before updating." : (state->update_available ? "Update the installed client now." : "Already up to date.")); if (state->check) gtk_widget_set_sensitive(state->check, !state->check_in_progress); if (!state->check_in_progress && !state->handoff) { if (state->running) settings_message(state, "Roblox is running; Update now is disabled until it closes."); else if (state->update_available) settings_message(state, "An update is available."); else settings_message(state, "Your installed client is up to date."); }
+    char *port_version = NULL;
+    run_release(state->root, "port-version", NULL, NULL, &port_version);
+    if (port_version) g_strstrip(port_version);
+    const char *port_latest = settings ? json_string(settings, "port_latest") : "";
+    gint64 port_checked = settings ? json_int(settings, "port_last_check") : 0;
+    state->port_update_available = port_version && *port_version && *port_latest && g_strcmp0(port_version, port_latest);
+    set_prefixed(state->port_current, "Installed port version: ", port_version);
+    set_prefixed(state->port_latest, "Latest port version: ", port_latest);
+    char port_checked_text[64] = "—";
+    if (port_checked > 0) {
+        GDateTime *date = g_date_time_new_from_unix_local(port_checked);
+        gchar *formatted = g_date_time_format(date, "%Y-%m-%d %H:%M");
+        g_strlcpy(port_checked_text, formatted, sizeof port_checked_text);
+        g_free(formatted); g_date_time_unref(date);
+    }
+    set_prefixed(state->port_checked, "Last successful port check: ", port_checked_text);
+    gtk_widget_set_sensitive(state->port_update, !state->port_check_in_progress && !state->port_handoff && !state->running && state->port_update_available);
+    gtk_widget_set_tooltip_text(state->port_update, state->running ? "Close Roblox before updating the port." : (state->port_update_available ? "Install the latest port release." : "No port update is available."));
+    if (state->port_check) gtk_widget_set_sensitive(state->port_check, !state->port_check_in_progress && !state->port_handoff);
+    if (!state->port_check_in_progress && !state->port_handoff) {
+        if (state->running) label_text(state->port_message, "Close Roblox before updating the port.");
+        else if (!port_version || !*port_version) label_text(state->port_message, "Installed port version is unknown; check for a release before updating.");
+        else if (state->port_update_available) label_text(state->port_message, "A newer port release is available.");
+        else if (!*port_latest) label_text(state->port_message, "No successful port update check has been recorded yet.");
+        else label_text(state->port_message, "The port is up to date.");
+    }
+    g_free(port_version);
     json_object_unref(object);
 }
 static void setting_set(LauncherState *state, const char *key, const char *value) { if (!run_release(state->root, "set", key, value, NULL)) settings_message(state, "Could not save this setting."); }
@@ -366,10 +395,72 @@ static void settings_update(GtkButton *button, gpointer data) {
     gtk_widget_hide(state->window);
     gtk_widget_destroy(state->window);
 }
+static void settings_port_check_done(GObject *source, GAsyncResult *result, gpointer data) {
+    LauncherState *state = data;
+    GSubprocess *process = G_SUBPROCESS(source);
+    gchar *output = NULL, *error_output = NULL;
+    GError *error = NULL;
+    gboolean communicated = g_subprocess_communicate_utf8_finish(process, result, &output, &error_output, &error);
+    JsonObject *metadata = communicated && g_subprocess_get_if_exited(process) && g_subprocess_get_exit_status(process) == 0
+        ? parse_json(output) : NULL;
+    gboolean ok = metadata && *json_string(metadata, "latest_version");
+    if (error) g_clear_error(&error);
+    g_free(output); g_free(error_output);
+    state->port_check_in_progress = FALSE;
+    state->port_process = NULL;
+    g_object_unref(process);
+    if (ok) {
+        char checked[32]; g_snprintf(checked, sizeof checked, "%lld", (long long)time(NULL));
+        setting_set(state, "port_latest", json_string(metadata, "latest_version"));
+        setting_set(state, "port_last_check", checked);
+    }
+    settings_refresh(state);
+    if (ok) label_text(state->port_message, state->port_update_available ? "A newer port release is available." : "The port is up to date.");
+    else label_text(state->port_message, "Could not check for port updates. Verify the network and try again.");
+    if (metadata) json_object_unref(metadata);
+}
+static void settings_port_check(GtkButton *button, gpointer data) {
+    LauncherState *state = data;
+    if (state->port_check_in_progress || state->port_handoff) return;
+    char *installer = g_build_filename(state->root, "installer.py", NULL);
+    char *prefix = g_strdup(state->root);
+    const gchar *argv[] = {"python3", installer, "release-status", "--prefix", prefix, NULL};
+    GSubprocessLauncher *launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE);
+    gchar **environment = host_environment();
+    g_subprocess_launcher_set_environ(launcher, environment); g_strfreev(environment);
+    GError *error = NULL;
+    GSubprocess *process = g_subprocess_launcher_spawnv(launcher, argv, &error);
+    g_object_unref(launcher); g_free(installer); g_free(prefix);
+    if (!process) {
+        label_text(state->port_message, error ? error->message : "Could not start the port update check.");
+        g_clear_error(&error); return;
+    }
+    state->port_process = process; state->port_check_in_progress = TRUE;
+    gtk_widget_set_sensitive(state->port_check, FALSE); gtk_widget_set_sensitive(state->port_update, FALSE);
+    label_text(state->port_message, "Checking for port updates…");
+    g_subprocess_communicate_utf8_async(process, NULL, NULL, settings_port_check_done, state);
+}
+static void settings_port_update(GtkButton *button, gpointer data) {
+    LauncherState *state = data;
+    if (state->running || !state->port_update_available || state->port_check_in_progress || state->port_handoff) return;
+    char *run = g_build_filename(state->root, "run.sh", NULL);
+    gchar *argv[] = {(gchar *)"sh", run, (gchar *)"port-update-settings", NULL};
+    gchar **environment = host_environment();
+    environment = g_environ_unsetenv(environment, "ROBLOX_MAC_NO_PROGRESS");
+    GError *error = NULL;
+    gboolean spawned = g_spawn_async(state->root, argv, environment, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &error);
+    g_strfreev(environment); g_free(run);
+    if (!spawned) {
+        label_text(state->port_message, error ? error->message : "Could not start the port updater.");
+        g_clear_error(&error); settings_refresh(state); return;
+    }
+    state->port_handoff = TRUE;
+    gtk_widget_hide(state->window); gtk_widget_destroy(state->window);
+}
 static void settings_reset(GtkButton *button, gpointer data) { LauncherState *state = data; setting_set(state, "skipped_version", ""); settings_refresh(state); }
 static gboolean launcher_delete(GtkWidget *window, GdkEvent *event, gpointer data) {
     LauncherState *state = data;
-    if (state->check_in_progress) {
+    if (state->check_in_progress || state->port_check_in_progress) {
         settings_message(state, "Please wait for the update check to finish.");
         return TRUE;
     }
@@ -437,6 +528,31 @@ static int run_launcher(const char *root, gboolean settings_page) {
     state->message = label(NULL, "status");
     gtk_box_pack_start(GTK_BOX(update_header), state->message, FALSE, FALSE, 0);
 
+    GtkWidget *port_separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(settings), port_separator, FALSE, FALSE, 8);
+    GtkWidget *port_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_box_pack_start(GTK_BOX(settings), port_section, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(port_section), label("Port updates", "section-title"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(port_section), label("Updates the Roblox Mac Linux Port files while preserving the client and your data.", "subtitle"), FALSE, FALSE, 0);
+    state->port_current = label(NULL, "update-value");
+    state->port_latest = label(NULL, "update-value");
+    state->port_checked = label(NULL, "update-value");
+    gtk_box_pack_start(GTK_BOX(port_section), state->port_current, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(port_section), state->port_latest, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(port_section), state->port_checked, FALSE, FALSE, 0);
+    GtkWidget *port_actions = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_button_box_set_layout(GTK_BUTTON_BOX(port_actions), GTK_BUTTONBOX_START);
+    gtk_box_set_spacing(GTK_BOX(port_actions), 8);
+    gtk_box_pack_start(GTK_BOX(port_section), port_actions, FALSE, FALSE, 4);
+    state->port_check = gtk_button_new_with_mnemonic("_Check for port updates");
+    g_signal_connect(state->port_check, "clicked", G_CALLBACK(settings_port_check), state);
+    gtk_container_add(GTK_CONTAINER(port_actions), state->port_check);
+    state->port_update = gtk_button_new_with_mnemonic("_Update port");
+    gtk_style_context_add_class(gtk_widget_get_style_context(state->port_update), "accent");
+    g_signal_connect(state->port_update, "clicked", G_CALLBACK(settings_port_update), state);
+    gtk_container_add(GTK_CONTAINER(port_actions), state->port_update);
+    state->port_message = label(NULL, "status");
+    gtk_box_pack_start(GTK_BOX(port_section), state->port_message, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(settings), label("Launch behavior", "section-title"), FALSE, FALSE, 0);
     GtkWidget *grid = gtk_grid_new();
     gtk_grid_set_row_spacing(GTK_GRID(grid), 12);

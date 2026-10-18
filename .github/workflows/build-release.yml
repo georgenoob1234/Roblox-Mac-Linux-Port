@@ -131,6 +131,7 @@ jobs:
       cancel-in-progress: false
     env:
       BUILD_JOBS: '2'
+      ROBLOX_MAC_PORT_VERSION: ${{ needs.validate.outputs.tag }}
       PERSISTENT_CHECKOUT: /home/runner/r
       # Per-run staging directory name (unique per run and attempt),
       # resolved under the runner's temp directory via $RUNNER_TEMP.

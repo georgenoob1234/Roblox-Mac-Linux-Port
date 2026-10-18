@@ -17,6 +17,8 @@ assert "bytes_done" in ui_source and "cancellable" in ui_source and "Cancel" in 
 assert "g_subprocess_communicate_utf8_async" in ui_source and "update-settings" in ui_source
 assert "progress_delete" in ui_source and "ROBLOX_MAC_NO_PROGRESS" in ui_source
 assert ".nav:checked" in ui_source and "@theme_selected_bg_color" in ui_source
+assert "update-header" in ui_source and "Check for updates" in ui_source and "section-title" in ui_source
+assert 'gtk_style_context_add_class(gtk_widget_get_style_context(state->update), "accent")' in ui_source
 assert "window_decoration" in ui_source and "cursor_appearance" in ui_source
 assert "Restore appearance defaults" in ui_source
 fetch_source = (ROOT / "scripts/fetch-client.sh").read_text()

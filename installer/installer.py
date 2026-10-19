@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -171,21 +172,52 @@ def _assert_safe_cancel_state(path: Path) -> None:
         raise CancelProtocolError(f"Shared cancellation state is not owned by this user: {path}")
 
 
+def _open_safe_regular_file(path: Path, flags: int, description: str) -> int:
+    """Open a protocol file and confirm the *opened* descriptor is safe.
+
+    The lock/state protocol must never block, be redirected, or race: the open
+    uses O_NOFOLLOW so a symlink is not followed and O_NONBLOCK so a FIFO
+    planted at the path cannot block the open. The returned descriptor is then
+    validated with fstat() -- regular file, owned by this user -- rather than
+    only lstat-ing the path, so a concurrent replacement cannot slip a FIFO or a
+    foreign file past a check/use window. Raises CancelProtocolError on any
+    failure; the caller owns the returned descriptor.
+    """
+    open_flags = (flags | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, open_flags)
+    except OSError as exc:
+        raise CancelProtocolError(f"Cannot open the {description}: {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise CancelProtocolError(f"Cannot inspect the {description}: {path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise CancelProtocolError(f"The {description} is not a regular file: {path}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise CancelProtocolError(f"The {description} is not owned by this user: {path}")
+    return fd
+
+
 def read_cancel_state() -> str:
     """Return the shared state, or "" when the protocol is not configured.
 
     A configured-but-unusable state is a protocol failure, not a reason to fall
     back to the marker alone, so a missing, unreadable, unsafe, or malformed
-    state raises CancelProtocolError.
+    state raises CancelProtocolError. The state is validated on the opened
+    descriptor (not merely the path) before it is read.
     """
     path = _cancel_state_path()
     if path is None:
         return ""
-    _assert_safe_cancel_state(path)
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as exc:
-        raise CancelProtocolError(f"Cannot open the shared cancellation state: {path}: {exc}") from exc
+    fd = _open_safe_regular_file(path, os.O_RDONLY, "shared cancellation state")
     try:
         with os.fdopen(fd, "rb", closefd=False) as stream:
             raw = stream.read()
@@ -225,7 +257,8 @@ def cancel_state_lock() -> Iterator[bool]:
     try:
         try:
             fd = os.open(lock_path, os.O_RDWR | os.O_CREAT
-                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                         | getattr(os, "O_NONBLOCK", 0), 0o600)
         except OSError as exc:
             raise CancelProtocolError(f"Cannot open the shared cancellation lock: {lock_path}: {exc}") from exc
         lock_st = os.fstat(fd)
@@ -413,6 +446,18 @@ class CleanupPendingError(InstallerError):
     """
 
 
+class TransactionDurabilityError(InstallerError):
+    """A transaction rename happened but its durability could not be confirmed.
+
+    Raised by the transaction-critical directory fsync when the confirming
+    fsync fails -- including a filesystem that reports directory fsync as
+    unsupported. A rename whose directory entry was not synced may be lost by a
+    crash, so the transaction must not claim durability it does not have: the
+    caller keeps its evidence, never rolls back on a guess, and lets recovery
+    re-establish durability and finish the cleanup.
+    """
+
+
 @contextlib.contextmanager
 def section(title: str) -> Iterator[None]:
     print("\n" + _color("1;36", f"── {title} " + "─" * max(2, 54 - len(title))))
@@ -509,7 +554,42 @@ def fsync_dir(path: Path) -> None:
         pass
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+# errno values that mean a filesystem does not support directory fsync at all,
+# rather than that the synced data failed to reach disk.
+_UNSUPPORTED_DIR_FSYNC_ERRNOS = frozenset(
+    code for code in (errno.EINVAL, errno.ENOSYS,
+                      getattr(errno, "ENOTSUP", errno.EINVAL),
+                      getattr(errno, "EOPNOTSUPP", errno.EINVAL))
+)
+
+
+def fsync_dir_strict(path: Path) -> None:
+    """Directory fsync for transaction-critical renames.
+
+    Unlike fsync_dir(), a failure is propagated: a rename whose directory entry
+    was not confirmed synced may be lost by a crash, so the transaction must not
+    claim durability it does not have. A filesystem that reports directory fsync
+    as unsupported is reported distinctly rather than treated as success, so the
+    caller can fail safely before mutating live files (or keep its evidence if
+    the failure happens after mutation already started).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise TransactionDurabilityError(f"Cannot open {path} to confirm durability: {exc}") from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        detail = " (directory fsync is not supported by this filesystem)" \
+            if exc.errno in _UNSUPPORTED_DIR_FSYNC_ERRNOS else ""
+        raise TransactionDurabilityError(
+            f"Cannot confirm the durability of {path}: {exc}{detail}") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600, durable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = lstat_or_none(path)
     if existing is not None and not stat.S_ISREG(existing.st_mode):
@@ -523,7 +603,13 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)
-        fsync_dir(path.parent)
+        # Transaction-critical callers (durable=True) must be able to tell a
+        # durable rename from one whose directory fsync failed, so they use the
+        # strict path; everyone else keeps the tolerant best-effort helper.
+        if durable:
+            fsync_dir_strict(path.parent)
+        else:
+            fsync_dir(path.parent)
     except Exception:
         try:
             temp.unlink(missing_ok=True)
@@ -536,8 +622,8 @@ def json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def atomic_json(path: Path, value: Any, mode: int = 0o600) -> None:
-    atomic_write(path, json_bytes(value), mode)
+def atomic_json(path: Path, value: Any, mode: int = 0o600, durable: bool = False) -> None:
+    atomic_write(path, json_bytes(value), mode, durable=durable)
 
 
 @contextlib.contextmanager
@@ -757,7 +843,7 @@ def copy_payload_to_stage(source: Path, names: list[str], stage: Path, release_t
     }
 
 
-def preserve_to_backup(source: Path, target_parent: Path, label: str) -> Path:
+def preserve_to_backup(source: Path, target_parent: Path, label: str, durable: bool = False) -> Path:
     backup_root = target_parent / BACKUP_PREFIX
     backup_st = lstat_or_none(backup_root)
     if backup_st is not None and (stat.S_ISLNK(backup_st.st_mode) or not stat.S_ISDIR(backup_st.st_mode)):
@@ -778,13 +864,14 @@ def preserve_to_backup(source: Path, target_parent: Path, label: str) -> Path:
     slot.mkdir(mode=0o700)
     destination = slot / source.name
     os.replace(source, destination)
-    fsync_dir(source.parent)
-    fsync_dir(slot)
+    sync = fsync_dir_strict if durable else fsync_dir
+    sync(source.parent)
+    sync(slot)
     return destination
 
 
-def write_journal(txn: Path, journal: dict[str, Any]) -> None:
-    atomic_json(txn / "journal.json", journal, 0o600)
+def write_journal(txn: Path, journal: dict[str, Any], durable: bool = True) -> None:
+    atomic_json(txn / "journal.json", journal, 0o600, durable=durable)
 
 
 def _persisted_journal_state(txn: Path) -> str | None:
@@ -843,14 +930,14 @@ def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> No
                     dest.unlink()
                 else:
                     try:
-                        saved = preserve_to_backup(dest, target.parent, "recovery-conflict")
+                        saved = preserve_to_backup(dest, target.parent, "recovery-conflict", durable=True)
                         warn(f"A file changed during recovery; preserved it at {saved}")
                     except Exception as exc:
                         conflicts.append(f"could not preserve unexpected {dest}: {exc}")
                         continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(backup, dest)
-            fsync_dir(dest.parent)
+            fsync_dir_strict(dest.parent)
         elif op.get("had_old"):
             # No backup means the original rename had not started; leave the
             # original in place. If it vanished, retain the journal as evidence.
@@ -876,7 +963,7 @@ def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> No
                 manifest.unlink()
             else:
                 try:
-                    saved = preserve_to_backup(manifest, target.parent, "recovery-manifest-conflict")
+                    saved = preserve_to_backup(manifest, target.parent, "recovery-manifest-conflict", durable=True)
                     warn(f"An unexpected manifest was preserved at {saved}")
                 except Exception as exc:
                     conflicts.append(f"could not preserve unexpected manifest: {exc}")
@@ -893,7 +980,7 @@ def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> No
     if conflicts:
         fail("Could not fully recover an interrupted installer transaction. Evidence was kept at " + str(txn) + ": " + "; ".join(conflicts))
     shutil.rmtree(txn)
-    fsync_dir(target.parent)
+    fsync_dir_strict(target.parent)
     if journal.get("target_created") and target.is_dir():
         with contextlib.suppress(OSError):
             target.rmdir()
@@ -907,7 +994,7 @@ def finalize_transaction(target: Path, txn: Path, journal: dict[str, Any], prese
         if lstat_or_none(backup) is None:
             continue
         if op.get("modified") and op.get("had_old") and preserve_modified:
-            saved = preserve_to_backup(backup, target.parent, "user-modified")
+            saved = preserve_to_backup(backup, target.parent, "user-modified", durable=True)
             good(f"Preserved your modified {rel} at {saved}")
         else:
             _remove_if_regular_or_symlink(backup)
@@ -915,7 +1002,7 @@ def finalize_transaction(target: Path, txn: Path, journal: dict[str, Any], prese
     if lstat_or_none(manifest_backup) is not None:
         _remove_if_regular_or_symlink(manifest_backup)
     shutil.rmtree(txn)
-    fsync_dir(target.parent)
+    fsync_dir_strict(target.parent)
 
 
 def recover_transactions(target: Path) -> None:
@@ -948,6 +1035,13 @@ def recover_transactions(target: Path) -> None:
         elif state == "committed":
             warn("Finishing cleanup from a previously completed installation transaction.")
             try:
+                # A committed journal whose rename was never confirmed durable
+                # (for example the write reported an error after the rename) must
+                # have that durability established before its backups are
+                # deleted: re-syncing the transaction directory is the required
+                # guarantee and is safe to retry. If it still cannot be
+                # confirmed, keep every piece of evidence.
+                fsync_dir_strict(txn)
                 finalize_transaction(target, txn, journal)
             except Exception as exc:
                 # The committed release is valid; only obsolete-backup cleanup
@@ -1063,7 +1157,7 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
     new_manifest_data = json_bytes(new_manifest) if new_manifest is not None else None
     new_manifest_hash = hashlib.sha256(new_manifest_data).hexdigest() if new_manifest_data is not None else None
     if new_manifest_data is not None:
-        atomic_write(txn / "new_manifest.json", new_manifest_data, 0o600)
+        atomic_write(txn / "new_manifest.json", new_manifest_data, 0o600, durable=True)
     operations = build_operations(target, old_manifest, new_manifest)
     journal = {
         "schema": 1,
@@ -1089,19 +1183,19 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
             if op["had_old"]:
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(dest, backup)
-                fsync_dir(dest.parent)
-                fsync_dir(backup.parent)
+                fsync_dir_strict(dest.parent)
+                fsync_dir_strict(backup.parent)
             if op["action"] == "replace":
                 if staged_payload is None:
                     fail(f"Internal error: no staged payload available for {name}")
                 os.replace(staged_payload / name, dest)
-                fsync_dir(dest.parent)
+                fsync_dir_strict(dest.parent)
         if old_manifest_exists:
             os.replace(manifest_path, txn / "backup" / "MANIFEST")
-            fsync_dir(target)
+            fsync_dir_strict(target)
         if new_manifest_data is not None:
             os.replace(txn / "new_manifest.json", manifest_path)
-            fsync_dir(target)
+            fsync_dir_strict(target)
     except Exception:
         try:
             rollback_transaction(target, txn, journal)
@@ -1117,6 +1211,16 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
     committed_journal["state"] = CANCEL_STATE_COMMITTED
     try:
         write_journal(txn, committed_journal)
+    except TransactionDurabilityError as exc:
+        # The committed journal rename landed, but its durability could not be
+        # confirmed. A crash could still lose the rename, so this is not a firm
+        # commit: never roll back on that guess and never delete the backups or
+        # the evidence. Report a pending transaction so recovery re-establishes
+        # durability (by re-syncing the transaction directory) and finishes the
+        # cleanup safely.
+        warn(f"The new release is live, but its commit could not be confirmed durable; "
+             f"cleanup is pending: {exc}")
+        return True
     except Exception as exc:
         persisted = _persisted_journal_state(txn)
         if persisted == CANCEL_STATE_COMMITTED:

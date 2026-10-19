@@ -32,25 +32,108 @@ UI_RESULT=0
 cancelled() { [ -n "${ROBLOX_MAC_CANCEL_FILE:-}" ] && [ -e "$ROBLOX_MAC_CANCEL_FILE" ]; }
 
 # Atomically record the shared cancellation state under <state>.lock, the same
-# lock the installer and the GTK UI use to settle the commit boundary. The write
-# is refused when the state or lock path is a symlink or is not ours, so a
-# planted link cannot redirect it. The temporary file plus rename keeps a
-# concurrent reader from seeing a partial value, and the flock spans the whole
-# read-modify-write so the installer and the UI cannot interleave at the
-# boundary. Returns non-zero when the state could not be recorded, so the caller
-# never starts an operation on stale state.
+# lock the installer and the GTK UI use to settle the commit boundary. The lock
+# and the state are opened with O_NOFOLLOW|O_NONBLOCK and validated on the
+# opened descriptor with fstat(), so a symlinked, FIFO, or foreign-owned path is
+# rejected promptly instead of being followed or blocking the shell forever, and
+# the flock spans the whole read-modify-write. Returns non-zero when the state
+# could not be recorded, so the caller never starts an operation on stale state.
+#
+# The Python helper is used when it can run. The launcher must still start on a
+# host where Python cannot run at all, so cancel_state_write_shell below is an
+# equivalent fallback: it also never follows a symlink, never opens a FIFO (an
+# O_RDWR open does not block on one), still verifies the descriptor it actually
+# opened, and still returns non-zero on any unsafe or failed path.
+CANCEL_PYTHON=
 cancel_state_write() {
-    [ -h "$CANCEL_STATE" ] && return 1
-    if [ -e "$CANCEL_STATE" ]; then
-        owner=$(stat -c %u -- "$CANCEL_STATE" 2>/dev/null || printf '')
-        if [ -n "$owner" ] && [ "$owner" != "$(id -u)" ]; then return 1; fi
+    if [ -z "$CANCEL_PYTHON" ]; then
+        if python3 -c 'import fcntl, os, stat' >/dev/null 2>&1; then
+            CANCEL_PYTHON=1
+        else
+            CANCEL_PYTHON=0
+        fi
     fi
+    if [ "$CANCEL_PYTHON" = 1 ]; then
+        python3 - "$CANCEL_STATE" "$1" <<'PY'
+import fcntl, os, stat, sys
+
+state_path = sys.argv[1]
+value = sys.argv[2]
+SAFE_FLAGS = (getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+              | getattr(os, "O_NONBLOCK", 0))
+
+
+def safe_open(path, flags):
+    fd = os.open(path, flags | SAFE_FLAGS, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        raise OSError("not a regular file owned by this user")
+    return fd
+
+
+lock_path = state_path + ".lock"
+try:
+    lock_fd = safe_open(lock_path, os.O_RDWR | os.O_CREAT)
+except OSError as exc:
+    print(f"cancel_state_write: unsafe lock path {lock_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        st = os.lstat(state_path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_uid != os.getuid():
+            raise OSError("owned by another user")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"cancel_state_write: unsafe state path {state_path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    tmp = f"{state_path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | SAFE_FLAGS, 0o600)
+    try:
+        os.write(fd, (value + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, state_path)
+except OSError as exc:
+    print(f"cancel_state_write: could not record {value!r} at {state_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+PY
+        return $?
+    fi
+    cancel_state_write_shell "$1"
+}
+
+# Equivalent path used only when Python cannot run. `test -f` stats without
+# opening, so a FIFO, directory, or other special file is rejected before the
+# open; the open itself is O_RDWR (`<>`), which never blocks on a FIFO; and the
+# descriptor actually opened is verified through /proc before the lock is taken.
+cancel_state_write_shell() {
     lock=$CANCEL_STATE.lock
+    [ -h "$CANCEL_STATE" ] && return 1
+    if [ -e "$CANCEL_STATE" ] && [ ! -f "$CANCEL_STATE" ]; then return 1; fi
     [ -h "$lock" ] && return 1
-    exec 7>>"$lock" 2>/dev/null || return 1
-    if [ -e "$lock" ]; then
-        lock_owner=$(stat -c %u -- "$lock" 2>/dev/null || printf '')
-        if [ -n "$lock_owner" ] && [ "$lock_owner" != "$(id -u)" ]; then exec 7>&-; return 1; fi
+    if [ -e "$lock" ] && [ ! -f "$lock" ]; then return 1; fi
+    # The braces scope the redirect, so a failure here does not silence the
+    # launcher's stderr for the rest of the run.
+    if ! { exec 7<>"$lock"; } 2>/dev/null; then return 1; fi
+    fd_owner=$(stat -Lc %u /proc/self/fd/7 2>/dev/null || printf '')
+    if [ ! -f /proc/self/fd/7 ] || { [ -n "$fd_owner" ] && [ "$fd_owner" != "$(id -u)" ]; }; then
+        exec 7>&-
+        return 1
+    fi
+    if [ -e "$CANCEL_STATE" ]; then
+        owner=$(stat -Lc %u -- "$CANCEL_STATE" 2>/dev/null || printf '')
+        if [ -n "$owner" ] && [ "$owner" != "$(id -u)" ]; then exec 7>&-; return 1; fi
     fi
     flock -x 7 2>/dev/null || { exec 7>&-; return 1; }
     tmp=$CANCEL_STATE.tmp.$$

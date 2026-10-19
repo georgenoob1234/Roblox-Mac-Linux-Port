@@ -1205,6 +1205,146 @@ exit 3
             leftover.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
+    # Protocol files are opened safely: a FIFO must fail promptly instead of
+    # blocking, and an unsafe descriptor (FIFO, directory, foreign owner) must
+    # fail closed. The Python cases run in a subprocess with a timeout so a
+    # regression cannot leave the suite blocked.
+    # ------------------------------------------------------------------
+    def probe_cancel_python(state_path: Path, mode: str, marker: Path | None = None,
+                            fake_uid: str = "", timeout: int = 20) -> subprocess.CompletedProcess[str]:
+        program = "\n".join([
+            "import importlib.util, os, sys",
+            "spec = importlib.util.spec_from_file_location('port_installer', sys.argv[1])",
+            "m = importlib.util.module_from_spec(spec); sys.modules['port_installer'] = m",
+            "spec.loader.exec_module(m)",
+            "os.environ['ROBLOX_MAC_CANCEL_STATE_FILE'] = sys.argv[2]",
+            "if sys.argv[3]:",
+            "    os.environ['ROBLOX_MAC_CANCEL_FILE'] = sys.argv[3]",
+            "if sys.argv[5]:",
+            "    m.os.getuid = lambda: int(sys.argv[5])",
+            "try:",
+            "    value = m.read_cancel_state() if sys.argv[4] == 'read' else m.cancel_boundary()",
+            "except m.CancelProtocolError as exc:",
+            "    print('PROTOCOL_ERROR', exc); sys.exit(7)",
+            "print('OK', value)",
+        ])
+        return subprocess.run(
+            [sys.executable, "-c", program, str(INSTALLER), str(state_path),
+             str(marker) if marker else "", mode, fake_uid],
+            capture_output=True, text=True, timeout=timeout)
+
+    scratch = root / "protocol-scratch"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    scratch.mkdir()
+    fifo_state = scratch / "fifo-state"
+    fifo_lock_state = scratch / "fifo-lock-state"
+    fifo_lock = Path(str(fifo_lock_state) + ".lock")
+    dir_state = scratch / "dir-state"
+    dir_lock_state = scratch / "dir-lock-state"
+    dir_lock = Path(str(dir_lock_state) + ".lock")
+    mismatched = scratch / "mismatched"
+    valid_dir = scratch / "valid"
+    valid_state = valid_dir / "state"
+
+    # A FIFO at the state path must fail promptly (no blocking open).
+    os.mkfifo(fifo_state)
+    result = probe_cancel_python(fifo_state, "read")
+    assert result.returncode == 7, (result.returncode, result.stdout, result.stderr)
+    assert "PROTOCOL_ERROR" in result.stdout, result.stdout
+
+    # A FIFO at the lock path must fail promptly too.
+    fifo_lock_state.write_text("open\n")
+    os.mkfifo(fifo_lock)
+    result = probe_cancel_python(fifo_lock_state, "boundary")
+    assert result.returncode == 7, (result.returncode, result.stdout, result.stderr)
+
+    # A directory at the state or lock path is not a regular file.
+    dir_state.mkdir()
+    result = probe_cancel_python(dir_state, "read")
+    assert result.returncode == 7, (result.returncode, result.stdout, result.stderr)
+    dir_lock_state.write_text("open\n")
+    dir_lock.mkdir()
+    result = probe_cancel_python(dir_lock_state, "boundary")
+    assert result.returncode == 7, (result.returncode, result.stdout, result.stderr)
+
+    # A descriptor owned by a different user is refused (uid patched to differ).
+    mismatched.write_text("open\n")
+    result = probe_cancel_python(mismatched, "read", fake_uid=str(os.getuid() + 1))
+    assert result.returncode == 7, (result.returncode, result.stdout, result.stderr)
+    assert "owned" in result.stdout, result.stdout
+
+    # A valid regular state still reads successfully.
+    valid_dir.mkdir()
+    valid_state.write_text("open\n")
+    result = probe_cancel_python(valid_state, "read")
+    assert result.returncode == 0 and "OK open" in result.stdout, (result.returncode, result.stdout)
+
+    # ------------------------------------------------------------------
+    # The real shell initialization path (start_progress -> cancel_state_write)
+    # must reject a FIFO at the lock or state path promptly, must not start the
+    # operation, and must still reset normally once the path is safe again.
+    # ------------------------------------------------------------------
+    def run_handoff_timed(extra_env=None, timeout=30) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([handoff / "bootstrap.sh", "port-update-settings"],
+                              env={**env, **(extra_env or {})}, capture_output=True,
+                              text=True, timeout=timeout)
+
+    shell_state = handoff / "DO_NOT_SHARE" / ".bootstrap-cancel-state"
+    shell_lock = Path(str(shell_state) + ".lock")
+
+    shell_state.unlink(missing_ok=True)
+    shell_lock.unlink(missing_ok=True)
+    event_log.write_text("")
+    os.mkfifo(shell_lock)
+    try:
+        fifo_lock_result = run_handoff_timed()
+    finally:
+        shell_lock.unlink(missing_ok=True)
+    assert fifo_lock_result.returncode != 0, (fifo_lock_result.returncode, fifo_lock_result.stderr)
+    assert not shell_state.exists(), "the shell must not record state through an unsafe lock"
+    assert event_log.read_text().strip() == "", "the operation must not start with a FIFO lock"
+
+    shell_state.unlink(missing_ok=True)
+    shell_lock.unlink(missing_ok=True)
+    event_log.write_text("")
+    os.mkfifo(shell_state)
+    try:
+        fifo_state_result = run_handoff_timed()
+    finally:
+        shell_state.unlink(missing_ok=True)
+        shell_lock.unlink(missing_ok=True)
+    assert fifo_state_result.returncode != 0, (fifo_state_result.returncode, fifo_state_result.stderr)
+    assert event_log.read_text().strip() == "", "the operation must not start with a FIFO state"
+
+    # A normal reset still works after the unsafe-path cases.
+    event_log.write_text("")
+    ok_result = run_handoff_timed({"PORT_STUB_RESULT": "0"})
+    assert ok_result.returncode == 0, (ok_result.returncode, ok_result.stderr)
+    assert shell_state.read_text().strip() == "open"
+
+    # The equivalent shell fallback (used when Python cannot run, so the
+    # launcher can still start) must reject a FIFO just as promptly and must
+    # not start the operation.
+    broken_bin = root / "protocol-broken-bin"
+    broken_bin.mkdir(exist_ok=True)
+    (broken_bin / "python3").write_text("#!/bin/sh\nexit 1\n")
+    (broken_bin / "python3").chmod(0o755)
+    fallback_env = {"PATH": str(broken_bin) + os.pathsep + os.environ["PATH"]}
+
+    shell_state.unlink(missing_ok=True)
+    shell_lock.unlink(missing_ok=True)
+    event_log.write_text("")
+    os.mkfifo(shell_lock)
+    try:
+        fallback_fifo = run_handoff_timed(fallback_env)
+    finally:
+        shell_lock.unlink(missing_ok=True)
+        shell_state.unlink(missing_ok=True)
+    assert fallback_fifo.returncode != 0, (fallback_fifo.returncode, fallback_fifo.stderr)
+    assert event_log.read_text().strip() == "", "the fallback must not start with a FIFO lock"
+
+    # ------------------------------------------------------------------
     # The durable commit point is irreversible: once the journal says
     # "committed" the new release is never rolled back, and an ambiguous
     # journal write keeps its evidence instead of guessing.
@@ -1356,6 +1496,107 @@ exit 3
     else:
         raise AssertionError("a committed journal was rolled back")
     shutil.rmtree(guard_txn)
+
+    # ------------------------------------------------------------------
+    # The commit point is durable only when the directory fsync that confirms
+    # it succeeds. A failure *after* the committed journal's rename (the real
+    # boundary, not a wrapper that raises once everything has returned) must not
+    # be treated as durable: no rollback, no backup deletion, an explicit
+    # pending outcome, and a recovery that re-establishes durability first.
+    # ------------------------------------------------------------------
+    original_fsync_strict = installer.fsync_dir_strict
+
+    def run_with_durability_fault(path: Path):
+        before = txns()
+        original_write_journal = installer.write_journal
+        original_finalize = installer.finalize_transaction
+        original_rollback = installer.rollback_transaction
+        armed = {"path": None}
+        record = {"rollbacks": 0, "finalize_states": []}
+
+        def armed_strict(directory):
+            # The committed journal has already been renamed into place; only
+            # the directory fsync that would confirm its durability fails.
+            if armed["path"] is not None and Path(directory) == armed["path"]:
+                raise installer.TransactionDurabilityError(
+                    "simulated directory fsync failure after the committed rename")
+            return original_fsync_strict(directory)
+
+        def arming_write_journal(txn, journal, *args, **kwargs):
+            if journal.get("state") == "committed":
+                armed["path"] = Path(txn)
+            return original_write_journal(txn, journal, *args, **kwargs)
+
+        def counted_rollback(*args, **kwargs):
+            record["rollbacks"] += 1
+            return original_rollback(*args, **kwargs)
+
+        def recording_finalize(target, txn, journal, **kwargs):
+            record["finalize_states"].append(installer._persisted_journal_state(txn))
+            return original_finalize(target, txn, journal, **kwargs)
+
+        installer.fsync_dir_strict = armed_strict
+        installer.write_journal = arming_write_journal
+        installer.rollback_transaction = counted_rollback
+        installer.finalize_transaction = recording_finalize
+        try:
+            try:
+                install_quietly(path, real2, "v2.0.0")
+                outcome = "ok"
+            except installer.CleanupPendingError as exc:
+                outcome = exc
+            except Exception as exc:  # noqa: BLE001 - the test reports the real failure
+                outcome = exc
+        finally:
+            installer.fsync_dir_strict = original_fsync_strict
+            installer.write_journal = original_write_journal
+            installer.rollback_transaction = original_rollback
+            installer.finalize_transaction = original_finalize
+        record["new_txns"] = txns() - before
+        return outcome, record
+
+    a5 = root / "commit-fsync-uncertain"
+    install_quietly(a5, real1, "v1.0.0")
+    a5_outcome, a5_record = run_with_durability_fault(a5)
+    assert isinstance(a5_outcome, installer.CleanupPendingError), (a5_outcome, a5_record)
+    assert a5_record["rollbacks"] == 0, a5_record
+    assert a5_record["finalize_states"] == [], "backups must not be deleted while durability is unconfirmed"
+    assert installer.installed_port_version(a5) == "v2.0.0"
+    assert len(a5_record["new_txns"]) == 1, a5_record
+    a5_txn = next(iter(a5_record["new_txns"]))
+    assert json.loads((a5_txn / "journal.json").read_text())["state"] == "committed"
+    assert (a5_txn / "backup" / "run.sh").is_file(), "the transaction evidence must be retained"
+    # A later recovery re-establishes durability and finishes the cleanup.
+    installer.recover_transactions(a5)
+    assert not a5_txn.exists(), "recovery did not resolve the pending transaction"
+    assert installer.installed_port_version(a5) == "v2.0.0"
+
+    # If the filesystem keeps rejecting directory fsync, recovery must not
+    # discard evidence or falsely claim durability.
+    a6 = root / "commit-fsync-stuck"
+    install_quietly(a6, real1, "v1.0.0")
+    a6_outcome, a6_record = run_with_durability_fault(a6)
+    assert isinstance(a6_outcome, installer.CleanupPendingError), (a6_outcome, a6_record)
+    assert len(a6_record["new_txns"]) == 1, a6_record
+    a6_txn = next(iter(a6_record["new_txns"]))
+
+    def fail_only_a6(directory):
+        if Path(directory) == a6_txn:
+            raise installer.TransactionDurabilityError("simulated persistent directory fsync failure")
+        return original_fsync_strict(directory)
+
+    installer.fsync_dir_strict = fail_only_a6
+    try:
+        installer.recover_transactions(a6)  # must not raise and must not delete evidence
+    finally:
+        installer.fsync_dir_strict = original_fsync_strict
+    assert a6_txn.is_dir(), "the evidence must survive a persistent fsync failure"
+    assert (a6_txn / "backup" / "run.sh").is_file(), "backups must not be discarded"
+    assert installer.installed_port_version(a6) == "v2.0.0"
+    # Once the filesystem cooperates again, recovery finishes safely.
+    installer.recover_transactions(a6)
+    assert not a6_txn.exists()
+    assert installer.installed_port_version(a6) == "v2.0.0"
 
     # The GTK UI must take the same lock and consult the same state file, so
     # the handshake cannot be bypassed by the window itself.

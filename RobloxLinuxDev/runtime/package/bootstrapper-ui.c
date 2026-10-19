@@ -150,12 +150,17 @@ enum { CANCEL_ACCEPTED, CANCEL_REFUSED, CANCEL_UNCERTAIN };
 
 static CancelState cancel_state_read(const char *state_path) {
     if (!state_path || !*state_path) return CANCEL_STATE_OPEN;
-    struct stat st;
-    if (lstat(state_path, &st) != 0) return CANCEL_STATE_UNKNOWN;
-    if (S_ISLNK(st.st_mode) || !S_ISREG(st.st_mode)) return CANCEL_STATE_UNKNOWN;
-    if (st.st_uid != getuid()) return CANCEL_STATE_UNKNOWN;
-    int fd = open(state_path, O_RDONLY | O_NOFOLLOW);
+    /* Open without following symlinks and without blocking on a FIFO, then
+     * validate the *opened* descriptor: fstat() on the descriptor (rather than
+     * only lstat() on the path) means a concurrent replacement cannot slip a
+     * FIFO or a foreign file past a check/use window. */
+    int fd = open(state_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return CANCEL_STATE_UNKNOWN;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) {
+        close(fd);
+        return CANCEL_STATE_UNKNOWN;
+    }
     char buffer[64];
     ssize_t n = read(fd, buffer, sizeof buffer - 1);
     close(fd);
@@ -170,7 +175,7 @@ static CancelState cancel_state_read(const char *state_path) {
 static int cancel_state_lock_fd(const char *state_path) {
     if (!state_path || !*state_path) return -1;
     char *path = g_strdup_printf("%s.lock", state_path);
-    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0600);
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) { close(fd); fd = -1; }

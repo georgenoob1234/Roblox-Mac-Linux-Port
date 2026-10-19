@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1018,6 +1019,344 @@ exit 3
                 os.environ[key] = value
         boundary_marker.unlink(missing_ok=True)
 
+    def txns() -> set:
+        return set(root.glob(installer.TXN_PREFIX + "*"))
+
+    # ------------------------------------------------------------------
+    # The shared cancellation protocol fails closed: an unsafe, unopenable, or
+    # unverifiable state must abort before any live file changes, instead of
+    # silently degrading to the marker alone.
+    # ------------------------------------------------------------------
+    proto_target = root / "protocol-target"
+    install_quietly(proto_target, real1, "v1.0.0")
+    proto_baseline = managed_snapshot(proto_target)
+    proto_state = root / "protocol-state"
+    proto_marker = root / "protocol-marker"
+    proto_saved = {key: os.environ.get(key) for key in
+                   ("ROBLOX_MAC_CANCEL_STATE_FILE", "ROBLOX_MAC_CANCEL_FILE")}
+    original_write_cancel = installer.write_cancel_state
+
+    # A mirror of bootstrapper-ui.c's progress_try_request_cancel(): it reports
+    # acceptance only when it takes the lock, reads a valid "open" state, and
+    # writes the marker; otherwise it refuses or reports uncertainty.
+    def ui_try_request(state_path: Path, request_marker: Path, cancel_file: Path | None = None) -> str:
+        destination = cancel_file if cancel_file is not None else request_marker
+        lock_path = Path(str(state_path) + ".lock")
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError:
+            return "uncertain"
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return "uncertain"
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return "uncertain"
+            try:
+                state_st = os.lstat(state_path)
+                if stat.S_ISLNK(state_st.st_mode) or not stat.S_ISREG(state_st.st_mode):
+                    return "uncertain"
+                value = state_path.read_text().strip()
+            except OSError:
+                return "uncertain"
+            if value == "open":
+                try:
+                    destination.write_text("cancel\n")
+                except OSError:
+                    return "uncertain"
+                return "accepted"
+            if value in ("committing", "committed", "cancelled"):
+                return "refused"
+            return "uncertain"
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    try:
+        os.environ["ROBLOX_MAC_CANCEL_STATE_FILE"] = str(proto_state)
+        os.environ["ROBLOX_MAC_CANCEL_FILE"] = str(proto_marker)
+        proto_marker.unlink(missing_ok=True)
+
+        # (1) A symlinked state file is rejected safely and never followed.
+        real_state = root / "protocol-real-state"
+        real_state.write_text("open\n")
+        proto_state.unlink(missing_ok=True)
+        proto_state.symlink_to(real_state)
+        try:
+            installer.cancel_boundary()
+        except installer.CancelProtocolError:
+            pass
+        else:
+            raise AssertionError("a symlinked shared state was accepted")
+        before = txns()
+        try:
+            install_quietly(proto_target, real2, "v2.0.0")
+        except installer.CancelProtocolError:
+            pass
+        else:
+            raise AssertionError("a symlinked shared state allowed a commit")
+        assert managed_snapshot(proto_target) == proto_baseline, "the old release must be intact"
+        assert txns() == before, "an aborted boundary must leave no transaction"
+        proto_state.unlink()
+
+        # (2) An unopenable lock (a planted symlink) fails closed as well.
+        proto_state.write_text("open\n")
+        lock_link = Path(str(proto_state) + ".lock")
+        lock_link.unlink(missing_ok=True)
+        planted_lock = root / "protocol-planted-lock"
+        planted_lock.write_text("")
+        lock_link.symlink_to(planted_lock)
+        try:
+            installer.cancel_boundary()
+        except installer.CancelProtocolError:
+            pass
+        else:
+            raise AssertionError("a symlinked lock was accepted")
+        before = txns()
+        try:
+            install_quietly(proto_target, real2, "v2.0.0")
+        except installer.CancelProtocolError:
+            pass
+        else:
+            raise AssertionError("an unopenable lock allowed a commit")
+        assert managed_snapshot(proto_target) == proto_baseline
+        assert txns() == before
+        lock_link.unlink()
+
+        # (3) A failed state write aborts before any live file changes.
+        proto_state.write_text("open\n")
+
+        def failing_write(*_args, **_kwargs):
+            raise installer.CancelProtocolError("simulated state write failure")
+
+        installer.write_cancel_state = failing_write
+        try:
+            before = txns()
+            try:
+                install_quietly(proto_target, real2, "v2.0.0")
+            except installer.CancelProtocolError:
+                pass
+            else:
+                raise AssertionError("a failed state write did not abort the commit")
+        finally:
+            installer.write_cancel_state = original_write_cancel
+        assert managed_snapshot(proto_target) == proto_baseline
+        assert txns() == before
+
+        # (4) A transition that cannot be verified (a silent no-op write) also
+        # aborts rather than letting an unverified commit proceed.
+        proto_state.write_text("open\n")
+        installer.write_cancel_state = lambda *_a, **_k: None
+        try:
+            before = txns()
+            try:
+                install_quietly(proto_target, real2, "v2.0.0")
+            except installer.CancelProtocolError:
+                pass
+            else:
+                raise AssertionError("an unverified transition did not abort the commit")
+        finally:
+            installer.write_cancel_state = original_write_cancel
+        assert managed_snapshot(proto_target) == proto_baseline
+        assert txns() == before
+
+        # (5) The GTK UI never reports acceptance when it cannot take the lock,
+        # read a safe state, or write the marker.
+        proto_marker.unlink(missing_ok=True)
+        lock_link.unlink(missing_ok=True)
+        lock_link.symlink_to(planted_lock)
+        assert ui_try_request(proto_state, proto_marker) == "uncertain"
+        assert not proto_marker.exists()
+        lock_link.unlink()
+        proto_state.unlink()
+        proto_state.symlink_to(real_state)
+        assert ui_try_request(proto_state, proto_marker) == "uncertain"
+        assert not proto_marker.exists()
+        proto_state.unlink()
+        proto_state.write_text("open\n")
+        missing_destination = root / "protocol-absent-dir" / "cancel"
+        assert ui_try_request(proto_state, proto_marker, missing_destination) == "uncertain"
+        assert not proto_marker.exists()
+        proto_state.write_text("committing\n")
+        assert ui_try_request(proto_state, proto_marker) == "refused"
+        assert not proto_marker.exists()
+        proto_state.write_text("open\n")
+        assert ui_try_request(proto_state, proto_marker) == "accepted"
+        assert proto_marker.exists()
+        proto_marker.unlink()
+
+        # (6) A genuinely absent protocol (legacy/direct CLI invocation) keeps
+        # the documented marker-only behaviour.
+        os.environ.pop("ROBLOX_MAC_CANCEL_STATE_FILE", None)
+        proto_marker.unlink(missing_ok=True)
+        assert installer.cancel_boundary() is False
+        proto_marker.write_text("cancel\n")
+        assert installer.cancel_boundary() is True
+        proto_marker.unlink()
+    finally:
+        for key, value in proto_saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        proto_marker.unlink(missing_ok=True)
+        for leftover in (root / "protocol-real-state", root / "protocol-planted-lock"):
+            leftover.unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
+    # The durable commit point is irreversible: once the journal says
+    # "committed" the new release is never rolled back, and an ambiguous
+    # journal write keeps its evidence instead of guessing.
+    # ------------------------------------------------------------------
+    def run_with_commit_faults(path: Path, write_wrap=None, finalize_fault=None, mark=None):
+        """Install v2.0.0 over ``path`` with journal/bookkeeping faults injected.
+
+        Returns ``(outcome, record)`` where ``outcome`` is ``"ok"``, the raised
+        exception, and ``record`` reports rollback calls, the persisted journal
+        state seen at finalize, and the transactions this run left behind.
+        """
+        before = txns()
+        original_write_journal = installer.write_journal
+        original_finalize = installer.finalize_transaction
+        original_rollback = installer.rollback_transaction
+        original_mark = installer.mark_commit_completed
+        record = {"rollbacks": 0, "finalize_states": []}
+
+        def counted_rollback(*args, **kwargs):
+            record["rollbacks"] += 1
+            return original_rollback(*args, **kwargs)
+
+        def recording_finalize(target, txn, journal, **kwargs):
+            record["finalize_states"].append(installer._persisted_journal_state(txn))
+            if finalize_fault is not None:
+                return finalize_fault(target, txn, journal, **kwargs)
+            return original_finalize(target, txn, journal, **kwargs)
+
+        if write_wrap is not None:
+            installer.write_journal = write_wrap(original_write_journal)
+        installer.rollback_transaction = counted_rollback
+        installer.finalize_transaction = recording_finalize
+        if mark is not None:
+            installer.mark_commit_completed = mark
+        try:
+            try:
+                install_quietly(path, real2, "v2.0.0")
+                outcome = "ok"
+            except installer.CleanupPendingError as exc:
+                outcome = exc
+            except Exception as exc:  # noqa: BLE001 - the test reports the real failure
+                outcome = exc
+        finally:
+            installer.write_journal = original_write_journal
+            installer.finalize_transaction = original_finalize
+            installer.rollback_transaction = original_rollback
+            installer.mark_commit_completed = original_mark
+        record["new_txns"] = txns() - before
+        return outcome, record
+
+    # (B1) A cancellation-state failure after the committed journal lands is
+    # post-commit bookkeeping: the new release stays and rollback is not called.
+    b1 = root / "commit-bookkeeping"
+    install_quietly(b1, real1, "v1.0.0")
+
+    def boom_mark():
+        raise RuntimeError("simulated cancellation bookkeeping failure")
+
+    b1_outcome, b1_record = run_with_commit_faults(b1, mark=boom_mark)
+    assert b1_outcome == "ok", b1_outcome
+    assert b1_record["rollbacks"] == 0, b1_record
+    assert b1_record["finalize_states"] == ["committed"], b1_record
+    assert installer.installed_port_version(b1) == "v2.0.0"
+    assert (b1 / "run.sh").read_bytes() == (real2 / "run.sh").read_bytes()
+    assert not b1_record["new_txns"], b1_record
+
+    # (B2) A journal write that fails before the committed state reaches disk
+    # is still safely rolled back.
+    b2 = root / "commit-write-before"
+    install_quietly(b2, real1, "v1.0.0")
+
+    def b2_wrap(original):
+        def wrapped(txn, journal):
+            if journal.get("state") == "committed":
+                raise OSError("simulated journal write failure before the commit")
+            return original(txn, journal)
+        return wrapped
+
+    b2_outcome, b2_record = run_with_commit_faults(b2, write_wrap=b2_wrap)
+    assert isinstance(b2_outcome, OSError), b2_outcome
+    assert "before the commit" in str(b2_outcome), b2_outcome
+    assert b2_record["rollbacks"] == 1, b2_record
+    assert not b2_record["finalize_states"], b2_record
+    assert installer.installed_port_version(b2) == "v1.0.0"
+    assert not b2_record["new_txns"], b2_record
+
+    # (B3) A journal write that raises after the committed state is already
+    # visible on disk is committed, not failed: no rollback, and recovery later
+    # treats the transaction as committed.
+    b3 = root / "commit-write-after"
+    install_quietly(b3, real1, "v1.0.0")
+
+    def b3_wrap(original):
+        def wrapped(txn, journal):
+            result = original(txn, journal)
+            if journal.get("state") == "committed":
+                raise OSError("simulated fsync failure after the committed rename")
+            return result
+        return wrapped
+
+    b3_outcome, b3_record = run_with_commit_faults(b3, write_wrap=b3_wrap)
+    assert b3_outcome == "ok", b3_outcome
+    assert b3_record["rollbacks"] == 0, b3_record
+    assert b3_record["finalize_states"] == ["committed"], b3_record
+    assert installer.installed_port_version(b3) == "v2.0.0"
+    assert not b3_record["new_txns"], b3_record
+
+    # (B4) An unreadable or ambiguous journal during error handling keeps its
+    # evidence and never performs a destructive rollback based on a guess.
+    b4 = root / "commit-write-ambiguous"
+    install_quietly(b4, real1, "v1.0.0")
+
+    def b4_wrap(original):
+        def wrapped(txn, journal):
+            if journal.get("state") == "committed":
+                (txn / "journal.json").write_text("{ not a valid journal", encoding="utf-8")
+                raise OSError("simulated journal corruption")
+            return original(txn, journal)
+        return wrapped
+
+    b4_outcome, b4_record = run_with_commit_faults(b4, write_wrap=b4_wrap)
+    assert isinstance(b4_outcome, installer.InstallerError), b4_outcome
+    assert not isinstance(b4_outcome, installer.CancelledError), b4_outcome
+    assert "could not determine" in str(b4_outcome).lower(), b4_outcome
+    assert b4_record["rollbacks"] == 0, b4_record
+    assert not b4_record["finalize_states"], b4_record
+    assert len(b4_record["new_txns"]) == 1, b4_record
+    try:
+        installer.recover_transactions(b4)
+    except installer.InstallerError:
+        pass
+    else:
+        raise AssertionError("recovery guessed an ambiguous journal state")
+    assert all(t.is_dir() for t in b4_record["new_txns"]), "the ambiguous evidence was discarded"
+    # Remove the deliberately corrupt transaction so it does not poison the
+    # recover_transactions() scans of the later cases in this shared tree.
+    for stale in b4_record["new_txns"]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+    # A transaction whose persisted journal is "committed" is never rolled back.
+    guard_txn = root / "commit-guard-txn"
+    (guard_txn / "backup").mkdir(parents=True)
+    (guard_txn / "journal.json").write_text(json.dumps({"state": "committed", "files": []}))
+    try:
+        installer.rollback_transaction(root / "commit-guard-target", guard_txn,
+                                       {"state": "committed", "files": []})
+    except installer.InstallerError:
+        pass
+    else:
+        raise AssertionError("a committed journal was rolled back")
+    shutil.rmtree(guard_txn)
+
     # The GTK UI must take the same lock and consult the same state file, so
     # the handshake cannot be bypassed by the window itself.
     ui_source = (PACKAGE / "bootstrapper-ui.c").read_text()
@@ -1025,6 +1364,11 @@ exit 3
     assert '"%s.lock"' in ui_source, "the UI must use the shared lock file"
     assert '.bootstrap-cancel-state' in ui_source, "the UI must read the shared state file"
     assert "can no longer be cancelled" in ui_source, "the UI must show a refusal, not an accepted cancel"
+    assert "_GNU_SOURCE" in ui_source and "O_NOFOLLOW" in ui_source, \
+        "the UI must not follow a symlinked state or lock"
+    assert "CANCEL_STATE_UNKNOWN" in ui_source and "CANCEL_STATE_BUSY" in ui_source, \
+        "the UI must distinguish a busy or unreadable state from open"
+    assert "could not be verified safely" in ui_source, "the UI must show a status-uncertain message"
 
     # ------------------------------------------------------------------
     # A cleanup failure after a durable commit is reported as applied, never

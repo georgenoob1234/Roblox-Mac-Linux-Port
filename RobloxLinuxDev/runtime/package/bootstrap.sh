@@ -31,21 +31,34 @@ UI_RESULT=0
 
 cancelled() { [ -n "${ROBLOX_MAC_CANCEL_FILE:-}" ] && [ -e "$ROBLOX_MAC_CANCEL_FILE" ]; }
 
-# Atomically record the shared cancellation state. The write is refused when the
-# path is a symlink or is not ours, so a planted link cannot redirect it. The
-# temporary file plus rename keeps a concurrent reader from seeing a partial
-# value; the flock spans the whole read-modify-write so the installer and the UI
-# cannot interleave at the boundary.
+# Atomically record the shared cancellation state under <state>.lock, the same
+# lock the installer and the GTK UI use to settle the commit boundary. The write
+# is refused when the state or lock path is a symlink or is not ours, so a
+# planted link cannot redirect it. The temporary file plus rename keeps a
+# concurrent reader from seeing a partial value, and the flock spans the whole
+# read-modify-write so the installer and the UI cannot interleave at the
+# boundary. Returns non-zero when the state could not be recorded, so the caller
+# never starts an operation on stale state.
 cancel_state_write() {
-    [ -e "$CANCEL_STATE" ] && { [ -h "$CANCEL_STATE" ] && return 0; }
+    [ -h "$CANCEL_STATE" ] && return 1
     if [ -e "$CANCEL_STATE" ]; then
         owner=$(stat -c %u -- "$CANCEL_STATE" 2>/dev/null || printf '')
-        [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] && return 0
+        if [ -n "$owner" ] && [ "$owner" != "$(id -u)" ]; then return 1; fi
     fi
+    lock=$CANCEL_STATE.lock
+    [ -h "$lock" ] && return 1
+    exec 7>>"$lock" 2>/dev/null || return 1
+    if [ -e "$lock" ]; then
+        lock_owner=$(stat -c %u -- "$lock" 2>/dev/null || printf '')
+        if [ -n "$lock_owner" ] && [ "$lock_owner" != "$(id -u)" ]; then exec 7>&-; return 1; fi
+    fi
+    flock -x 7 2>/dev/null || { exec 7>&-; return 1; }
     tmp=$CANCEL_STATE.tmp.$$
-    printf '%s\n' "$1" > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+    if ! printf '%s\n' "$1" > "$tmp" 2>/dev/null; then rm -f -- "$tmp"; exec 7>&-; return 1; fi
     chmod 600 "$tmp" 2>/dev/null || true
-    mv -f -- "$tmp" "$CANCEL_STATE" 2>/dev/null || rm -f -- "$tmp"
+    if ! mv -f -- "$tmp" "$CANCEL_STATE" 2>/dev/null; then rm -f -- "$tmp"; exec 7>&-; return 1; fi
+    exec 7>&-
+    return 0
 }
 
 say() { echo "roblox: $*" >&2; }
@@ -69,9 +82,17 @@ start_progress() {
     export ROBLOX_MAC_CANCEL_FILE ROBLOX_MAC_CANCEL_STATE_FILE
     # Drop any request and state left by a previous operation before the new
     # one can observe them: a stale "committing" must never make a fresh
-    # update look uncancellable, and a stale marker must never cancel it.
+    # update look uncancellable, and a stale marker must never cancel it. If
+    # the reset cannot be recorded the operation must not start, so a stale
+    # state can never be mistaken for a fresh one; the caller aborts.
     rm -f -- "$ROBLOX_MAC_CANCEL_FILE"
-    cancel_state_write open
+    if ! cancel_state_write open; then
+        ROBLOX_MAC_CANCEL_FILE=
+        ROBLOX_MAC_CANCEL_STATE_FILE=
+        export ROBLOX_MAC_CANCEL_FILE ROBLOX_MAC_CANCEL_STATE_FILE
+        say 'Could not reset the shared update state; not starting the operation.'
+        return 1
+    fi
     UI_FIFO=$DATA/.bootstrap-progress.$$
     rm -f -- "$UI_FIFO"
     mkfifo "$UI_FIFO" 2>/dev/null || { UI_FIFO=; return 0; }
@@ -470,7 +491,7 @@ case "$command" in
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
-        start_progress
+        start_progress || { exec 9>&-; exit 1; }
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest); check_result=$?
@@ -486,7 +507,7 @@ case "$command" in
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
-        start_progress
+        start_progress || { exec 9>&-; exit 1; }
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest); check_result=$?
@@ -509,7 +530,7 @@ case "$command" in
             event failed 0 'Close Roblox before updating the port' 0 0 false
             finish_progress; exit 1
         fi
-        start_progress
+        start_progress || { exec 9>&-; exit 1; }
         do_port_update; result=$?; finish_progress; exec 9>&-
         exit "$result";;
     port-update-settings)
@@ -534,7 +555,7 @@ if ! flock -n -E 73 9; then
     exit 0
 fi
 recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
-start_progress
+start_progress || { exec 9>&-; exit 1; }
 first_run || { finish_progress; exit 1; }
 installed=$(installed_version)
 event checking 25 'Checking for updates'

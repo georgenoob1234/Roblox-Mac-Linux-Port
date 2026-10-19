@@ -110,6 +110,10 @@ CANCEL_STATE_OPEN = "open"
 CANCEL_STATE_COMMITTING = "committing"
 CANCEL_STATE_COMMITTED = "committed"
 CANCEL_STATE_CANCELLED = "cancelled"
+# Every value the shared cancellation state may legitimately hold. Anything
+# else is treated as a protocol failure rather than as a fresh "open" state.
+CANCEL_STATES = frozenset({CANCEL_STATE_OPEN, CANCEL_STATE_COMMITTING,
+                           CANCEL_STATE_COMMITTED, CANCEL_STATE_CANCELLED})
 
 
 def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
@@ -135,20 +139,65 @@ def cancel_state_file() -> str:
     """The launcher's shared cancellation state file, or "" when absent.
 
     When the launcher does not provide it (a standalone CLI run, or an older
-    launcher) the installer falls back to the plain marker file, so direct
-    `installer.py update` invocations keep working unchanged.
+    launcher that predates the protocol) the installer falls back to the plain
+    marker file, so direct `installer.py update` invocations keep working
+    unchanged. Its presence is what selects the fail-closed shared protocol.
     """
     return os.environ.get("ROBLOX_MAC_CANCEL_STATE_FILE", "")
 
 
+def cancel_protocol_configured() -> bool:
+    """True when the launcher supplied the shared cancellation-state protocol."""
+    return bool(cancel_state_file())
+
+
+def _cancel_state_path() -> Path | None:
+    raw = cancel_state_file()
+    return Path(raw) if raw else None
+
+
+def _assert_safe_cancel_state(path: Path) -> None:
+    """Refuse a shared state file that is a symlink, not ours, or not a file.
+
+    Called under the shared lock immediately before the state is read or
+    replaced, so there is no time-of-check/time-of-use window.
+    """
+    st = lstat_or_none(path)
+    if st is None:
+        raise CancelProtocolError(f"Shared cancellation state is missing: {path}")
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise CancelProtocolError(f"Shared cancellation state is not a safe regular file: {path}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise CancelProtocolError(f"Shared cancellation state is not owned by this user: {path}")
+
+
 def read_cancel_state() -> str:
-    path = cancel_state_file()
-    if not path:
+    """Return the shared state, or "" when the protocol is not configured.
+
+    A configured-but-unusable state is a protocol failure, not a reason to fall
+    back to the marker alone, so a missing, unreadable, unsafe, or malformed
+    state raises CancelProtocolError.
+    """
+    path = _cancel_state_path()
+    if path is None:
         return ""
+    _assert_safe_cancel_state(path)
     try:
-        return Path(path).read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise CancelProtocolError(f"Cannot open the shared cancellation state: {path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read()
+    except OSError as exc:
+        raise CancelProtocolError(f"Cannot read the shared cancellation state: {path}: {exc}") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    value = raw.decode("utf-8", "replace").strip()
+    if value not in CANCEL_STATES:
+        raise CancelProtocolError(f"Unrecognised shared cancellation state in {path}: {value!r}")
+    return value
 
 
 @contextlib.contextmanager
@@ -158,28 +207,40 @@ def cancel_state_lock() -> Iterator[bool]:
     The launcher, the installer and the GTK UI all take this flock around the
     read-modify-write of the state file, so exactly one side wins at the
     boundary: a request recorded while the state is still "open" is honoured,
-    and a request that arrives once "committing" is recorded is refused. Yields
-    True when the lock was taken, and False when the protocol is unavailable so
-    callers fall back to the marker alone.
+    and a request that arrives once "committing" is recorded is refused.
+
+    Yields False only when no shared protocol is configured (a legacy/direct
+    CLI invocation). When the launcher configured the protocol, an unsafe,
+    missing, unopenable, or un-lockable file raises CancelProtocolError instead
+    of degrading to the marker alone, so a commit cannot proceed on state that
+    could not be established. The state file is validated under the lock.
     """
-    if not cancel_state_file():
+    path = _cancel_state_path()
+    if path is None:
         yield False
         return
-    lock_path = Path(cancel_state_file() + ".lock")
+    lock_path = Path(str(path) + ".lock")
     fd = -1
     locked = False
     try:
         try:
-            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
-        except OSError:
-            yield False
-            return
-        lock_st = lstat_or_none(lock_path)
-        if lock_st is not None and (stat.S_ISLNK(lock_st.st_mode) or lock_st.st_uid != os.getuid()):
-            yield False
-            return
-        fcntl.flock(fd, fcntl.LOCK_EX)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+        except OSError as exc:
+            raise CancelProtocolError(f"Cannot open the shared cancellation lock: {lock_path}: {exc}") from exc
+        lock_st = os.fstat(fd)
+        if not stat.S_ISREG(lock_st.st_mode):
+            raise CancelProtocolError(f"Shared cancellation lock is not a regular file: {lock_path}")
+        if hasattr(os, "getuid") and lock_st.st_uid != os.getuid():
+            raise CancelProtocolError(f"Shared cancellation lock is not owned by this user: {lock_path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise CancelProtocolError(f"Cannot acquire the shared cancellation lock: {lock_path}: {exc}") from exc
         locked = True
+        # Validate the state only once the lock is held: no other writer can
+        # swap the path between validation and the read-modify-write below.
+        _assert_safe_cancel_state(path)
         yield True
     finally:
         if fd >= 0:
@@ -191,40 +252,69 @@ def cancel_state_lock() -> Iterator[bool]:
 
 
 def write_cancel_state(value: str) -> None:
-    """Atomically record the shared cancellation state; never fatal."""
-    path = cancel_state_file()
-    if not path:
+    """Atomically record the shared state under the caller's lock.
+
+    A configured protocol must not degrade silently, so a failed write raises
+    CancelProtocolError instead of leaving a stale state in place. With no
+    configured protocol this is a no-op.
+    """
+    path = _cancel_state_path()
+    if path is None:
         return
+    _assert_safe_cancel_state(path)
     try:
-        atomic_write(Path(path), (value + "\n").encode("utf-8"), 0o600)
-    except (OSError, InstallerError):
-        pass
+        atomic_write(path, (value + "\n").encode("utf-8"), 0o600)
+    except (OSError, InstallerError) as exc:
+        raise CancelProtocolError(
+            f"Cannot record the shared cancellation state {value!r} at {path}: {exc}") from exc
 
 
 def cancel_boundary() -> bool:
     """Atomically decide whether a cancellation request wins the boundary.
 
-    Returns True when a request recorded before the transition must abort the
-    operation before any destination file changes, and False once the installer
-    has recorded that it owns the commit. The decision and the state transition
-    happen inside one lock, so a request can never be accepted (and shown as
-    accepted by the UI) after the commit has begun.
+    Returns True when a request recorded while the state was still "open" must
+    abort the operation before any destination file changes, and False once the
+    installer has recorded that it owns the commit. The decision, the state
+    transition, and its verification all happen inside one lock, so a request
+    can never be accepted (and shown as accepted by the UI) after the commit
+    has begun, and a transition that cannot be verified aborts the update.
     """
-    with cancel_state_lock() as locked:
+    if not cancel_protocol_configured():
+        # Legacy/direct invocation: the marker alone is the contract.
+        return cancellation_requested()
+    with cancel_state_lock():
+        state = read_cancel_state()
+        if state != CANCEL_STATE_OPEN:
+            # A fresh commit may only be claimed from "open". Any other value
+            # (committing/committed/cancelled) is stale or already owned, so
+            # refuse to guess and abort before touching any live file.
+            raise CancelProtocolError(
+                f"The shared cancellation state is not open (found {state!r}); refusing to start a commit")
         if cancellation_requested():
-            if locked:
-                write_cancel_state(CANCEL_STATE_CANCELLED)
+            write_cancel_state(CANCEL_STATE_CANCELLED)
+            if read_cancel_state() != CANCEL_STATE_CANCELLED:
+                raise CancelProtocolError("The accepted cancellation could not be recorded safely")
             return True
-        if locked:
-            write_cancel_state(CANCEL_STATE_COMMITTING)
+        write_cancel_state(CANCEL_STATE_COMMITTING)
+        if read_cancel_state() != CANCEL_STATE_COMMITTING:
+            raise CancelProtocolError("The commit transition could not be recorded safely")
         return False
 
 
 def mark_commit_completed() -> None:
-    """Record a durable commit so stale state can never look cancellable."""
-    with cancel_state_lock() as locked:
-        if locked and read_cancel_state() in (CANCEL_STATE_COMMITTING, CANCEL_STATE_COMMITTED):
+    """Record a durable commit so stale state can never look cancellable.
+
+    Runs only after the transaction's journal is durably committed; a failure
+    here is post-commit bookkeeping (the caller warns) and must never be a
+    reason to roll back the committed release.
+    """
+    if not cancel_protocol_configured():
+        return
+    with cancel_state_lock():
+        if read_cancel_state() in (CANCEL_STATE_COMMITTING, CANCEL_STATE_COMMITTED):
             write_cancel_state(CANCEL_STATE_COMMITTED)
+            if read_cancel_state() != CANCEL_STATE_COMMITTED:
+                raise CancelProtocolError("The completed commit could not be recorded safely")
 
 
 def _color(code: str, value: str) -> str:
@@ -291,6 +381,16 @@ def fail(message: str) -> "NoReturn":
 
 class InstallerError(RuntimeError):
     pass
+
+
+class CancelProtocolError(InstallerError):
+    """The shared cancellation protocol could not be used safely.
+
+    Raised instead of silently degrading to marker-only cancellation when the
+    configured shared state or its lock cannot be opened, locked, read, written,
+    or verified. The operation must fail closed so a commit can never proceed
+    (or a request be accepted) on state that could not be established.
+    """
 
 
 class CancelledError(InstallerError):
@@ -687,6 +787,27 @@ def write_journal(txn: Path, journal: dict[str, Any]) -> None:
     atomic_json(txn / "journal.json", journal, 0o600)
 
 
+def _persisted_journal_state(txn: Path) -> str | None:
+    """The durable journal state, or None when it cannot be established safely.
+
+    Returns None for a missing, unreadable, non-regular, or malformed journal so
+    a caller never guesses a state it cannot verify -- in particular so it never
+    destructively rolls back a transaction that may already be committed.
+    """
+    journal_path = txn / "journal.json"
+    st = lstat_or_none(journal_path)
+    if st is None or not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        data = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    state = data.get("state")
+    return state if isinstance(state, str) else None
+
+
 def _remove_if_regular_or_symlink(path: Path) -> None:
     st = lstat_or_none(path)
     if st is None:
@@ -697,6 +818,11 @@ def _remove_if_regular_or_symlink(path: Path) -> None:
 
 
 def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> None:
+    # A transaction whose persisted journal is "committed" is authoritative:
+    # never roll it back, even if a caller asks, so a post-commit error can
+    # never undo a live release.
+    if journal.get("state") == CANCEL_STATE_COMMITTED or _persisted_journal_state(txn) == CANCEL_STATE_COMMITTED:
+        raise InstallerError(f"Refusing to roll back a committed installer transaction: {txn}")
     backup_root = txn / "backup"
     conflicts: list[str] = []
     for op in reversed(journal.get("files", [])):
@@ -951,6 +1077,10 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
     }
     (txn / "backup").mkdir(parents=True, exist_ok=True, mode=0o700)
     write_journal(txn, journal)
+    # Phase 1: swap the managed files while the journal says "applying". A
+    # failure here is before the commit point and is still safely rolled back to
+    # the old release. BaseException is deliberately not caught, so an interrupt
+    # that leaves a real "applying" transaction behind is repaired by recovery.
     try:
         for op in operations:
             name = op["path"]
@@ -972,19 +1102,49 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
         if new_manifest_data is not None:
             os.replace(txn / "new_manifest.json", manifest_path)
             fsync_dir(target)
-        journal["state"] = "committed"
-        write_journal(txn, journal)
-        mark_commit_completed()
     except Exception:
         try:
             rollback_transaction(target, txn, journal)
         except Exception as recovery_exc:
             warn(f"Automatic rollback was incomplete: {recovery_exc}")
         raise
-    # The swap is durable: from here the new release is what is installed, so
-    # a cleanup failure must never be reported (or treated) as a failed update
-    # or trigger a rollback. The committed journal keeps the evidence and
-    # recovery retries the cleanup on the next start.
+    # Phase 2: the commit point. Durably recording the journal as "committed" is
+    # what makes the new release authoritative; from here it is never rolled
+    # back. Writing can fail after the atomic rename lands but before the
+    # directory fsync returns, so the persisted state -- not the exception --
+    # decides the outcome rather than assuming the old journal is still there.
+    committed_journal = dict(journal)
+    committed_journal["state"] = CANCEL_STATE_COMMITTED
+    try:
+        write_journal(txn, committed_journal)
+    except Exception as exc:
+        persisted = _persisted_journal_state(txn)
+        if persisted == CANCEL_STATE_COMMITTED:
+            # The committed state is already visible on disk: the commit is
+            # durable and must not be undone.
+            warn(f"The commit is durable, but recording it reported an error: {exc}")
+        elif persisted == "applying":
+            # The committed state never reached disk, so the old release is
+            # still safe to restore.
+            try:
+                rollback_transaction(target, txn, journal)
+            except Exception as recovery_exc:
+                warn(f"Automatic rollback was incomplete: {recovery_exc}")
+            raise
+        else:
+            # The journal is unreadable or malformed, so the persisted state
+            # cannot be established. Keep the evidence and refuse to guess: a
+            # destructive rollback could discard an installation that already
+            # committed.
+            fail("Could not determine whether the installer transaction committed; "
+                 f"transaction evidence was kept at {txn}: {exc}")
+    # Phase 3: post-commit bookkeeping and cleanup. Nothing here may undo the
+    # committed release, so a cancellation-state failure is only a warning and a
+    # cleanup failure is reported as pending rather than as a failed update.
+    try:
+        mark_commit_completed()
+    except Exception as exc:
+        warn(f"The release is committed, but its cancellation state could not be recorded: {exc}")
     try:
         finalize_transaction(target, txn, journal, preserve_modified=preserve_modified)
     except Exception as exc:

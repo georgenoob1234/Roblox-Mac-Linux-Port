@@ -1,3 +1,7 @@
+/* lstat(2), O_NOFOLLOW and O_CLOEXEC are exposed by _GNU_SOURCE; the UI build
+ * compiles with -std=c11, which otherwise hides them. */
+#define _GNU_SOURCE
+
 #include <gtk/gtk.h>
 #include <json-glib/json-glib.h>
 #include <gio/gio.h>
@@ -137,64 +141,99 @@ static gboolean progress_hide(gpointer data) { ProgressState *state = data; prog
  * operation and the installer flips it to "committing" at the commit boundary,
  * both under <state>.lock. The UI takes the same lock around its
  * check-and-request, so it can never record -- and therefore never show -- an
- * accepted cancellation after the commit has begun. A missing or unreadable
- * state file means an older launcher without this protocol; the marker alone is
- * then still the contract, exactly as before. */
-static gboolean cancel_state_open(const char *state_path) {
-    if (!state_path || !*state_path) return TRUE;
-    char *contents = NULL;
-    if (!g_file_get_contents(state_path, &contents, NULL, NULL)) return TRUE;
-    g_strstrip(contents);
-    gboolean open = !*contents || !g_strcmp0(contents, "open");
-    g_free(contents);
-    return open;
+ * accepted cancellation after the commit has begun. The protocol fails closed:
+ * an unusable lock or an unreadable, unsafe, or malformed state is never
+ * mistaken for a safe "open". Only a genuinely absent protocol path (no
+ * launcher protocol at all) keeps the marker-only contract. */
+typedef enum { CANCEL_STATE_OPEN, CANCEL_STATE_BUSY, CANCEL_STATE_UNKNOWN } CancelState;
+enum { CANCEL_ACCEPTED, CANCEL_REFUSED, CANCEL_UNCERTAIN };
+
+static CancelState cancel_state_read(const char *state_path) {
+    if (!state_path || !*state_path) return CANCEL_STATE_OPEN;
+    struct stat st;
+    if (lstat(state_path, &st) != 0) return CANCEL_STATE_UNKNOWN;
+    if (S_ISLNK(st.st_mode) || !S_ISREG(st.st_mode)) return CANCEL_STATE_UNKNOWN;
+    if (st.st_uid != getuid()) return CANCEL_STATE_UNKNOWN;
+    int fd = open(state_path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return CANCEL_STATE_UNKNOWN;
+    char buffer[64];
+    ssize_t n = read(fd, buffer, sizeof buffer - 1);
+    close(fd);
+    if (n <= 0) return CANCEL_STATE_UNKNOWN;
+    buffer[n] = '\0';
+    char *value = g_strstrip(buffer);
+    if (!g_strcmp0(value, "open")) return CANCEL_STATE_OPEN;
+    if (!g_strcmp0(value, "committing") || !g_strcmp0(value, "committed") ||
+        !g_strcmp0(value, "cancelled")) return CANCEL_STATE_BUSY;
+    return CANCEL_STATE_UNKNOWN;
 }
 static int cancel_state_lock_fd(const char *state_path) {
     if (!state_path || !*state_path) return -1;
     char *path = g_strdup_printf("%s.lock", state_path);
-    int fd = open(path, O_RDWR | O_CREAT, 0600);
-    if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    int fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid()) { close(fd); fd = -1; }
+    }
     g_free(path);
     return fd;
 }
-/* Record a cancellation request only while the state is still "open". Returns
- * FALSE when the request was refused because the commit already owns the
- * transition, so the caller must not present it as accepted. */
-static gboolean progress_try_request_cancel(ProgressState *state) {
+/* Record a cancellation request only while the state is still "open", under the
+ * shared lock. Returns CANCEL_ACCEPTED only when the lock was taken, a valid
+ * "open" state was read, and the marker was written; CANCEL_REFUSED when the
+ * commit already owns the transition; CANCEL_UNCERTAIN when the lock or state
+ * could not be used safely, so the caller never claims the request was accepted
+ * and never writes a marker on an unverifiable state. */
+static int progress_try_request_cancel(ProgressState *state) {
+    if (!state->cancel_state || !*state->cancel_state)
+        return g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL) ? CANCEL_ACCEPTED : CANCEL_UNCERTAIN;
     int fd = cancel_state_lock_fd(state->cancel_state);
-    if (fd < 0) return g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL);
-    gboolean accepted = FALSE;
+    if (fd < 0) return CANCEL_UNCERTAIN;
+    int result = CANCEL_UNCERTAIN;
     if (flock(fd, LOCK_EX) == 0) {
-        if (cancel_state_open(state->cancel_state))
-            accepted = g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL);
+        CancelState current = cancel_state_read(state->cancel_state);
+        if (current == CANCEL_STATE_OPEN)
+            result = g_file_set_contents(state->cancel_file, "cancel\n", -1, NULL) ? CANCEL_ACCEPTED : CANCEL_UNCERTAIN;
+        else if (current == CANCEL_STATE_BUSY)
+            result = CANCEL_REFUSED;
         flock(fd, LOCK_UN);
     }
     close(fd);
-    return accepted;
+    return result;
 }
 static void progress_request_cancel(ProgressState *state, GtkWidget *button) {
     if (!state->cancellable || state->cancelled) return;
-    if (!progress_try_request_cancel(state)) {
-        /* The installer already owns the commit. Never claim the request was
-         * accepted; reflect the real, authoritative outcome instead. */
-        if (button) gtk_widget_set_sensitive(button, FALSE);
-        label_text(state->status, "This update is already being applied and can no longer be cancelled.");
+    int result = progress_try_request_cancel(state);
+    if (result == CANCEL_ACCEPTED) {
+        state->cancelled = TRUE; state->cancellable = FALSE;
+        if (button) { gtk_button_set_label(GTK_BUTTON(button), "Cancelling…"); gtk_widget_set_sensitive(button, FALSE); }
+        label_text(state->status, "Cancelling…");
         return;
     }
-    state->cancelled = TRUE; state->cancellable = FALSE;
-    if (button) { gtk_button_set_label(GTK_BUTTON(button), "Cancelling…"); gtk_widget_set_sensitive(button, FALSE); }
-    label_text(state->status, "Cancelling…");
+    /* Never claim the request was accepted unless it was recorded under a valid
+     * "open" state. Disable further attempts and report the real outcome. */
+    state->cancellable = FALSE;
+    if (button) gtk_widget_set_sensitive(button, FALSE);
+    if (result == CANCEL_REFUSED)
+        label_text(state->status, "This update is already being applied and can no longer be cancelled.");
+    else
+        label_text(state->status, "Cancellation is unavailable; the update status could not be verified safely.");
 }
 /* The state file is authoritative, so poll it instead of trusting that the
  * non-cancellable progress event has already been processed: the commit may
- * have begun while that event is still queued. */
+ * have begun while that event is still queued. An unreadable or invalid state
+ * is never treated as proof that cancellation is still safe. */
 static gboolean progress_poll_cancel(gpointer data) {
     ProgressState *state = data;
     if (state->closed || state->done) return G_SOURCE_REMOVE;
-    if (state->cancel && !state->cancelled && state->cancellable &&
-        !cancel_state_open(state->cancel_state)) {
-        state->cancellable = FALSE;
-        gtk_widget_set_sensitive(state->cancel, FALSE);
+    if (state->cancel && !state->cancelled && state->cancellable) {
+        CancelState current = cancel_state_read(state->cancel_state);
+        if (current != CANCEL_STATE_OPEN) {
+            state->cancellable = FALSE;
+            gtk_widget_set_sensitive(state->cancel, FALSE);
+            if (current == CANCEL_STATE_UNKNOWN)
+                label_text(state->status, "Cancellation is unavailable; the update status could not be verified safely.");
+        }
     }
     return G_SOURCE_CONTINUE;
 }

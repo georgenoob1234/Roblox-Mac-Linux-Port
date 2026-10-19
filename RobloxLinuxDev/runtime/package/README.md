@@ -59,6 +59,7 @@ The headless interface is:
 sh run.sh status
 sh run.sh check
 sh run.sh update                 # newline-delimited JSON progress
+sh run.sh update-settings        # internal Settings handoff; accepts no extra arguments
 sh run.sh --launcher             # open the full launcher on Play
 sh run.sh --settings             # open the full launcher on Settings
 sh run.sh get auto_update
@@ -86,13 +87,24 @@ The bundled GTK3 bootstrapper shows delayed first-run/update progress and the
 ask-mode decision dialog. Its full launcher has Play, Settings and Info pages;
 the installed menu entry opens Play, while `sh run.sh --settings` opens
 Settings. Settings can be opened while Roblox is running; its Update now action
-is disabled with a reason until the game closes. Update events include byte
+is disabled with a reason until the game closes. Settings checks run in the
+background and refresh the authoritative status without blocking the window.
+When Update now is selected, Settings closes before the dedicated progress
+window opens. The internal `update-settings` handoff waits for the updater's
+real exit status, then opens Settings exactly once after success, failure or
+cancellation. Update events include byte
 counts when the download exposes Content-Length; verification and shader
 preparation use a pulsing bar. Cancel during checking, downloading,
 verification or shader preparation removes staging data, keeps the previous
 client, and returns without launching a browser link. A timeout or an ask-mode
 decline launches without updating. If GTK or a display is not available,
 launches continue without updating and a desktop notification is attempted.
+Settings also has a separate Port updates section. It checks the canonical
+GitHub release metadata and updates only installer-owned release files through
+the verified `installer.py` transaction. `RobloxVersion/`, `DO_NOT_SHARE/`,
+unknown files and modified files are preserved. The port update uses the same
+bootstrapper progress window and returns to Settings after success, failure or
+cancellation.
 The Play page's Open last log action opens the newest diagnostics file; logs can
 contain account details and should not be shared blindly.
 The native UI and media libraries are built or packaged in Ubuntu 24.04. Release

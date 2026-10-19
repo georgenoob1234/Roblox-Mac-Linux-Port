@@ -8,9 +8,21 @@ APP=$HERE/RobloxLinux.AppImage
 STATE=$DATA/bootstrapper.json
 HELPER=$HERE/bootstrap.py
 MARKER=$DATA/first-run.initialized
+# Shared cancellation handshake with the installer and the GTK UI. The marker
+# records a request; the state file records whether cancellation is still
+# accepted ("open") or the commit has begun ("committing"/"committed"). The
+# installer and the UI settle the boundary under <state>.lock; this script only
+# resets the state before an operation, which it does while holding the
+# instance lock, so no other operation can be running.
+CANCEL_MARKER=$DATA/.bootstrap-cancel
+CANCEL_STATE=$DATA/.bootstrap-cancel-state
 URI_MAX_AGE=${ROBLOX_MAC_URI_MAX_AGE:-600}
 EVENTS=${ROBLOX_MAC_EVENTS:-0}
-UI_APP=${ROBLOX_MAC_UI_APP:-}
+if [ "${ROBLOX_MAC_NO_PROGRESS:-0}" = 1 ]; then
+    UI_APP=
+else
+    UI_APP=${ROBLOX_MAC_UI_APP:-}
+fi
 UI_FD=0
 UI_PID=
 UI_FIFO=
@@ -18,6 +30,102 @@ UI_CANCELLED=0
 UI_RESULT=0
 
 cancelled() { [ -n "${ROBLOX_MAC_CANCEL_FILE:-}" ] && [ -e "$ROBLOX_MAC_CANCEL_FILE" ]; }
+
+# Atomically record the shared cancellation state under <state>.lock, the same
+# lock the installer and the GTK UI use to settle the commit boundary. The lock
+# is opened with O_NOFOLLOW|O_NONBLOCK and validated on the opened descriptor
+# with fstat(), so a symlinked, FIFO, or foreign-owned path is rejected promptly
+# instead of being followed or blocking the shell forever, and the flock spans
+# the whole read-modify-write. Returns non-zero when the state could not be
+# recorded, so the caller never starts an operation on stale state.
+#
+# The helper runs Python because it must use the same flock/atomic-replace
+# protocol as the installer and the UI. There is deliberately no shell
+# fallback: a redirection-based fallback cannot safely open a path that another
+# process could replace between the check and the open, so a host where this
+# helper cannot run refuses to start the operation instead of weakening the
+# protocol.
+CANCEL_PYTHON=
+cancel_state_write() {
+    if [ -z "$CANCEL_PYTHON" ]; then
+        if python3 -c 'import fcntl, os, stat, tempfile' >/dev/null 2>&1; then
+            CANCEL_PYTHON=1
+        else
+            CANCEL_PYTHON=0
+        fi
+    fi
+    if [ "$CANCEL_PYTHON" != 1 ]; then
+        say 'Python 3 with fcntl support is required to record the shared update state.'
+        return 1
+    fi
+    python3 - "$CANCEL_STATE" "$1" <<'PY'
+import fcntl, os, stat, sys, tempfile
+
+state_path = sys.argv[1]
+value = sys.argv[2]
+SAFE_FLAGS = (getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+              | getattr(os, "O_NONBLOCK", 0))
+
+
+def safe_open(path, flags):
+    fd = os.open(path, flags | SAFE_FLAGS, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        raise OSError("not a regular file owned by this user")
+    return fd
+
+
+lock_path = state_path + ".lock"
+try:
+    lock_fd = safe_open(lock_path, os.O_RDWR | os.O_CREAT)
+except OSError as exc:
+    print(f"cancel_state_write: unsafe lock path {lock_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+tmp = None
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        # Validate the state through the descriptor actually opened, not just
+        # the path: O_NOFOLLOW rejects a symlink and fstat rejects a FIFO or
+        # any other non-regular entry. A missing state is the first-run case.
+        state_fd = safe_open(state_path, os.O_RDONLY)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"cancel_state_write: unsafe state path {state_path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    else:
+        os.close(state_fd)
+    # A unique file created exclusively in the same directory: a file or
+    # symlink planted at a predictable temporary name can be neither opened
+    # nor truncated by the replacement.
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(state_path) + ".tmp-",
+                               dir=os.path.dirname(state_path) or ".")
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, (value + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, state_path)
+    tmp = None
+except OSError as exc:
+    print(f"cancel_state_write: could not record {value!r} at {state_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    if tmp is not None:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+PY
+    return $?
+}
 
 say() { echo "roblox: $*" >&2; }
 event() {
@@ -35,9 +143,30 @@ PY
 }
 start_progress() {
     [ -n "$UI_APP" ] || return 0
-    ROBLOX_MAC_CANCEL_FILE=$DATA/.bootstrap-cancel
-    export ROBLOX_MAC_CANCEL_FILE
+    # A port update mutates the managed port files and therefore requires the
+    # shared protocol. A normal launch or client update can still run without
+    # it (the port updater is the only component that relies on the state
+    # file), so it degrades with a warning instead of refusing to start.
+    require_cancel_state=${1:-}
+    ROBLOX_MAC_CANCEL_FILE=$CANCEL_MARKER
+    ROBLOX_MAC_CANCEL_STATE_FILE=$CANCEL_STATE
+    export ROBLOX_MAC_CANCEL_FILE ROBLOX_MAC_CANCEL_STATE_FILE
+    # Drop any request and state left by a previous operation before the new
+    # one can observe them: a stale "committing" must never make a fresh
+    # update look uncancellable, and a stale marker must never cancel it. If
+    # the reset cannot be recorded the operation must not start, so a stale
+    # state can never be mistaken for a fresh one; the caller aborts.
     rm -f -- "$ROBLOX_MAC_CANCEL_FILE"
+    if ! cancel_state_write open; then
+        ROBLOX_MAC_CANCEL_FILE=
+        ROBLOX_MAC_CANCEL_STATE_FILE=
+        export ROBLOX_MAC_CANCEL_FILE ROBLOX_MAC_CANCEL_STATE_FILE
+        if [ "$require_cancel_state" = required ]; then
+            say 'Could not reset the shared update state; not starting the operation.'
+            return 1
+        fi
+        say 'warning: the shared update state is unavailable; continuing without it.'
+    fi
     UI_FIFO=$DATA/.bootstrap-progress.$$
     rm -f -- "$UI_FIFO"
     mkfifo "$UI_FIFO" 2>/dev/null || { UI_FIFO=; return 0; }
@@ -60,7 +189,7 @@ finish_progress() {
         [ -e "${ROBLOX_MAC_CANCEL_FILE:-}" ] && UI_CANCELLED=1
         [ "$ui_result" -eq 0 ] || [ "$ui_result" -eq 4 ] || notify 'Bootstrapper UI unavailable; launching without updating.' 'Roblox'
     fi
-    [ "$UI_CANCELLED" -eq 1 ] || rm -f -- "${ROBLOX_MAC_CANCEL_FILE:-}" 2>/dev/null || true
+    rm -f -- "${ROBLOX_MAC_CANCEL_FILE:-}" 2>/dev/null || true
     UI_FD=0; UI_PID=; UI_FIFO=
 }
 notify() {
@@ -320,10 +449,15 @@ check_latest() {
         if cancelled; then kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true; rm -f -- "$check_output"; return 125; fi
         sleep 0.1
     done
-    wait "$check_pid" 2>/dev/null || true
+    wait "$check_pid" 2>/dev/null
+    check_status=$?
     latest=$(sed -n '/^version-[0-9a-f][0-9a-f]*$/p' "$check_output" 2>/dev/null | tail -n 1 || true)
     rm -f -- "$check_output"
     settings_set last_check "$now" >/dev/null 2>&1 || true
+    if [ "$check_status" -ne 0 ]; then
+        [ -n "$latest" ] && printf '%s\n' "$latest"
+        return 1
+    fi
     if [ -n "$latest" ]; then
         settings_set last_known_latest "$latest" >/dev/null 2>&1 || true
         display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 9>&- 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
@@ -331,6 +465,7 @@ check_latest() {
         printf '%s\n' "$latest"
     else
         settings_get last_known_latest
+        return 1
     fi
 }
 
@@ -343,10 +478,12 @@ do_update() {
             ROBLOX_MAC_PROGRESS_FD=8 ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
             sh "$HERE/update-roblox.sh"; then
         if cancelled; then
+            event cancelled 0 'Update cancelled; keeping the installed client' 0 0 false
             say 'Update cancelled; the installed client was kept.'
             notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
             return 125
         fi
+        event failed 0 'Update failed; keeping the installed client' 0 0 false
         say 'Update failed or timed out; the installed client was kept.'
         notify 'Roblox update failed; the installed client was kept.' 'Roblox update failed'
         return 1
@@ -355,6 +492,57 @@ do_update() {
     event verifying 78 'Verifying the downloaded client' 0 0 true
     event preparing 90 'Preparing shaders' 0 0 true
     event update 100 'Update complete' 0 0 false
+}
+
+do_port_update() {
+    if [ ! -f "$HERE/installer.py" ]; then
+        event failed 0 'Port updater is not included in this release' 0 0 false
+        say 'Port updater is unavailable; install a release containing installer.py.'
+        return 1
+    fi
+    event checking 5 'Checking the latest port release' 0 0 true
+    # The installer owns the cancellation decision. It polls the marker during
+    # its cancellable phases, stops honouring it at the commit boundary, and
+    # reports an accepted cancellation with its own terminal status (125). The
+    # GTK UI and the installer settle the boundary through the shared
+    # CANCEL_STATE file under CANCEL_LOCK, so this wrapper never guesses from
+    # the marker file -- a late request, or a marker left over from an earlier
+    # operation, must not change the result of an update that actually
+    # committed.
+    #
+    # It is deliberately not wrapped in `timeout`: a signal during the
+    # non-cancellable commit phase is exactly what leaves run.sh or
+    # installer.py missing. The installer bounds its own cancellable phases
+    # instead (network socket timeouts plus ROBLOX_MAC_PORT_UPDATE_TIMEOUT,
+    # default 30m, applied only before the commit boundary), and an
+    # interruption of the commit itself is repaired by the launcher's
+    # recovery entry point on the next start.
+    env ROBLOX_MAC_PROGRESS_FD=8 \
+        ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
+        ROBLOX_MAC_CANCEL_STATE_FILE="${ROBLOX_MAC_CANCEL_STATE_FILE:-}" \
+        ROBLOX_MAC_LOCK_HELD=1 \
+        python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop
+    _port_update_status=$?
+    case "$_port_update_status" in
+        0)
+            event update 100 'Port update complete' 0 0 false
+            return 0;;
+        3)
+            # The new release is committed and live; only obsolete-backup
+            # cleanup could not finish. Report it as applied -- never with the
+            # failure wording, which would wrongly claim the old release was
+            # kept and the change never happened.
+            event update 100 'Port update applied; finishing cleanup on the next start' 0 0 false
+            say 'Port update applied; leftover cleanup will finish on the next start.'
+            return 0;;
+        125)
+            event cancelled 0 'Port update cancelled; the current release was kept' 0 0 false
+            say 'Port update cancelled; the current release was kept.'
+            return 125;;
+    esac
+    event failed 0 'Port update failed; the current release was kept' 0 0 false
+    say 'Port update failed; the current release was kept.'
+    return 1
 }
 
 status_json() { python3 "$HELPER" status "$DATA" "$HERE/RobloxVersion"; }
@@ -377,11 +565,12 @@ case "$command" in
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
-        start_progress
+        start_progress || { exec 9>&-; exit 1; }
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; notify 'Update check cancelled.' 'Roblox'; exit 125; }
+        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; status_json; exit 1; }
         finish_progress
         exec 9>&-
         status_json; exit 0;;
@@ -392,13 +581,40 @@ case "$command" in
             say 'Roblox is already running.'; notify 'Roblox is already running.' 'Roblox is already running'; exit 0
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
-        start_progress
+        start_progress || { exec 9>&-; exit 1; }
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; exit 125; }
+        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; exit 1; }
         [ -n "$latest" ] || { say 'No latest version is known; update check failed.'; finish_progress; exit 1; }
         do_update; result=$?; finish_progress; [ "$UI_CANCELLED" -eq 1 ] && result=125; exit "$result";;
+    update-settings)
+        [ "$#" -eq 1 ] || { echo 'Usage: run.sh update-settings' >&2; exit 2; }
+        sh "$HERE/run.sh" update
+        update_result=$?
+        sh "$HERE/run.sh" --settings
+        settings_result=$?
+        [ "$settings_result" -eq 0 ] || exit "$settings_result"
+        exit "$update_result";;
+    port-update)
+        EVENTS=1
+        mkdir -p "$DATA"; exec 9>"$DATA/instance.lock"
+        if ! flock -n -E 73 9; then
+            event failed 0 'Close Roblox before updating the port' 0 0 false
+            finish_progress; exit 1
+        fi
+        start_progress required || { exec 9>&-; exit 1; }
+        do_port_update; result=$?; finish_progress; exec 9>&-
+        exit "$result";;
+    port-update-settings)
+        [ "$#" -eq 1 ] || { echo 'Usage: run.sh port-update-settings' >&2; exit 2; }
+        sh "$HERE/run.sh" port-update
+        update_result=$?
+        sh "$HERE/run.sh" --settings
+        settings_result=$?
+        [ "$settings_result" -eq 0 ] || exit "$settings_result"
+        exit "$update_result";;
     launch)
         :;;
     *)
@@ -413,7 +629,7 @@ if ! flock -n -E 73 9; then
     exit 0
 fi
 recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
-start_progress
+start_progress || { exec 9>&-; exit 1; }
 first_run || { finish_progress; exit 1; }
 installed=$(installed_version)
 event checking 25 'Checking for updates'

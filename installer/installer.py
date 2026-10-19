@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -17,11 +18,14 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -32,6 +36,7 @@ APP_ID = "roblox-mac-linux-port"
 APP_NAME = "Roblox Mac Linux Port"
 REPOSITORY = "georgenoob1234/Roblox-Mac-Linux-Port"
 MANIFEST_NAME = ".roblox-mac-port-install.json"
+PORT_VERSION_FILE = ".roblox-mac-port-version"
 TXN_PREFIX = ".roblox-mac-port-txn-"
 BACKUP_PREFIX = ".roblox-mac-port-backups"
 DESKTOP_STATE_NAME = "desktop.json"
@@ -56,6 +61,7 @@ PAYLOAD_FILES = {
     "run.sh",
     "update-roblox.sh",
     "installer.py",
+    PORT_VERSION_FILE,
 }
 REQUIRED_FILES = {
     "FFlags.json",
@@ -80,6 +86,274 @@ EXECUTABLE_FILES = {
 PROTECTED_NAMES = {"DO_NOT_SHARE", "RobloxVersion", ".update-work"}
 USER_CONFIG_FILES = {"FFlags.json"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+MAX_RELEASE_BYTES = 4 * 1024 * 1024 * 1024
+RECOVERY_DIR_NAME = "recovery"
+# Documented terminal status for a cancellation that was accepted before the
+# commit boundary. The launcher relies on this status (and never on a marker
+# file) to decide whether an operation reported cancellation.
+EXIT_CANCELLED = 125
+# Documented terminal status for an update whose files were committed but whose
+# backup cleanup could not finish. The new release is installed; only cleanup
+# remains, and recovery retries it. It must never be reported as a failure that
+# kept the previous release, and a committed install is never rolled back just
+# because deleting obsolete backups failed.
+EXIT_CLEANUP_PENDING = 3
+# Cancellable phases poll for cancellation on a timer so a stalled download or
+# staging step cannot pin an update indefinitely without an answer.
+PORT_UPDATE_POLL_SECONDS = 0.5
+DEFAULT_PORT_UPDATE_TIMEOUT_SECONDS = 1800.0
+# Shared cancellation handshake. The launcher resets the state to "open" before
+# an operation, the installer owns the transition to "committing" at the commit
+# boundary, and the GTK UI reads the same file under the same lock. Whoever
+# holds the lock first wins, so a request cannot be accepted after the commit
+# has begun and the UI cannot show a refused request as an accepted cancel.
+CANCEL_STATE_OPEN = "open"
+CANCEL_STATE_COMMITTING = "committing"
+CANCEL_STATE_COMMITTED = "committed"
+CANCEL_STATE_CANCELLED = "cancelled"
+# Every value the shared cancellation state may legitimately hold. Anything
+# else is treated as a protocol failure rather than as a fresh "open" state.
+CANCEL_STATES = frozenset({CANCEL_STATE_OPEN, CANCEL_STATE_COMMITTING,
+                           CANCEL_STATE_COMMITTED, CANCEL_STATE_CANCELLED})
+
+# Explicit outcomes for a transaction whose live files are in place but whose
+# bookkeeping did not finish. They must stay distinct: an unconfirmed commit
+# blocks every later mutation, while an ordinary cleanup failure does not.
+TXN_OUTCOME_CLEANUP_PENDING = "cleanup-pending"
+TXN_OUTCOME_DURABILITY_PENDING = "durability-pending"
+
+
+def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
+                   bytes_total: int = 0, cancellable: bool = True) -> None:
+    raw_fd = os.environ.get("ROBLOX_MAC_PROGRESS_FD", "")
+    if not raw_fd.isdigit():
+        return
+    payload = json.dumps({"phase": phase, "percent": percent, "message": message,
+                          "bytes_done": bytes_done, "bytes_total": bytes_total,
+                          "cancellable": bool(cancellable)}, separators=(",", ":"))
+    try:
+        os.write(int(raw_fd), (payload + "\n").encode())
+    except (OSError, ValueError):
+        pass
+
+
+def cancellation_requested() -> bool:
+    marker = os.environ.get("ROBLOX_MAC_CANCEL_FILE", "")
+    return bool(marker and os.path.exists(marker))
+
+
+def cancel_state_file() -> str:
+    """The launcher's shared cancellation state file, or "" when absent.
+
+    When the launcher does not provide it (a standalone CLI run, or an older
+    launcher that predates the protocol) the installer falls back to the plain
+    marker file, so direct `installer.py update` invocations keep working
+    unchanged. Its presence is what selects the fail-closed shared protocol.
+    """
+    return os.environ.get("ROBLOX_MAC_CANCEL_STATE_FILE", "")
+
+
+def cancel_protocol_configured() -> bool:
+    """True when the launcher supplied the shared cancellation-state protocol."""
+    return bool(cancel_state_file())
+
+
+def _cancel_state_path() -> Path | None:
+    raw = cancel_state_file()
+    return Path(raw) if raw else None
+
+
+def _assert_safe_cancel_state(path: Path) -> None:
+    """Refuse a shared state file that is a symlink, not ours, or not a file.
+
+    Called under the shared lock immediately before the state is read or
+    replaced, so there is no time-of-check/time-of-use window.
+    """
+    st = lstat_or_none(path)
+    if st is None:
+        raise CancelProtocolError(f"Shared cancellation state is missing: {path}")
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise CancelProtocolError(f"Shared cancellation state is not a safe regular file: {path}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise CancelProtocolError(f"Shared cancellation state is not owned by this user: {path}")
+
+
+def _open_safe_regular_file(path: Path, flags: int, description: str) -> int:
+    """Open a protocol file and confirm the *opened* descriptor is safe.
+
+    The lock/state protocol must never block, be redirected, or race: the open
+    uses O_NOFOLLOW so a symlink is not followed and O_NONBLOCK so a FIFO
+    planted at the path cannot block the open. The returned descriptor is then
+    validated with fstat() -- regular file, owned by this user -- rather than
+    only lstat-ing the path, so a concurrent replacement cannot slip a FIFO or a
+    foreign file past a check/use window. Raises CancelProtocolError on any
+    failure; the caller owns the returned descriptor.
+    """
+    open_flags = (flags | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, open_flags)
+    except OSError as exc:
+        raise CancelProtocolError(f"Cannot open the {description}: {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise CancelProtocolError(f"Cannot inspect the {description}: {path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise CancelProtocolError(f"The {description} is not a regular file: {path}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise CancelProtocolError(f"The {description} is not owned by this user: {path}")
+    return fd
+
+
+def read_cancel_state() -> str:
+    """Return the shared state, or "" when the protocol is not configured.
+
+    A configured-but-unusable state is a protocol failure, not a reason to fall
+    back to the marker alone, so a missing, unreadable, unsafe, or malformed
+    state raises CancelProtocolError. The state is validated on the opened
+    descriptor (not merely the path) before it is read.
+    """
+    path = _cancel_state_path()
+    if path is None:
+        return ""
+    fd = _open_safe_regular_file(path, os.O_RDONLY, "shared cancellation state")
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read()
+    except OSError as exc:
+        raise CancelProtocolError(f"Cannot read the shared cancellation state: {path}: {exc}") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    value = raw.decode("utf-8", "replace").strip()
+    if value not in CANCEL_STATES:
+        raise CancelProtocolError(f"Unrecognised shared cancellation state in {path}: {value!r}")
+    return value
+
+
+@contextlib.contextmanager
+def cancel_state_lock() -> Iterator[bool]:
+    """Serialise a cancellation request against the commit transition.
+
+    The launcher, the installer and the GTK UI all take this flock around the
+    read-modify-write of the state file, so exactly one side wins at the
+    boundary: a request recorded while the state is still "open" is honoured,
+    and a request that arrives once "committing" is recorded is refused.
+
+    Yields False only when no shared protocol is configured (a legacy/direct
+    CLI invocation). When the launcher configured the protocol, an unsafe,
+    missing, unopenable, or un-lockable file raises CancelProtocolError instead
+    of degrading to the marker alone, so a commit cannot proceed on state that
+    could not be established. The state file is validated under the lock.
+    """
+    path = _cancel_state_path()
+    if path is None:
+        yield False
+        return
+    lock_path = Path(str(path) + ".lock")
+    fd = -1
+    locked = False
+    try:
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                         | getattr(os, "O_NONBLOCK", 0), 0o600)
+        except OSError as exc:
+            raise CancelProtocolError(f"Cannot open the shared cancellation lock: {lock_path}: {exc}") from exc
+        lock_st = os.fstat(fd)
+        if not stat.S_ISREG(lock_st.st_mode):
+            raise CancelProtocolError(f"Shared cancellation lock is not a regular file: {lock_path}")
+        if hasattr(os, "getuid") and lock_st.st_uid != os.getuid():
+            raise CancelProtocolError(f"Shared cancellation lock is not owned by this user: {lock_path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise CancelProtocolError(f"Cannot acquire the shared cancellation lock: {lock_path}: {exc}") from exc
+        locked = True
+        # Validate the state only once the lock is held: no other writer can
+        # swap the path between validation and the read-modify-write below.
+        _assert_safe_cancel_state(path)
+        yield True
+    finally:
+        if fd >= 0:
+            if locked:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def write_cancel_state(value: str) -> None:
+    """Atomically record the shared state under the caller's lock.
+
+    A configured protocol must not degrade silently, so a failed write raises
+    CancelProtocolError instead of leaving a stale state in place. With no
+    configured protocol this is a no-op.
+    """
+    path = _cancel_state_path()
+    if path is None:
+        return
+    _assert_safe_cancel_state(path)
+    try:
+        atomic_write(path, (value + "\n").encode("utf-8"), 0o600)
+    except (OSError, InstallerError) as exc:
+        raise CancelProtocolError(
+            f"Cannot record the shared cancellation state {value!r} at {path}: {exc}") from exc
+
+
+def cancel_boundary() -> bool:
+    """Atomically decide whether a cancellation request wins the boundary.
+
+    Returns True when a request recorded while the state was still "open" must
+    abort the operation before any destination file changes, and False once the
+    installer has recorded that it owns the commit. The decision, the state
+    transition, and its verification all happen inside one lock, so a request
+    can never be accepted (and shown as accepted by the UI) after the commit
+    has begun, and a transition that cannot be verified aborts the update.
+    """
+    if not cancel_protocol_configured():
+        # Legacy/direct invocation: the marker alone is the contract.
+        return cancellation_requested()
+    with cancel_state_lock():
+        state = read_cancel_state()
+        if state != CANCEL_STATE_OPEN:
+            # A fresh commit may only be claimed from "open". Any other value
+            # (committing/committed/cancelled) is stale or already owned, so
+            # refuse to guess and abort before touching any live file.
+            raise CancelProtocolError(
+                f"The shared cancellation state is not open (found {state!r}); refusing to start a commit")
+        if cancellation_requested():
+            write_cancel_state(CANCEL_STATE_CANCELLED)
+            if read_cancel_state() != CANCEL_STATE_CANCELLED:
+                raise CancelProtocolError("The accepted cancellation could not be recorded safely")
+            return True
+        write_cancel_state(CANCEL_STATE_COMMITTING)
+        if read_cancel_state() != CANCEL_STATE_COMMITTING:
+            raise CancelProtocolError("The commit transition could not be recorded safely")
+        return False
+
+
+def mark_commit_completed() -> None:
+    """Record a durable commit so stale state can never look cancellable.
+
+    Runs only after the transaction's journal is durably committed; a failure
+    here is post-commit bookkeeping (the caller warns) and must never be a
+    reason to roll back the committed release.
+    """
+    if not cancel_protocol_configured():
+        return
+    with cancel_state_lock():
+        if read_cancel_state() in (CANCEL_STATE_COMMITTING, CANCEL_STATE_COMMITTED):
+            write_cancel_state(CANCEL_STATE_COMMITTED)
+            if read_cancel_state() != CANCEL_STATE_COMMITTED:
+                raise CancelProtocolError("The completed commit could not be recorded safely")
 
 
 def _color(code: str, value: str) -> str:
@@ -146,6 +420,59 @@ def fail(message: str) -> "NoReturn":
 
 class InstallerError(RuntimeError):
     pass
+
+
+class CancelProtocolError(InstallerError):
+    """The shared cancellation protocol could not be used safely.
+
+    Raised instead of silently degrading to marker-only cancellation when the
+    configured shared state or its lock cannot be opened, locked, read, written,
+    or verified. The operation must fail closed so a commit can never proceed
+    (or a request be accepted) on state that could not be established.
+    """
+
+
+class CancelledError(InstallerError):
+    """A cancellation accepted before the transaction touched any file.
+
+    Raised with its own terminal status (EXIT_CANCELLED) so the launcher and
+    the GTK UI never have to infer "cancelled" from a marker file, which a
+    late request or a previous operation may have left behind.
+    """
+
+
+class CleanupPendingError(InstallerError):
+    """The release was committed; only obsolete-backup cleanup failed.
+
+    It carries its own terminal status (EXIT_CLEANUP_PENDING) so the launcher
+    reports "applied, cleanup pending" instead of the failure wording that
+    claims the previous release was kept -- which would be false, because the
+    new files are already live. The committed transaction is left in place for
+    recovery to finish the cleanup.
+    """
+
+
+class TransactionDurabilityError(InstallerError):
+    """A transaction rename happened but its durability could not be confirmed.
+
+    Raised by the transaction-critical directory fsync when the confirming
+    fsync fails -- including a filesystem that reports directory fsync as
+    unsupported. A rename whose directory entry was not synced may be lost by a
+    crash, so the transaction must not claim durability it does not have: the
+    caller keeps its evidence, never rolls back on a guess, and lets recovery
+    re-establish durability and finish the cleanup.
+    """
+
+
+class CommitDurabilityPendingError(CleanupPendingError):
+    """The release is live, but its commit durability is unresolved.
+
+    It shares CleanupPendingError's terminal status because the new files are
+    already installed, yet it is deliberately distinct from an ordinary
+    cleanup failure: while the committed journal's durability cannot be
+    confirmed, no further installation mutation may start. Recovery retries
+    the confirming fsync and only then finishes the cleanup.
+    """
 
 
 @contextlib.contextmanager
@@ -244,7 +571,42 @@ def fsync_dir(path: Path) -> None:
         pass
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+# errno values that mean a filesystem does not support directory fsync at all,
+# rather than that the synced data failed to reach disk.
+_UNSUPPORTED_DIR_FSYNC_ERRNOS = frozenset(
+    code for code in (errno.EINVAL, errno.ENOSYS,
+                      getattr(errno, "ENOTSUP", errno.EINVAL),
+                      getattr(errno, "EOPNOTSUPP", errno.EINVAL))
+)
+
+
+def fsync_dir_strict(path: Path) -> None:
+    """Directory fsync for transaction-critical renames.
+
+    Unlike fsync_dir(), a failure is propagated: a rename whose directory entry
+    was not confirmed synced may be lost by a crash, so the transaction must not
+    claim durability it does not have. A filesystem that reports directory fsync
+    as unsupported is reported distinctly rather than treated as success, so the
+    caller can fail safely before mutating live files (or keep its evidence if
+    the failure happens after mutation already started).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        raise TransactionDurabilityError(f"Cannot open {path} to confirm durability: {exc}") from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        detail = " (directory fsync is not supported by this filesystem)" \
+            if exc.errno in _UNSUPPORTED_DIR_FSYNC_ERRNOS else ""
+        raise TransactionDurabilityError(
+            f"Cannot confirm the durability of {path}: {exc}{detail}") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600, durable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = lstat_or_none(path)
     if existing is not None and not stat.S_ISREG(existing.st_mode):
@@ -258,7 +620,13 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)
-        fsync_dir(path.parent)
+        # Transaction-critical callers (durable=True) must be able to tell a
+        # durable rename from one whose directory fsync failed, so they use the
+        # strict path; everyone else keeps the tolerant best-effort helper.
+        if durable:
+            fsync_dir_strict(path.parent)
+        else:
+            fsync_dir(path.parent)
     except Exception:
         try:
             temp.unlink(missing_ok=True)
@@ -271,8 +639,8 @@ def json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def atomic_json(path: Path, value: Any, mode: int = 0o600) -> None:
-    atomic_write(path, json_bytes(value), mode)
+def atomic_json(path: Path, value: Any, mode: int = 0o600, durable: bool = False) -> None:
+    atomic_write(path, json_bytes(value), mode, durable=durable)
 
 
 @contextlib.contextmanager
@@ -305,6 +673,8 @@ def installer_lock() -> Iterator[None]:
 
 
 def assert_not_running(target: Path) -> None:
+    if os.environ.get("ROBLOX_MAC_LOCK_HELD") == "1":
+        return
     data = target / "DO_NOT_SHARE"
     data_st = lstat_or_none(data)
     if data_st is not None and stat.S_ISLNK(data_st.st_mode):
@@ -365,6 +735,44 @@ def load_manifest(target: Path) -> dict[str, Any] | None:
         if name not in PAYLOAD_FILES or not isinstance(info, dict) or not HEX64.fullmatch(str(info.get("sha256", ""))):
             fail(f"Installer manifest contains an unexpected entry ({name!r}). Refusing destructive changes.")
     return manifest
+
+
+def installed_port_version(target: Path) -> str:
+    manifest = load_manifest(target)
+    if manifest:
+        value = str(manifest.get("version") or "").strip()
+        if value and value != "local":
+            return value
+    version_path = target / PORT_VERSION_FILE
+    try:
+        value = version_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return value
+
+
+def infer_legacy_manifest(target: Path) -> dict[str, Any] | None:
+    """Adopt a direct extracted release without claiming unknown files."""
+    if not check_target_root(target):
+        return None
+    files: dict[str, Any] = {}
+    recognized = 0
+    for child in target.iterdir():
+        if child.name in PROTECTED_NAMES or child.name.startswith(TXN_PREFIX) or child.name == MANIFEST_NAME:
+            continue
+        if child.name not in PAYLOAD_FILES:
+            warn(f"Preserving unrelated pre-existing entry without modifying it: {child}")
+            continue
+        st = child.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            fail(f"Legacy port file is not a regular file; refusing to replace it: {child}")
+        files[child.name] = {"sha256": sha256_file(child), "mode": stat.S_IMODE(st.st_mode), "legacy": True}
+        recognized += 1
+    if not recognized or not REQUIRED_FILES.issubset(files):
+        return None
+    return {"schema": 1, "app_id": APP_ID, "app_name": APP_NAME,
+            "install_dir": str(target), "version": installed_port_version(target) or "legacy",
+            "source": "legacy-direct-release", "files": files}
 
 
 def check_source_root(raw: str | Path, target: Path) -> Path:
@@ -452,7 +860,7 @@ def copy_payload_to_stage(source: Path, names: list[str], stage: Path, release_t
     }
 
 
-def preserve_to_backup(source: Path, target_parent: Path, label: str) -> Path:
+def preserve_to_backup(source: Path, target_parent: Path, label: str, durable: bool = False) -> Path:
     backup_root = target_parent / BACKUP_PREFIX
     backup_st = lstat_or_none(backup_root)
     if backup_st is not None and (stat.S_ISLNK(backup_st.st_mode) or not stat.S_ISDIR(backup_st.st_mode)):
@@ -473,13 +881,35 @@ def preserve_to_backup(source: Path, target_parent: Path, label: str) -> Path:
     slot.mkdir(mode=0o700)
     destination = slot / source.name
     os.replace(source, destination)
-    fsync_dir(source.parent)
-    fsync_dir(slot)
+    sync = fsync_dir_strict if durable else fsync_dir
+    sync(source.parent)
+    sync(slot)
     return destination
 
 
-def write_journal(txn: Path, journal: dict[str, Any]) -> None:
-    atomic_json(txn / "journal.json", journal, 0o600)
+def write_journal(txn: Path, journal: dict[str, Any], durable: bool = True) -> None:
+    atomic_json(txn / "journal.json", journal, 0o600, durable=durable)
+
+
+def _persisted_journal_state(txn: Path) -> str | None:
+    """The durable journal state, or None when it cannot be established safely.
+
+    Returns None for a missing, unreadable, non-regular, or malformed journal so
+    a caller never guesses a state it cannot verify -- in particular so it never
+    destructively rolls back a transaction that may already be committed.
+    """
+    journal_path = txn / "journal.json"
+    st = lstat_or_none(journal_path)
+    if st is None or not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        data = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    state = data.get("state")
+    return state if isinstance(state, str) else None
 
 
 def _remove_if_regular_or_symlink(path: Path) -> None:
@@ -492,6 +922,11 @@ def _remove_if_regular_or_symlink(path: Path) -> None:
 
 
 def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> None:
+    # A transaction whose persisted journal is "committed" is authoritative:
+    # never roll it back, even if a caller asks, so a post-commit error can
+    # never undo a live release.
+    if journal.get("state") == CANCEL_STATE_COMMITTED or _persisted_journal_state(txn) == CANCEL_STATE_COMMITTED:
+        raise InstallerError(f"Refusing to roll back a committed installer transaction: {txn}")
     backup_root = txn / "backup"
     conflicts: list[str] = []
     for op in reversed(journal.get("files", [])):
@@ -512,14 +947,14 @@ def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> No
                     dest.unlink()
                 else:
                     try:
-                        saved = preserve_to_backup(dest, target.parent, "recovery-conflict")
+                        saved = preserve_to_backup(dest, target.parent, "recovery-conflict", durable=True)
                         warn(f"A file changed during recovery; preserved it at {saved}")
                     except Exception as exc:
                         conflicts.append(f"could not preserve unexpected {dest}: {exc}")
                         continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(backup, dest)
-            fsync_dir(dest.parent)
+            fsync_dir_strict(dest.parent)
         elif op.get("had_old"):
             # No backup means the original rename had not started; leave the
             # original in place. If it vanished, retain the journal as evidence.
@@ -545,7 +980,7 @@ def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> No
                 manifest.unlink()
             else:
                 try:
-                    saved = preserve_to_backup(manifest, target.parent, "recovery-manifest-conflict")
+                    saved = preserve_to_backup(manifest, target.parent, "recovery-manifest-conflict", durable=True)
                     warn(f"An unexpected manifest was preserved at {saved}")
                 except Exception as exc:
                     conflicts.append(f"could not preserve unexpected manifest: {exc}")
@@ -562,7 +997,7 @@ def rollback_transaction(target: Path, txn: Path, journal: dict[str, Any]) -> No
     if conflicts:
         fail("Could not fully recover an interrupted installer transaction. Evidence was kept at " + str(txn) + ": " + "; ".join(conflicts))
     shutil.rmtree(txn)
-    fsync_dir(target.parent)
+    fsync_dir_strict(target.parent)
     if journal.get("target_created") and target.is_dir():
         with contextlib.suppress(OSError):
             target.rmdir()
@@ -576,7 +1011,7 @@ def finalize_transaction(target: Path, txn: Path, journal: dict[str, Any], prese
         if lstat_or_none(backup) is None:
             continue
         if op.get("modified") and op.get("had_old") and preserve_modified:
-            saved = preserve_to_backup(backup, target.parent, "user-modified")
+            saved = preserve_to_backup(backup, target.parent, "user-modified", durable=True)
             good(f"Preserved your modified {rel} at {saved}")
         else:
             _remove_if_regular_or_symlink(backup)
@@ -584,12 +1019,25 @@ def finalize_transaction(target: Path, txn: Path, journal: dict[str, Any], prese
     if lstat_or_none(manifest_backup) is not None:
         _remove_if_regular_or_symlink(manifest_backup)
     shutil.rmtree(txn)
-    fsync_dir(target.parent)
+    fsync_dir_strict(target.parent)
 
 
-def recover_transactions(target: Path) -> None:
+def recover_transactions(target: Path, require_durable: bool = False) -> str | None:
+    """Repair transactions left beside ``target``.
+
+    A committed transaction is never rolled back. Its committed journal must
+    first be confirmed durable by re-syncing the transaction directory; if that
+    still fails, the transaction's evidence is always kept. ``require_durable``
+    is for mutation entry points: they must stop before changing anything,
+    while a launch-time recovery may report the unresolved state and continue.
+
+    Returns TXN_OUTCOME_DURABILITY_PENDING when a committed transaction's
+    durability remains unconfirmed, and None otherwise. An ordinary cleanup
+    failure after durability was established stays a warning.
+    """
     if not target.parent.exists():
-        return
+        return None
+    unresolved = False
     for txn in sorted(target.parent.glob(TXN_PREFIX + "*")):
         st = lstat_or_none(txn)
         if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
@@ -616,9 +1064,37 @@ def recover_transactions(target: Path) -> None:
             good("Recovered the previous installation state.")
         elif state == "committed":
             warn("Finishing cleanup from a previously completed installation transaction.")
-            finalize_transaction(target, txn, journal)
+            try:
+                # A committed journal whose rename was never confirmed durable
+                # (for example the write reported an error after the rename) must
+                # have that durability established before its backups are
+                # deleted: re-syncing the transaction directory is the required
+                # guarantee and is safe to retry. If it still cannot be
+                # confirmed, keep every piece of evidence.
+                fsync_dir_strict(txn)
+            except TransactionDurabilityError as exc:
+                # This is the unresolved-commit condition, not an ordinary
+                # cleanup failure: a later update must not overwrite live files
+                # whose relationship to this journal is not durable yet.
+                if require_durable:
+                    raise TransactionDurabilityError(
+                        "The previous update's committed state is not confirmed durable; "
+                        f"refusing to start another update. Transaction evidence was kept at {txn}: {exc}"
+                    ) from exc
+                warn("The previous update is live, but its commit durability is still "
+                     f"unconfirmed; keeping its transaction evidence at {txn} for a later retry: {exc}")
+                unresolved = True
+                continue
+            try:
+                # Durability is established here, so a failure below is only
+                # obsolete-backup cleanup. It is safe to warn and retry later;
+                # it must not block updates or undo the committed release.
+                finalize_transaction(target, txn, journal)
+            except Exception as exc:
+                warn(f"Cleanup from a completed transaction is still pending: {exc}")
         else:
             fail(f"Unknown installer transaction state in {journal_path}; refusing to guess.")
+    return TXN_OUTCOME_DURABILITY_PENDING if unresolved else None
 
 
 def inspect_target(target: Path, new_files: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -699,7 +1175,7 @@ def build_operations(target: Path, old_manifest: dict[str, Any] | None, new_mani
                 continue
             operations.append({"path": name, "action": "replace", "had_old": True,
                                "old_hash": current_hash, "new_hash": new_record["sha256"],
-                               "modified": current_hash != old_record["sha256"]})
+                               "modified": bool(old_record.get("legacy")) or current_hash != old_record["sha256"]})
         elif old_record is not None:
             if name in USER_CONFIG_FILES:
                 warn(f"Preserving user configuration on uninstall: {dest}")
@@ -713,14 +1189,23 @@ def build_operations(target: Path, old_manifest: dict[str, Any] | None, new_mani
 
 def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | None,
                       new_manifest: dict[str, Any] | None, staged_payload: Path | None,
-                      target_created: bool = False, preserve_modified: bool = True) -> None:
+                      target_created: bool = False, preserve_modified: bool = True) -> str | None:
+    """Swap the managed files under a journal, then clean up.
+
+    Returns TXN_OUTCOME_DURABILITY_PENDING when the files were committed but
+    the committed journal's durability could not be confirmed, and
+    TXN_OUTCOME_CLEANUP_PENDING when the commit is durable but the
+    obsolete-backup cleanup could not finish. Both mean the new files are live;
+    only the former forbids another mutation until recovery re-confirms
+    durability. Returns None when everything, including cleanup, finished.
+    """
     manifest_path = target / MANIFEST_NAME
     old_manifest_exists = lstat_or_none(manifest_path) is not None
     old_manifest_hash = sha256_file(manifest_path) if old_manifest_exists else None
     new_manifest_data = json_bytes(new_manifest) if new_manifest is not None else None
     new_manifest_hash = hashlib.sha256(new_manifest_data).hexdigest() if new_manifest_data is not None else None
     if new_manifest_data is not None:
-        atomic_write(txn / "new_manifest.json", new_manifest_data, 0o600)
+        atomic_write(txn / "new_manifest.json", new_manifest_data, 0o600, durable=True)
     operations = build_operations(target, old_manifest, new_manifest)
     journal = {
         "schema": 1,
@@ -734,6 +1219,10 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
     }
     (txn / "backup").mkdir(parents=True, exist_ok=True, mode=0o700)
     write_journal(txn, journal)
+    # Phase 1: swap the managed files while the journal says "applying". A
+    # failure here is before the commit point and is still safely rolled back to
+    # the old release. BaseException is deliberately not caught, so an interrupt
+    # that leaves a real "applying" transaction behind is repaired by recovery.
     try:
         for op in operations:
             name = op["path"]
@@ -742,28 +1231,78 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
             if op["had_old"]:
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(dest, backup)
-                fsync_dir(dest.parent)
-                fsync_dir(backup.parent)
+                fsync_dir_strict(dest.parent)
+                fsync_dir_strict(backup.parent)
             if op["action"] == "replace":
                 if staged_payload is None:
                     fail(f"Internal error: no staged payload available for {name}")
                 os.replace(staged_payload / name, dest)
-                fsync_dir(dest.parent)
+                fsync_dir_strict(dest.parent)
         if old_manifest_exists:
             os.replace(manifest_path, txn / "backup" / "MANIFEST")
-            fsync_dir(target)
+            fsync_dir_strict(target)
         if new_manifest_data is not None:
             os.replace(txn / "new_manifest.json", manifest_path)
-            fsync_dir(target)
-        journal["state"] = "committed"
-        write_journal(txn, journal)
+            fsync_dir_strict(target)
     except Exception:
         try:
             rollback_transaction(target, txn, journal)
         except Exception as recovery_exc:
             warn(f"Automatic rollback was incomplete: {recovery_exc}")
         raise
-    finalize_transaction(target, txn, journal, preserve_modified=preserve_modified)
+    # Phase 2: the commit point. Durably recording the journal as "committed" is
+    # what makes the new release authoritative; from here it is never rolled
+    # back. Writing can fail after the atomic rename lands but before the
+    # directory fsync returns, so the persisted state -- not the exception --
+    # decides the outcome rather than assuming the old journal is still there.
+    committed_journal = dict(journal)
+    committed_journal["state"] = CANCEL_STATE_COMMITTED
+    try:
+        write_journal(txn, committed_journal)
+    except TransactionDurabilityError as exc:
+        # The committed journal rename landed, but its durability could not be
+        # confirmed. A crash could still lose the rename, so this is not a firm
+        # commit: never roll back on that guess and never delete the backups or
+        # the evidence. Report a pending transaction so recovery re-establishes
+        # durability (by re-syncing the transaction directory) and finishes the
+        # cleanup safely.
+        warn(f"The new release is live, but its commit could not be confirmed durable; "
+             f"cleanup is pending: {exc}")
+        return TXN_OUTCOME_DURABILITY_PENDING
+    except Exception as exc:
+        persisted = _persisted_journal_state(txn)
+        if persisted == CANCEL_STATE_COMMITTED:
+            # The committed state is already visible on disk: the commit is
+            # durable and must not be undone.
+            warn(f"The commit is durable, but recording it reported an error: {exc}")
+        elif persisted == "applying":
+            # The committed state never reached disk, so the old release is
+            # still safe to restore.
+            try:
+                rollback_transaction(target, txn, journal)
+            except Exception as recovery_exc:
+                warn(f"Automatic rollback was incomplete: {recovery_exc}")
+            raise
+        else:
+            # The journal is unreadable or malformed, so the persisted state
+            # cannot be established. Keep the evidence and refuse to guess: a
+            # destructive rollback could discard an installation that already
+            # committed.
+            fail("Could not determine whether the installer transaction committed; "
+                 f"transaction evidence was kept at {txn}: {exc}")
+    # Phase 3: post-commit bookkeeping and cleanup. Nothing here may undo the
+    # committed release, so a cancellation-state failure is only a warning and a
+    # cleanup failure is reported as pending rather than as a failed update.
+    try:
+        mark_commit_completed()
+    except Exception as exc:
+        warn(f"The release is committed, but its cancellation state could not be recorded: {exc}")
+    try:
+        finalize_transaction(target, txn, journal, preserve_modified=preserve_modified)
+    except Exception as exc:
+        warn(f"The release is applied, but its leftover cleanup is incomplete and will be retried: {exc}")
+        return TXN_OUTCOME_CLEANUP_PENDING
+    return None
 
 
 def check_platform() -> None:
@@ -808,6 +1347,157 @@ def check_local_space(source: Path, target: Path, names: list[str], dry_run: boo
         fail(f"Not enough free space beside the install location. Need about {required // (1024*1024)} MiB for staging; only {free // (1024*1024)} MiB is free.")
 
 
+_PORT_UPDATE_TIMEOUT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$")
+_PORT_UPDATE_TIMEOUT_FACTORS = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def port_update_budget_seconds() -> float:
+    """Total time allowed for the cancellable phases of a port update.
+
+    Mirrors the shell's historical ROBLOX_MAC_PORT_UPDATE_TIMEOUT (default 30
+    minutes, optional s/m/h suffix). It bounds only the work performed before
+    the commit boundary; the transaction itself is never interrupted by it.
+    """
+    raw = os.environ.get("ROBLOX_MAC_PORT_UPDATE_TIMEOUT", "")
+    match = _PORT_UPDATE_TIMEOUT_RE.match(raw) if raw else None
+    if not match:
+        return DEFAULT_PORT_UPDATE_TIMEOUT_SECONDS
+    return max(0.0, float(match.group(1)) * _PORT_UPDATE_TIMEOUT_FACTORS[match.group(2).lower()])
+
+
+class _PreCommitWatchdog:
+    """Answer a stalled cancellable phase without ever touching the commit.
+
+    Replacing the port files in place is not interruptible: a signal or a kill
+    during that commit phase is exactly what leaves run.sh or installer.py
+    missing. The timer is therefore armed for the cancellable phases only --
+    it polls the cancellation marker so a stalled download still reacts to
+    Cancel, fails the operation if no progress is possible within the budget,
+    and is disarmed at the commit boundary.
+    """
+
+    def __init__(self, budget_seconds: float) -> None:
+        self.budget = budget_seconds
+        self.deadline = 0.0
+        self.armed = False
+        self._previous_handler: Any = None
+
+    def _interval(self) -> float:
+        if self.budget <= 0:
+            return 0.001
+        return max(0.001, min(PORT_UPDATE_POLL_SECONDS, self.budget / 4.0))
+
+    def _tick(self, _signum: int, _frame: Any) -> None:
+        # Cancellation is checked first so an accepted request keeps its own
+        # terminal status instead of being reported as a timeout failure.
+        if cancellation_requested():
+            raise CancelledError("Port update cancelled.")
+        if time.monotonic() >= self.deadline:
+            raise InstallerError(
+                "The port update stopped making progress and was aborted before changing any files."
+            )
+
+    def arm(self) -> None:
+        if self.armed or not hasattr(signal, "setitimer"):
+            return
+        if threading.current_thread() is not threading.main_thread():
+            return
+        try:
+            self._previous_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, self._tick)
+            self.deadline = time.monotonic() + self.budget
+            signal.setitimer(signal.ITIMER_REAL, self._interval(), self._interval())
+        except (ValueError, OSError, AttributeError):
+            return
+        self.armed = True
+
+    def disarm(self) -> None:
+        if not self.armed:
+            return
+        self.armed = False
+        with contextlib.suppress(ValueError, OSError, AttributeError):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        with contextlib.suppress(ValueError, OSError, TypeError):
+            if self._previous_handler is not None:
+                signal.signal(signal.SIGALRM, self._previous_handler)
+
+
+_active_watchdog: "_PreCommitWatchdog | None" = None
+
+
+def arm_pre_commit_watchdog() -> None:
+    global _active_watchdog
+    if _active_watchdog is not None:
+        return
+    watchdog = _PreCommitWatchdog(port_update_budget_seconds())
+    watchdog.arm()
+    _active_watchdog = watchdog
+
+
+def disarm_pre_commit_watchdog() -> None:
+    global _active_watchdog
+    watchdog, _active_watchdog = _active_watchdog, None
+    if watchdog is not None:
+        watchdog.disarm()
+
+
+def recovery_helper_dir() -> Path:
+    return state_root() / RECOVERY_DIR_NAME
+
+
+def recovery_helper_script() -> Path:
+    return recovery_helper_dir() / "recover.sh"
+
+
+def recovery_helper_installer() -> Path:
+    return recovery_helper_dir() / "installer.py"
+
+
+def _shell_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _recovery_wrapper(target: Path) -> bytes:
+    return (
+        "#!/bin/sh\n"
+        "# Standalone recovery entry point for an interrupted port update.\n"
+        "# It lives outside the install directory so it still works when the\n"
+        "# interruption left installer.py or run.sh itself missing. Generated\n"
+        "# by installer.py; do not edit. Usage: recover.sh [PREFIX]\n"
+        "set -eu\n"
+        "HERE=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n"
+        f"prefix=${{1:-{_shell_single_quote(str(target))}}}\n"
+        "exec python3 \"$HERE/installer.py\" recover --prefix \"$prefix\"\n"
+    ).encode("utf-8")
+
+
+def publish_recovery_helper(target: Path) -> None:
+    """Keep a payload-independent recovery entry point outside the install dir.
+
+    A port update replaces installer.py and run.sh in place, so an interrupted
+    transaction can leave the install directory without a usable launcher or
+    installer. This copy of the running installer is written to the installer
+    state directory before the first destination file changes, and is
+    refreshed on every install or update. It reuses the journal, the backups
+    and the recovery code of the normal flow; it is not a second transaction
+    format.
+    """
+    running = Path(__file__).resolve()
+    if running.is_symlink() or not running.is_file():
+        fail("Cannot safely locate the running installer script.")
+    directory = recovery_helper_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = lstat_or_none(directory)
+    if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        fail(f"Recovery helper directory is not a real directory: {directory}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        fail(f"Recovery helper directory is owned by another user: {directory}")
+    with contextlib.suppress(OSError):
+        directory.chmod(0o700)
+    atomic_write(recovery_helper_installer(), running.read_bytes(), 0o755)
+    atomic_write(recovery_helper_script(), _recovery_wrapper(target), 0o755)
+
+
 def run_install_or_update(target: Path, source: Path, release_tag: str | None,
                           dry_run: bool = False, migrate_data: bool | None = None,
                           force_desktop: bool = False, yes: bool = False,
@@ -821,8 +1511,20 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
     if not dry_run:
-        recover_transactions(target)
-    old_manifest = inspect_target(target, {name: {} for name in (set(names) | {"installer.py"})})
+        publish_recovery_helper(target)
+        # A previous commit whose durability is still unconfirmed must not be
+        # overwritten by a new transaction: stop before staging or touching any
+        # live file, and keep the previous evidence for another recovery.
+        recover_transactions(target, require_durable=True)
+    existing_manifest = load_manifest(target) if check_target_root(target) else None
+    if existing_manifest is None and target.exists():
+        old_manifest = infer_legacy_manifest(target)
+        if old_manifest:
+            note("Adopting the recognized files in this direct release; unknown files and persistent data will be preserved.")
+        else:
+            old_manifest = inspect_target(target, {name: {} for name in (set(names) | {"installer.py"})})
+    else:
+        old_manifest = inspect_target(target, {name: {} for name in (set(names) | {"installer.py"})})
     target_exists = target.exists()
     if target_exists:
         assert_not_running(target)
@@ -872,7 +1574,16 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             target.mkdir(parents=False, mode=0o755)
             target_created = True
             fsync_dir(target.parent)
-        apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
+        # Commit boundary: disarm the watchdog, then settle the cancellation
+        # race under the shared lock. A request recorded while the state was
+        # still "open" wins and aborts safely; a request that loses is refused
+        # (the launcher's UI reads the same state and will not show it as
+        # accepted), and the transaction then commits without interruption.
+        disarm_pre_commit_watchdog()
+        if cancel_boundary():
+            raise CancelledError("Port update cancelled.")
+        progress_event("installing", 94, "Installing the verified port files", 0, 0, False)
+        pending_outcome = apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
     except Exception:
         # If the transaction did not start, remove only our own staging area.
         if txn.exists() and lstat_or_none(txn / "journal.json") is None:
@@ -882,7 +1593,19 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             with contextlib.suppress(OSError):
                 target.rmdir()
         raise
+    finally:
+        disarm_pre_commit_watchdog()
     good(f"Application files installed at {target}")
+    if pending_outcome == TXN_OUTCOME_DURABILITY_PENDING:
+        progress_event("complete", 100,
+                       "Port update applied; confirming the committed state on the next start",
+                       0, 0, False)
+    elif pending_outcome == TXN_OUTCOME_CLEANUP_PENDING:
+        progress_event("complete", 100,
+                       "Port update applied; finishing cleanup on the next start",
+                       0, 0, False)
+    else:
+        progress_event("complete", 100, "Port update complete", 0, 0, False)
 
     # Data is migrated only if the destination has no data directory. It is
     # copied (never moved), so the original remains recoverable until the user
@@ -932,6 +1655,20 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
         good("Done. Launch 'Roblox (Mac Linux Port)' from your application menu, or run run.sh from the install folder.")
     else:
         good("Done. Launch with run.sh from the install folder, or enable desktop integration later.")
+    if pending_outcome == TXN_OUTCOME_DURABILITY_PENDING:
+        # The new files are live, but their commit is not yet confirmed
+        # durable: recovery must re-establish that before another update may
+        # replace them. This is a pending (applied) result, not a failure.
+        raise CommitDurabilityPendingError(
+            f"The update was applied at {target}, but its commit durability could not be "
+            "confirmed. Its transaction evidence was kept and another update will be refused "
+            "until recovery confirms the committed state.")
+    if pending_outcome == TXN_OUTCOME_CLEANUP_PENDING:
+        # The release is live; only obsolete backups remain. Report this as an
+        # applied update with pending cleanup so the launcher never claims the
+        # previous release was kept (it was not) or that everything is tidy.
+        raise CleanupPendingError(
+            f"The update was applied at {target}, but its leftover cleanup is incomplete and will be retried.")
 
 
 def confirm(prompt: str, default: bool = False) -> bool:
@@ -1317,7 +2054,9 @@ def uninstall_desktop(dry_run: bool = False, expected_target: Path | None = None
 
 def remove_install(target: Path, yes: bool = False, dry_run: bool = False,
                    remove_client_cache: bool = False, keep_data: bool = True) -> None:
-    recover_transactions(target)
+    # Uninstall mutates the same managed files, so an unresolved committed
+    # transaction blocks it exactly like an update.
+    recover_transactions(target, require_durable=True)
     manifest = inspect_target(target)
     if manifest is None:
         fail(f"No valid installer manifest exists at {target}; refusing to delete an unknown folder.")
@@ -1353,12 +2092,23 @@ def remove_install(target: Path, yes: bool = False, dry_run: bool = False,
         return
     txn = Path(tempfile.mkdtemp(prefix=TXN_PREFIX, dir=target.parent))
     try:
-        apply_transaction(target, txn, manifest, None, None, False, preserve_modified=keep_data)
+        pending_outcome = apply_transaction(target, txn, manifest, None, None, False,
+                                            preserve_modified=keep_data)
     except Exception:
         if txn.exists() and lstat_or_none(txn / "journal.json") is None:
             with contextlib.suppress(OSError):
                 shutil.rmtree(txn)
         raise
+    if pending_outcome == TXN_OUTCOME_DURABILITY_PENDING:
+        # The managed files are already gone, but their committed removal is
+        # not confirmed durable. Do not purge data or desktop entries on top of
+        # an uncertain commit; recovery will confirm it first.
+        raise CommitDurabilityPendingError(
+            f"The uninstall changed files at {target}, but its commit durability could not be "
+            "confirmed. Its transaction evidence was kept and further changes are refused "
+            "until recovery confirms the committed state.")
+    if pending_outcome == TXN_OUTCOME_CLEANUP_PENDING:
+        warn("Application files were removed, but obsolete-backup cleanup is still pending.")
     try:
         uninstall_desktop(expected_target=target)
     except InstallerError as exc:
@@ -1493,20 +2243,33 @@ def download_file(url: str, destination: Path, expected_size: int = 0) -> None:
     if not url.startswith("https://github.com/"):
         fail(f"Refusing to download from an unexpected URL: {url}")
     request = urllib.request.Request(url, headers={"User-Agent": f"{APP_ID}-installer"})
+    if expected_size > MAX_RELEASE_BYTES:
+        fail("The published release is larger than the supported download limit.")
+    progress_event("downloading", 15, "Downloading the Roblox Mac Linux Port release",
+                   0, expected_size, True)
     try:
         with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
             total_header = response.headers.get("Content-Length")
             total = int(total_header) if total_header and total_header.isdigit() else expected_size
+            if total > MAX_RELEASE_BYTES:
+                fail("The release download exceeds the supported size limit.")
             done = 0
             last_report = 0
             while True:
+                if cancellation_requested():
+                    raise CancelledError("Port update cancelled.")
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 output.write(chunk)
                 done += len(chunk)
+                if done > MAX_RELEASE_BYTES:
+                    fail("The release download exceeds the supported size limit.")
                 if done - last_report >= 8 * 1024 * 1024:
                     last_report = done
+                    percent = min(75, 15 + int(done * 60 / total)) if total else -1
+                    progress_event("downloading", percent, "Downloading the Roblox Mac Linux Port release",
+                                   done, total, True)
                     if sys.stderr.isatty() and total:
                         percent = min(100, int(done * 100 / total))
                         print(f"\r  Downloading release: {percent:3d}% ({done // (1024*1024)} MiB)", end="", file=sys.stderr, flush=True)
@@ -1514,17 +2277,23 @@ def download_file(url: str, destination: Path, expected_size: int = 0) -> None:
             os.fsync(output.fileno())
             if sys.stderr.isatty():
                 print(file=sys.stderr)
+            progress_event("verifying", 78, "Verifying the downloaded release", done, total, True)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         fail(f"Download failed: {exc}")
 
 
 def extract_release_archive(archive_path: Path, destination: Path) -> Path:
+    if cancellation_requested():
+        raise CancelledError("Port update cancelled.")
+    progress_event("staging", 84, "Staging the verified release", 0, 0, True)
     destination.mkdir(parents=True, exist_ok=True)
     try:
         with tarfile.open(archive_path, "r:gz") as tar:
             seen: set[str] = set()
             root_candidates: set[str] = set()
             for member in tar.getmembers():
+                if cancellation_requested():
+                    raise CancelledError("Port update cancelled.")
                 raw = member.name
                 path = PurePosixPath(raw)
                 if path.is_absolute() or ".." in path.parts or not path.parts:
@@ -1563,11 +2332,14 @@ def extract_release_archive(archive_path: Path, destination: Path) -> Path:
     missing = sorted(REQUIRED_FILES - {p.name for p in destination.iterdir()})
     if missing:
         fail("Downloaded release is incomplete; missing: " + ", ".join(missing))
+    progress_event("staging", 90, "Release files staged and validated", 0, 0, True)
     return destination
 
 
 def get_source_for_action(action: str, target: Path, source_arg: str | None,
                           dry_run: bool = False) -> tuple[Path | None, str | None, tempfile.TemporaryDirectory | None]:
+    if cancellation_requested():
+        raise CancelledError("Port update cancelled.")
     if source_arg:
         source = check_source_root(source_arg, target)
         safe_payload_names(source)
@@ -1582,6 +2354,7 @@ def get_source_for_action(action: str, target: Path, source_arg: str | None,
         note(f"Would download verified release {metadata['tag']} from GitHub.")
         return None, metadata["tag"], None
     metadata = latest_release_metadata()
+    progress_event("checking", 5, f"Found release {metadata['tag']}", 0, metadata["size"], True)
     target.parent.mkdir(parents=True, exist_ok=True)
     free_bytes = shutil.disk_usage(target.parent).free
     estimated_peak = max(512 * 1024 * 1024, metadata["size"] * 2 + 64 * 1024 * 1024)
@@ -1594,6 +2367,7 @@ def get_source_for_action(action: str, target: Path, source_arg: str | None,
     note(f"Downloading the official release from {REPOSITORY}…")
     download_file(metadata["url"], archive, metadata["size"])
     actual = sha256_file(archive)
+    progress_event("verifying", 80, "Verifying the release checksum", metadata["size"], metadata["size"], True)
     if actual != metadata["digest"]:
         temp_obj.cleanup()
         fail("SHA-256 verification failed for the downloaded release. The archive was rejected.")
@@ -1631,6 +2405,20 @@ def status(target: Path) -> None:
     extras = [p.name for p in target.iterdir() if p.name not in set(manifest['files']) | {MANIFEST_NAME}]
     if extras:
         print("Other preserved entries: " + ", ".join(sorted(extras)[:12]) + (" …" if len(extras) > 12 else ""))
+
+
+def release_status(target: Path) -> None:
+    latest = latest_release_metadata()
+    print(json.dumps({"installed_version": installed_port_version(target),
+                      "latest_version": latest["tag"],
+                      "asset": "RobloxLinuxRelease.tar.gz",
+                      "asset_url": latest["url"],
+                      "sha256": latest["digest"],
+                      "size": latest["size"]}, separators=(",", ":")))
+
+
+def release_version(target: Path) -> None:
+    print(installed_port_version(target))
 
 
 TITLE_LINES = (
@@ -1846,6 +2634,7 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--yes", action="store_true", help="Assume yes for confirmations; never bypasses file-safety checks")
     parser.add_argument("--dry-run", action="store_true", help="Show planned changes without modifying files")
     parser.add_argument("--force-desktop", action="store_true", help="Back up and replace conflicting desktop files/default URI handlers")
+    parser.add_argument("--no-desktop", action="store_true", help=argparse.SUPPRESS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1867,6 +2656,13 @@ def build_parser() -> argparse.ArgumentParser:
     data_choice.add_argument("--purge-data", dest="keep_data", action="store_false", help="Remove app data inside the install root after confirmation")
     p.set_defaults(keep_data=True)
     p = sub.add_parser("status", help="Show install and desktop-integration status")
+    p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
+    p = sub.add_parser("release-status", help="Query the canonical latest release metadata")
+    p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    p = sub.add_parser("release-version", help="Print the installed release version")
+    p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
+    p = sub.add_parser("recover", help="Recover an interrupted application-file transaction")
     p.add_argument("--prefix", help=f"Installation directory (default: {default_prefix()})")
     p = sub.add_parser("desktop", help="Manage the user-local .desktop launcher and roblox:// URI handler")
     p.add_argument("action", choices=("install", "uninstall"))
@@ -1893,6 +2689,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             status(target)
             return 0
+        if args.command == "release-status":
+            release_status(target)
+            return 0
+        if args.command == "release-version":
+            release_version(target)
+            return 0
+        if args.command == "recover":
+            assert_not_running(target)
+            # Launch-time recovery reports an unresolved commit explicitly
+            # (exit 3) but still permits launch: the installed release is live,
+            # only a further mutation is forbidden until durability is
+            # confirmed. An ordinary, fully completed recovery exits 0.
+            status = recover_transactions(target)
+            return EXIT_CLEANUP_PENDING if status == TXN_OUTCOME_DURABILITY_PENDING else 0
         if args.command == "desktop":
             if args.action == "install":
                 if not target.is_dir():
@@ -1946,16 +2756,21 @@ def main(argv: list[str] | None = None) -> int:
             check_platform()
             if not args.dry_run:
                 target.parent.mkdir(parents=True, exist_ok=True)
-            source, tag, temp_obj = get_source_for_action(args.command, target, args.source, args.dry_run)
-            if args.dry_run and source is None:
-                print(f"Would update {APP_NAME} to {tag} at {target}; no download or file changes performed.")
-                return 0
+            arm_pre_commit_watchdog()
             try:
-                run_install_or_update(target, source, tag, dry_run=args.dry_run, yes=args.yes,
-                                      force_desktop=args.force_desktop, confirmed=confirmed)
+                source, tag, temp_obj = get_source_for_action(args.command, target, args.source, args.dry_run)
+                if args.dry_run and source is None:
+                    print(f"Would update {APP_NAME} to {tag} at {target}; no download or file changes performed.")
+                    return 0
+                try:
+                    run_install_or_update(target, source, tag, dry_run=args.dry_run, yes=args.yes,
+                                          force_desktop=args.force_desktop, confirmed=confirmed,
+                                          install_desktop_integration=not args.no_desktop)
+                finally:
+                    if temp_obj:
+                        temp_obj.cleanup()
             finally:
-                if temp_obj:
-                    temp_obj.cleanup()
+                disarm_pre_commit_watchdog()
             return 0
     return 0
 
@@ -1963,6 +2778,12 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except CancelledError as exc:
+        warn(str(exc))
+        sys.exit(EXIT_CANCELLED)
+    except CleanupPendingError as exc:
+        warn(str(exc))
+        sys.exit(EXIT_CLEANUP_PENDING)
     except InstallerError as exc:
         warn(str(exc))
         sys.exit(1)

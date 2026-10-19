@@ -27,6 +27,14 @@ else
     echo '(no tracked Python sources)'
 fi
 
+# --- Installer bootstrap checksum ----------------------------------------------------------
+echo '== Installer bootstrap checksum =='
+installer_hash=$(sha256sum installer/installer.py | awk '{print tolower($1)}')
+file_hash=$(awk 'NF {print tolower($1); exit}' installer/installer.py.sha256)
+pinned_hash=$(sed -n "s/^EXPECTED_SHA256='\([0-9a-fA-F]*\)'$/\1/p" install.sh)
+[ "$installer_hash" = "$file_hash" ] || { echo 'FAIL: installer/installer.py.sha256 is stale' >&2; fail=1; }
+[ "$installer_hash" = "$(printf '%s' "$pinned_hash" | tr '[:upper:]' '[:lower:]')" ] || { echo 'FAIL: install.sh pinned installer hash is stale' >&2; fail=1; }
+
 # --- JSON validation ------------------------------------------------------------------------
 echo '== JSON validation =='
 jsons=$(git ls-files '*.json')

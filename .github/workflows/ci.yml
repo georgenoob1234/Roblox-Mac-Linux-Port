@@ -41,6 +41,18 @@ jobs:
       - name: Run safe installer regression tests
         run: python3 -B installer/tests/test_installer.py
 
+      - name: Run port updater regression tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-port-updater.py
+
+      - name: Run client update recovery tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-update-recovery.py
+
+      - name: Run bootstrapper tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-bootstrapper.py
+
+      - name: Run release checks
+        run: python3 -B RobloxLinuxDev/runtime/package/check-release.py
+
   # ---------------------------------------------------------------------------
   # Full build — self-hosted CachyOS VM, gated by repository variable.
   #

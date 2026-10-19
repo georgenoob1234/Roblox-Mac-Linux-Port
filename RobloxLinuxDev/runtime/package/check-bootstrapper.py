@@ -14,14 +14,20 @@ assert "g_environ_unsetenv" in ui_source and '"LD_LIBRARY_PATH"' in ui_source
 assert '"APPDIR"' in ui_source and 'g_spawn_async(state->root' in ui_source
 assert '"setsid"' in ui_source and 'host_environment()' in ui_source
 assert "bytes_done" in ui_source and "cancellable" in ui_source and "Cancel" in ui_source
+assert "g_subprocess_communicate_utf8_async" in ui_source and "update-settings" in ui_source
+assert "progress_delete" in ui_source and "ROBLOX_MAC_NO_PROGRESS" in ui_source
+assert "Check for port updates" in ui_source and "port-update-settings" in ui_source
 assert ".nav:checked" in ui_source and "@theme_selected_bg_color" in ui_source
+assert "update-header" in ui_source and "Check for updates" in ui_source and "section-title" in ui_source
+assert 'gtk_style_context_add_class(gtk_widget_get_style_context(state->update), "accent")' in ui_source
 assert "window_decoration" in ui_source and "cursor_appearance" in ui_source
 assert "Restore appearance defaults" in ui_source
 fetch_source = (ROOT / "scripts/fetch-client.sh").read_text()
 assert "Content-Length" in fetch_source or "content-length" in fetch_source
 assert "ROBLOX_MAC_CANCEL_FILE" in fetch_source and "exit 125" in fetch_source
-with tempfile.TemporaryDirectory(prefix="roblox bootstrap ") as tmp:
-    release = Path(tmp) / "release"
+with tempfile.TemporaryDirectory(prefix="roblox bootstrap ") as tmpdir:
+    tmp = Path(tmpdir)
+    release = tmp / "release"
     release.mkdir()
     private = release / "DO_NOT_SHARE"
     private.mkdir()
@@ -37,7 +43,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
   --shell) test ! -e /proc/$$/fd/9; mkdir -p "$HERE/DO_NOT_SHARE/prefix"; exit 0;;
-  --client-version) echo version-abcd; exit 0;;
+  --client-version) [ "${FAIL_CHECK:-0}" = 1 ] && exit 1; echo version-abcd; exit 0;;
   --uri) printf '%s\n' launched-with-uri > "$HERE/uri-launch"; exit 0;;
   *) printf '%s %s %s\n' launched "${ROBLOX_MAC_DECORATIONS:-}" "${ROBLOX_MAC_CURSOR_APPEARANCE:-}" > "$HERE/launched"; sleep "${FAKE_LAUNCH_SLEEP:-0}"; exit 0;;
 esac
@@ -105,6 +111,57 @@ printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
     checked = json.loads(subprocess.check_output([bootstrap, "check"], env=env, text=True))
     assert checked["latest_known"] == "version-abcd" and "settings" in checked
 
+    # A Settings check can suppress the progress helper and still return the
+    # authoritative status JSON for the asynchronous GTK callback.
+    subprocess.run([bootstrap, "set", "check_interval_hours", "0"], env=env, check=True)
+    no_progress = subprocess.run([bootstrap, "check"], env={**env, "ROBLOX_MAC_NO_PROGRESS": "1"},
+                                 capture_output=True, text=True, check=True)
+    assert json.loads(no_progress.stdout)["latest_known"] == "version-abcd"
+    failed_check = subprocess.run([bootstrap, "check"], env={**env, "FAIL_CHECK": "1"},
+                                  capture_output=True, text=True)
+    assert failed_check.returncode == 1
+    assert json.loads(failed_check.stdout)["latest_known"] == "version-abcd"
+
+    # The handoff waits for the updater, opens Settings exactly once, and
+    # preserves success, failure and cancellation status.
+    handoff = tmp / "handoff"
+    handoff.mkdir()
+    (handoff / "DO_NOT_SHARE").mkdir()
+    (handoff / "bootstrap.sh").write_text((ROOT / "package/bootstrap.sh").read_text())
+    (handoff / "bootstrap.sh").chmod(0o755)
+    (handoff / "bootstrap.py").write_text((ROOT / "package/bootstrap.py").read_text())
+    handoff_run = handoff / "run.sh"
+    handoff_run.write_text('''#!/bin/sh
+set -eu
+case "${1:-}" in
+  update)
+    echo update-start >> "$HANDOFF_LOG"
+    sleep 0.15
+    printf updater-exited > "$HANDOFF_DONE"
+    case "${HANDOFF_RESULT:-0}" in 0) exit 0;; 125) exit 125;; *) exit 1;; esac
+    ;;
+  --settings)
+    test -f "$HANDOFF_DONE"
+    echo settings >> "$HANDOFF_LOG"
+    exit 0
+    ;;
+  *) exit 2;;
+esac
+''')
+    handoff_run.chmod(0o755)
+    handoff_log = handoff / "handoff.log"
+    handoff_done = handoff / "updater.done"
+    handoff_env = {**env, "HANDOFF_LOG": str(handoff_log), "HANDOFF_DONE": str(handoff_done)}
+    success = subprocess.run([handoff / "bootstrap.sh", "update-settings"], env=handoff_env, capture_output=True, text=True)
+    assert success.returncode == 0 and handoff_log.read_text().splitlines() == ["update-start", "settings"]
+    handoff_log.write_text(""); handoff_done.unlink()
+    failed_handoff = subprocess.run([handoff / "bootstrap.sh", "update-settings"], env={**handoff_env, "HANDOFF_RESULT": "1"}, capture_output=True, text=True)
+    assert failed_handoff.returncode == 1 and handoff_log.read_text().splitlines() == ["update-start", "settings"]
+    handoff_log.write_text(""); handoff_done.unlink()
+    cancelled_handoff = subprocess.run([handoff / "bootstrap.sh", "update-settings"], env={**handoff_env, "HANDOFF_RESULT": "125"}, capture_output=True, text=True)
+    assert cancelled_handoff.returncode == 125 and handoff_log.read_text().splitlines() == ["update-start", "settings"]
+    assert subprocess.run([handoff / "bootstrap.sh", "update-settings", "extra"], env=handoff_env).returncode == 2
+
     # The UI is only a decision/progress front end. A fake helper proves the
     # core applies Skip this version and keeps the opaque URI out of output.
     fake_ui = Path(tmp) / "fake-ui"
@@ -156,6 +213,23 @@ exit 3
     assert cancelled.returncode == 125
     assert (release / "RobloxVersion/.version").read_text().strip() == "version-old"
     assert not list(private.glob(".update.*"))
+
+    # A progress consumer receives the shared newline-delimited event stream.
+    event_log = tmp / "progress.events"
+    event_ui = Path(tmp) / "event-ui"
+    event_ui.write_text('''#!/bin/sh
+case "${2:-}" in
+  --progress) cat > "$PROGRESS_LOG"; exit 0;;
+esac
+exit 3
+''')
+    event_ui.chmod(0o755)
+    (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "auto", "check_interval_hours": 0}))
+    (release / "RobloxVersion/.version").write_text("version-old\n")
+    completed = subprocess.run([bootstrap, "update"], env={**env, "ROBLOX_MAC_UI_APP": str(event_ui), "PROGRESS_LOG": str(event_log)}, capture_output=True, text=True)
+    assert completed.returncode == 0
+    phases = [json.loads(line)["phase"] for line in event_log.read_text().splitlines()]
+    assert phases[:2] == ["checking", "downloading"] and phases[-1] == "update"
 
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "off", "check_interval_hours": 24}))
     notify_bin = Path(tmp) / "notify-bin"

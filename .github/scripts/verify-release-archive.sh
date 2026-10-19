@@ -39,6 +39,8 @@ icon_bw.png
 README.md
 FFlags.json
 .gitignore
+installer.py
+.roblox-mac-port-version
 '
 
 files=$(tar -tzf "$ARCHIVE" | grep -v '/$' | sort)

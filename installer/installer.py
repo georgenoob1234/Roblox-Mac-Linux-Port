@@ -116,6 +116,12 @@ CANCEL_STATE_CANCELLED = "cancelled"
 CANCEL_STATES = frozenset({CANCEL_STATE_OPEN, CANCEL_STATE_COMMITTING,
                            CANCEL_STATE_COMMITTED, CANCEL_STATE_CANCELLED})
 
+# Explicit outcomes for a transaction whose live files are in place but whose
+# bookkeeping did not finish. They must stay distinct: an unconfirmed commit
+# blocks every later mutation, while an ordinary cleanup failure does not.
+TXN_OUTCOME_CLEANUP_PENDING = "cleanup-pending"
+TXN_OUTCOME_DURABILITY_PENDING = "durability-pending"
+
 
 def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
                    bytes_total: int = 0, cancellable: bool = True) -> None:
@@ -455,6 +461,17 @@ class TransactionDurabilityError(InstallerError):
     crash, so the transaction must not claim durability it does not have: the
     caller keeps its evidence, never rolls back on a guess, and lets recovery
     re-establish durability and finish the cleanup.
+    """
+
+
+class CommitDurabilityPendingError(CleanupPendingError):
+    """The release is live, but its commit durability is unresolved.
+
+    It shares CleanupPendingError's terminal status because the new files are
+    already installed, yet it is deliberately distinct from an ordinary
+    cleanup failure: while the committed journal's durability cannot be
+    confirmed, no further installation mutation may start. Recovery retries
+    the confirming fsync and only then finishes the cleanup.
     """
 
 
@@ -1005,9 +1022,22 @@ def finalize_transaction(target: Path, txn: Path, journal: dict[str, Any], prese
     fsync_dir_strict(target.parent)
 
 
-def recover_transactions(target: Path) -> None:
+def recover_transactions(target: Path, require_durable: bool = False) -> str | None:
+    """Repair transactions left beside ``target``.
+
+    A committed transaction is never rolled back. Its committed journal must
+    first be confirmed durable by re-syncing the transaction directory; if that
+    still fails, the transaction's evidence is always kept. ``require_durable``
+    is for mutation entry points: they must stop before changing anything,
+    while a launch-time recovery may report the unresolved state and continue.
+
+    Returns TXN_OUTCOME_DURABILITY_PENDING when a committed transaction's
+    durability remains unconfirmed, and None otherwise. An ordinary cleanup
+    failure after durability was established stays a warning.
+    """
     if not target.parent.exists():
-        return
+        return None
+    unresolved = False
     for txn in sorted(target.parent.glob(TXN_PREFIX + "*")):
         st = lstat_or_none(txn)
         if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
@@ -1042,14 +1072,29 @@ def recover_transactions(target: Path) -> None:
                 # guarantee and is safe to retry. If it still cannot be
                 # confirmed, keep every piece of evidence.
                 fsync_dir_strict(txn)
+            except TransactionDurabilityError as exc:
+                # This is the unresolved-commit condition, not an ordinary
+                # cleanup failure: a later update must not overwrite live files
+                # whose relationship to this journal is not durable yet.
+                if require_durable:
+                    raise TransactionDurabilityError(
+                        "The previous update's committed state is not confirmed durable; "
+                        f"refusing to start another update. Transaction evidence was kept at {txn}: {exc}"
+                    ) from exc
+                warn("The previous update is live, but its commit durability is still "
+                     f"unconfirmed; keeping its transaction evidence at {txn} for a later retry: {exc}")
+                unresolved = True
+                continue
+            try:
+                # Durability is established here, so a failure below is only
+                # obsolete-backup cleanup. It is safe to warn and retry later;
+                # it must not block updates or undo the committed release.
                 finalize_transaction(target, txn, journal)
             except Exception as exc:
-                # The committed release is valid; only obsolete-backup cleanup
-                # failed. Keep the evidence for a later retry rather than
-                # blocking the launch or rolling back a finished installation.
                 warn(f"Cleanup from a completed transaction is still pending: {exc}")
         else:
             fail(f"Unknown installer transaction state in {journal_path}; refusing to guess.")
+    return TXN_OUTCOME_DURABILITY_PENDING if unresolved else None
 
 
 def inspect_target(target: Path, new_files: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -1144,12 +1189,15 @@ def build_operations(target: Path, old_manifest: dict[str, Any] | None, new_mani
 
 def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | None,
                       new_manifest: dict[str, Any] | None, staged_payload: Path | None,
-                      target_created: bool = False, preserve_modified: bool = True) -> bool:
+                      target_created: bool = False, preserve_modified: bool = True) -> str | None:
     """Swap the managed files under a journal, then clean up.
 
-    Returns True when the files were committed but the obsolete-backup cleanup
-    could not finish. That is not a failed update: the new files are live and
-    the committed transaction is left for recovery to clean up.
+    Returns TXN_OUTCOME_DURABILITY_PENDING when the files were committed but
+    the committed journal's durability could not be confirmed, and
+    TXN_OUTCOME_CLEANUP_PENDING when the commit is durable but the
+    obsolete-backup cleanup could not finish. Both mean the new files are live;
+    only the former forbids another mutation until recovery re-confirms
+    durability. Returns None when everything, including cleanup, finished.
     """
     manifest_path = target / MANIFEST_NAME
     old_manifest_exists = lstat_or_none(manifest_path) is not None
@@ -1220,7 +1268,7 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
         # cleanup safely.
         warn(f"The new release is live, but its commit could not be confirmed durable; "
              f"cleanup is pending: {exc}")
-        return True
+        return TXN_OUTCOME_DURABILITY_PENDING
     except Exception as exc:
         persisted = _persisted_journal_state(txn)
         if persisted == CANCEL_STATE_COMMITTED:
@@ -1253,8 +1301,8 @@ def apply_transaction(target: Path, txn: Path, old_manifest: dict[str, Any] | No
         finalize_transaction(target, txn, journal, preserve_modified=preserve_modified)
     except Exception as exc:
         warn(f"The release is applied, but its leftover cleanup is incomplete and will be retried: {exc}")
-        return True
-    return False
+        return TXN_OUTCOME_CLEANUP_PENDING
+    return None
 
 
 def check_platform() -> None:
@@ -1464,7 +1512,10 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
             target.parent.mkdir(parents=True, exist_ok=True)
     if not dry_run:
         publish_recovery_helper(target)
-        recover_transactions(target)
+        # A previous commit whose durability is still unconfirmed must not be
+        # overwritten by a new transaction: stop before staging or touching any
+        # live file, and keep the previous evidence for another recovery.
+        recover_transactions(target, require_durable=True)
     existing_manifest = load_manifest(target) if check_target_root(target) else None
     if existing_manifest is None and target.exists():
         old_manifest = infer_legacy_manifest(target)
@@ -1532,7 +1583,7 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
         if cancel_boundary():
             raise CancelledError("Port update cancelled.")
         progress_event("installing", 94, "Installing the verified port files", 0, 0, False)
-        cleanup_pending = apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
+        pending_outcome = apply_transaction(target, txn, old_manifest, new_manifest, payload_stage, target_created)
     except Exception:
         # If the transaction did not start, remove only our own staging area.
         if txn.exists() and lstat_or_none(txn / "journal.json") is None:
@@ -1545,9 +1596,16 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
     finally:
         disarm_pre_commit_watchdog()
     good(f"Application files installed at {target}")
-    progress_event("complete", 100,
-                   "Port update applied; finishing cleanup on the next start" if cleanup_pending
-                   else "Port update complete", 0, 0, False)
+    if pending_outcome == TXN_OUTCOME_DURABILITY_PENDING:
+        progress_event("complete", 100,
+                       "Port update applied; confirming the committed state on the next start",
+                       0, 0, False)
+    elif pending_outcome == TXN_OUTCOME_CLEANUP_PENDING:
+        progress_event("complete", 100,
+                       "Port update applied; finishing cleanup on the next start",
+                       0, 0, False)
+    else:
+        progress_event("complete", 100, "Port update complete", 0, 0, False)
 
     # Data is migrated only if the destination has no data directory. It is
     # copied (never moved), so the original remains recoverable until the user
@@ -1597,7 +1655,15 @@ def run_install_or_update(target: Path, source: Path, release_tag: str | None,
         good("Done. Launch 'Roblox (Mac Linux Port)' from your application menu, or run run.sh from the install folder.")
     else:
         good("Done. Launch with run.sh from the install folder, or enable desktop integration later.")
-    if cleanup_pending:
+    if pending_outcome == TXN_OUTCOME_DURABILITY_PENDING:
+        # The new files are live, but their commit is not yet confirmed
+        # durable: recovery must re-establish that before another update may
+        # replace them. This is a pending (applied) result, not a failure.
+        raise CommitDurabilityPendingError(
+            f"The update was applied at {target}, but its commit durability could not be "
+            "confirmed. Its transaction evidence was kept and another update will be refused "
+            "until recovery confirms the committed state.")
+    if pending_outcome == TXN_OUTCOME_CLEANUP_PENDING:
         # The release is live; only obsolete backups remain. Report this as an
         # applied update with pending cleanup so the launcher never claims the
         # previous release was kept (it was not) or that everything is tidy.
@@ -1988,7 +2054,9 @@ def uninstall_desktop(dry_run: bool = False, expected_target: Path | None = None
 
 def remove_install(target: Path, yes: bool = False, dry_run: bool = False,
                    remove_client_cache: bool = False, keep_data: bool = True) -> None:
-    recover_transactions(target)
+    # Uninstall mutates the same managed files, so an unresolved committed
+    # transaction blocks it exactly like an update.
+    recover_transactions(target, require_durable=True)
     manifest = inspect_target(target)
     if manifest is None:
         fail(f"No valid installer manifest exists at {target}; refusing to delete an unknown folder.")
@@ -2024,12 +2092,23 @@ def remove_install(target: Path, yes: bool = False, dry_run: bool = False,
         return
     txn = Path(tempfile.mkdtemp(prefix=TXN_PREFIX, dir=target.parent))
     try:
-        apply_transaction(target, txn, manifest, None, None, False, preserve_modified=keep_data)
+        pending_outcome = apply_transaction(target, txn, manifest, None, None, False,
+                                            preserve_modified=keep_data)
     except Exception:
         if txn.exists() and lstat_or_none(txn / "journal.json") is None:
             with contextlib.suppress(OSError):
                 shutil.rmtree(txn)
         raise
+    if pending_outcome == TXN_OUTCOME_DURABILITY_PENDING:
+        # The managed files are already gone, but their committed removal is
+        # not confirmed durable. Do not purge data or desktop entries on top of
+        # an uncertain commit; recovery will confirm it first.
+        raise CommitDurabilityPendingError(
+            f"The uninstall changed files at {target}, but its commit durability could not be "
+            "confirmed. Its transaction evidence was kept and further changes are refused "
+            "until recovery confirms the committed state.")
+    if pending_outcome == TXN_OUTCOME_CLEANUP_PENDING:
+        warn("Application files were removed, but obsolete-backup cleanup is still pending.")
     try:
         uninstall_desktop(expected_target=target)
     except InstallerError as exc:
@@ -2618,8 +2697,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "recover":
             assert_not_running(target)
-            recover_transactions(target)
-            return 0
+            # Launch-time recovery reports an unresolved commit explicitly
+            # (exit 3) but still permits launch: the installed release is live,
+            # only a further mutation is forbidden until durability is
+            # confirmed. An ordinary, fully completed recovery exits 0.
+            status = recover_transactions(target)
+            return EXIT_CLEANUP_PENDING if status == TXN_OUTCOME_DURABILITY_PENDING else 0
         if args.command == "desktop":
             if args.action == "install":
                 if not target.is_dir():

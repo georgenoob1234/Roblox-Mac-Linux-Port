@@ -33,29 +33,33 @@ cancelled() { [ -n "${ROBLOX_MAC_CANCEL_FILE:-}" ] && [ -e "$ROBLOX_MAC_CANCEL_F
 
 # Atomically record the shared cancellation state under <state>.lock, the same
 # lock the installer and the GTK UI use to settle the commit boundary. The lock
-# and the state are opened with O_NOFOLLOW|O_NONBLOCK and validated on the
-# opened descriptor with fstat(), so a symlinked, FIFO, or foreign-owned path is
-# rejected promptly instead of being followed or blocking the shell forever, and
-# the flock spans the whole read-modify-write. Returns non-zero when the state
-# could not be recorded, so the caller never starts an operation on stale state.
+# is opened with O_NOFOLLOW|O_NONBLOCK and validated on the opened descriptor
+# with fstat(), so a symlinked, FIFO, or foreign-owned path is rejected promptly
+# instead of being followed or blocking the shell forever, and the flock spans
+# the whole read-modify-write. Returns non-zero when the state could not be
+# recorded, so the caller never starts an operation on stale state.
 #
-# The Python helper is used when it can run. The launcher must still start on a
-# host where Python cannot run at all, so cancel_state_write_shell below is an
-# equivalent fallback: it also never follows a symlink, never opens a FIFO (an
-# O_RDWR open does not block on one), still verifies the descriptor it actually
-# opened, and still returns non-zero on any unsafe or failed path.
+# The helper runs Python because it must use the same flock/atomic-replace
+# protocol as the installer and the UI. There is deliberately no shell
+# fallback: a redirection-based fallback cannot safely open a path that another
+# process could replace between the check and the open, so a host where this
+# helper cannot run refuses to start the operation instead of weakening the
+# protocol.
 CANCEL_PYTHON=
 cancel_state_write() {
     if [ -z "$CANCEL_PYTHON" ]; then
-        if python3 -c 'import fcntl, os, stat' >/dev/null 2>&1; then
+        if python3 -c 'import fcntl, os, stat, tempfile' >/dev/null 2>&1; then
             CANCEL_PYTHON=1
         else
             CANCEL_PYTHON=0
         fi
     fi
-    if [ "$CANCEL_PYTHON" = 1 ]; then
-        python3 - "$CANCEL_STATE" "$1" <<'PY'
-import fcntl, os, stat, sys
+    if [ "$CANCEL_PYTHON" != 1 ]; then
+        say 'Python 3 with fcntl support is required to record the shared update state.'
+        return 1
+    fi
+    python3 - "$CANCEL_STATE" "$1" <<'PY'
+import fcntl, os, stat, sys, tempfile
 
 state_path = sys.argv[1]
 value = sys.argv[2]
@@ -78,70 +82,49 @@ try:
 except OSError as exc:
     print(f"cancel_state_write: unsafe lock path {lock_path}: {exc}", file=sys.stderr)
     sys.exit(1)
+tmp = None
 try:
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
     try:
-        st = os.lstat(state_path)
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            raise OSError("not a regular file")
-        if st.st_uid != os.getuid():
-            raise OSError("owned by another user")
+        # Validate the state through the descriptor actually opened, not just
+        # the path: O_NOFOLLOW rejects a symlink and fstat rejects a FIFO or
+        # any other non-regular entry. A missing state is the first-run case.
+        state_fd = safe_open(state_path, os.O_RDONLY)
     except FileNotFoundError:
         pass
     except OSError as exc:
         print(f"cancel_state_write: unsafe state path {state_path}: {exc}", file=sys.stderr)
         sys.exit(1)
-    tmp = f"{state_path}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | SAFE_FLAGS, 0o600)
+    else:
+        os.close(state_fd)
+    # A unique file created exclusively in the same directory: a file or
+    # symlink planted at a predictable temporary name can be neither opened
+    # nor truncated by the replacement.
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(state_path) + ".tmp-",
+                               dir=os.path.dirname(state_path) or ".")
     try:
+        os.fchmod(fd, 0o600)
         os.write(fd, (value + "\n").encode("utf-8"))
+        os.fsync(fd)
     finally:
         os.close(fd)
-    os.chmod(tmp, 0o600)
     os.replace(tmp, state_path)
+    tmp = None
 except OSError as exc:
     print(f"cancel_state_write: could not record {value!r} at {state_path}: {exc}", file=sys.stderr)
     sys.exit(1)
 finally:
+    if tmp is not None:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
     finally:
         os.close(lock_fd)
 PY
-        return $?
-    fi
-    cancel_state_write_shell "$1"
-}
-
-# Equivalent path used only when Python cannot run. `test -f` stats without
-# opening, so a FIFO, directory, or other special file is rejected before the
-# open; the open itself is O_RDWR (`<>`), which never blocks on a FIFO; and the
-# descriptor actually opened is verified through /proc before the lock is taken.
-cancel_state_write_shell() {
-    lock=$CANCEL_STATE.lock
-    [ -h "$CANCEL_STATE" ] && return 1
-    if [ -e "$CANCEL_STATE" ] && [ ! -f "$CANCEL_STATE" ]; then return 1; fi
-    [ -h "$lock" ] && return 1
-    if [ -e "$lock" ] && [ ! -f "$lock" ]; then return 1; fi
-    # The braces scope the redirect, so a failure here does not silence the
-    # launcher's stderr for the rest of the run.
-    if ! { exec 7<>"$lock"; } 2>/dev/null; then return 1; fi
-    fd_owner=$(stat -Lc %u /proc/self/fd/7 2>/dev/null || printf '')
-    if [ ! -f /proc/self/fd/7 ] || { [ -n "$fd_owner" ] && [ "$fd_owner" != "$(id -u)" ]; }; then
-        exec 7>&-
-        return 1
-    fi
-    if [ -e "$CANCEL_STATE" ]; then
-        owner=$(stat -Lc %u -- "$CANCEL_STATE" 2>/dev/null || printf '')
-        if [ -n "$owner" ] && [ "$owner" != "$(id -u)" ]; then exec 7>&-; return 1; fi
-    fi
-    flock -x 7 2>/dev/null || { exec 7>&-; return 1; }
-    tmp=$CANCEL_STATE.tmp.$$
-    if ! printf '%s\n' "$1" > "$tmp" 2>/dev/null; then rm -f -- "$tmp"; exec 7>&-; return 1; fi
-    chmod 600 "$tmp" 2>/dev/null || true
-    if ! mv -f -- "$tmp" "$CANCEL_STATE" 2>/dev/null; then rm -f -- "$tmp"; exec 7>&-; return 1; fi
-    exec 7>&-
-    return 0
+    return $?
 }
 
 say() { echo "roblox: $*" >&2; }
@@ -160,6 +143,11 @@ PY
 }
 start_progress() {
     [ -n "$UI_APP" ] || return 0
+    # A port update mutates the managed port files and therefore requires the
+    # shared protocol. A normal launch or client update can still run without
+    # it (the port updater is the only component that relies on the state
+    # file), so it degrades with a warning instead of refusing to start.
+    require_cancel_state=${1:-}
     ROBLOX_MAC_CANCEL_FILE=$CANCEL_MARKER
     ROBLOX_MAC_CANCEL_STATE_FILE=$CANCEL_STATE
     export ROBLOX_MAC_CANCEL_FILE ROBLOX_MAC_CANCEL_STATE_FILE
@@ -173,8 +161,11 @@ start_progress() {
         ROBLOX_MAC_CANCEL_FILE=
         ROBLOX_MAC_CANCEL_STATE_FILE=
         export ROBLOX_MAC_CANCEL_FILE ROBLOX_MAC_CANCEL_STATE_FILE
-        say 'Could not reset the shared update state; not starting the operation.'
-        return 1
+        if [ "$require_cancel_state" = required ]; then
+            say 'Could not reset the shared update state; not starting the operation.'
+            return 1
+        fi
+        say 'warning: the shared update state is unavailable; continuing without it.'
     fi
     UI_FIFO=$DATA/.bootstrap-progress.$$
     rm -f -- "$UI_FIFO"
@@ -613,7 +604,7 @@ case "$command" in
             event failed 0 'Close Roblox before updating the port' 0 0 false
             finish_progress; exit 1
         fi
-        start_progress || { exec 9>&-; exit 1; }
+        start_progress required || { exec 9>&-; exit 1; }
         do_port_update; result=$?; finish_progress; exec 9>&-
         exit "$result";;
     port-update-settings)

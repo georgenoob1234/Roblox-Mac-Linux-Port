@@ -49,7 +49,11 @@ recover_port_transaction() {
         run_port_recovery
     ) || _port_recovery_status=$?
     case "$_port_recovery_status" in
-        0|4) return 0;;
+        # 3 is the installer's applied/pending status: the committed release is
+        # live, but its transaction durability is still unconfirmed. Launching
+        # it is safe; only a further update is refused until recovery confirms
+        # the committed state. 4 means another instance owns the lock.
+        0|3|4) return 0;;
     esac
     return 1
 }

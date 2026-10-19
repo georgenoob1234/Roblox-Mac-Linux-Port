@@ -13,6 +13,7 @@ import importlib.util
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -505,6 +506,7 @@ with tempfile.TemporaryDirectory(prefix="port-updater-") as tmpdir:
     # ------------------------------------------------------------------
     real1 = real_release(root, "v1.0.0")
     real2 = real_release(root, "v2.0.0")
+    real3 = real_release(root, "v3.0.0")
 
     def prepare_recovery_target(name: str) -> Path:
         path = root / name
@@ -1323,26 +1325,128 @@ exit 3
     assert ok_result.returncode == 0, (ok_result.returncode, ok_result.stderr)
     assert shell_state.read_text().strip() == "open"
 
-    # The equivalent shell fallback (used when Python cannot run, so the
-    # launcher can still start) must reject a FIFO just as promptly and must
-    # not start the operation.
+    # There is no unsafe shell fallback. When Python cannot run, the operation
+    # must be refused before it starts, even when the state and lock paths are
+    # perfectly safe and could have been written by a redirection.
     broken_bin = root / "protocol-broken-bin"
     broken_bin.mkdir(exist_ok=True)
     (broken_bin / "python3").write_text("#!/bin/sh\nexit 1\n")
     (broken_bin / "python3").chmod(0o755)
-    fallback_env = {"PATH": str(broken_bin) + os.pathsep + os.environ["PATH"]}
+    broken_env = {"PATH": str(broken_bin) + os.pathsep + os.environ["PATH"]}
 
     shell_state.unlink(missing_ok=True)
     shell_lock.unlink(missing_ok=True)
     event_log.write_text("")
-    os.mkfifo(shell_lock)
+    missing_python = run_handoff_timed(broken_env)
+    assert missing_python.returncode != 0, (missing_python.returncode, missing_python.stderr)
+    assert event_log.read_text().strip() == "", "an update started without the cancellation helper"
+    assert not shell_state.exists(), "a missing helper must not leave a partially initialized state"
+
+    # A helper that starts Python but fails while executing the shared-state
+    # helper must be propagated as well, before any progress event or state.
+    failing_bin = root / "protocol-failing-bin"
+    failing_bin.mkdir(exist_ok=True)
+    failing_helper = failing_bin / "python3"
+    failing_helper.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"-\" ]; then exit 12; fi\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n")
+    failing_helper.chmod(0o755)
+    shell_state.unlink(missing_ok=True)
+    shell_lock.unlink(missing_ok=True)
+    event_log.write_text("")
+    helper_failed = run_handoff_timed(
+        {"PATH": str(failing_bin) + os.pathsep + os.environ["PATH"]})
+    assert helper_failed.returncode != 0, (helper_failed.returncode, helper_failed.stderr)
+    assert event_log.read_text().strip() == "", "an update started after helper initialization failed"
+    assert not shell_state.exists()
+
+    # A symlinked state or lock is rejected without touching its target.
+    victim = root / "protocol-shell-victim"
+    victim.write_text("victim-original\n")
+
+    shell_state.unlink(missing_ok=True)
+    shell_lock.unlink(missing_ok=True)
+    shell_state.symlink_to(victim)
+    event_log.write_text("")
     try:
-        fallback_fifo = run_handoff_timed(fallback_env)
+        linked_state = run_handoff_timed()
+    finally:
+        shell_state.unlink(missing_ok=True)
+        shell_lock.unlink(missing_ok=True)
+    assert linked_state.returncode != 0, (linked_state.returncode, linked_state.stderr)
+    assert victim.read_text() == "victim-original\n", "a symlinked state target was modified"
+    assert event_log.read_text().strip() == "", "a symlinked state allowed the operation to start"
+
+    victim.write_text("victim-original\n")
+    shell_lock.symlink_to(victim)
+    event_log.write_text("")
+    try:
+        linked_lock = run_handoff_timed()
     finally:
         shell_lock.unlink(missing_ok=True)
         shell_state.unlink(missing_ok=True)
-    assert fallback_fifo.returncode != 0, (fallback_fifo.returncode, fallback_fifo.stderr)
-    assert event_log.read_text().strip() == "", "the fallback must not start with a FIFO lock"
+    assert linked_lock.returncode != 0, (linked_lock.returncode, linked_lock.stderr)
+    assert victim.read_text() == "victim-original\n", "a symlinked lock target was modified"
+    assert event_log.read_text().strip() == "", "a symlinked lock allowed the operation to start"
+
+    # A temp file planted at the old predictable name must never redirect or
+    # truncate the helper's replacement: the helper creates a unique file with
+    # exclusive creation in the state directory instead.
+    plant_bin = root / "protocol-plant-bin"
+    plant_bin.mkdir(exist_ok=True)
+    (plant_bin / "python3").write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"-\" ] && [ -n \"${PLANT_LOG:-}\" ]; then\n"
+        "    _tmp=\"${PLANT_STATE}.tmp.$$\"\n"
+        "    rm -f -- \"$_tmp\" 2>/dev/null || true\n"
+        "    if [ \"${PLANT_KIND:-}\" = symlink ]; then\n"
+        "        ln -s -- \"${PLANT_VICTIM}\" \"$_tmp\" 2>/dev/null || true\n"
+        "    else\n"
+        "        printf 'sentinel-content\\n' > \"$_tmp\" 2>/dev/null || true\n"
+        "    fi\n"
+        "    printf '%s\\n' \"$_tmp\" >> \"$PLANT_LOG\" 2>/dev/null || true\n"
+        "fi\n"
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n")
+    (plant_bin / "python3").chmod(0o755)
+    plant_env = {"PATH": str(plant_bin) + os.pathsep + os.environ["PATH"],
+                 "PLANT_STATE": str(shell_state)}
+
+    plant_log = root / "protocol-plant-log"
+    victim.write_text("victim-original\n")
+    shell_state.unlink(missing_ok=True)
+    shell_lock.unlink(missing_ok=True)
+    plant_log.unlink(missing_ok=True)
+    event_log.write_text("")
+    planted_symlink = run_handoff_timed({
+        **plant_env, "PLANT_LOG": str(plant_log), "PLANT_KIND": "symlink",
+        "PLANT_VICTIM": str(victim),
+    })
+    assert planted_symlink.returncode == 0, (planted_symlink.returncode, planted_symlink.stderr)
+    assert victim.read_text() == "victim-original\n", "a planted symlink redirected the state write"
+    assert shell_state.read_text().strip() == "open"
+    planted = [Path(line) for line in plant_log.read_text().splitlines()]
+    assert planted, "the helper never ran through the planting wrapper"
+    for path in planted:
+        assert path.is_symlink(), f"the helper replaced the planted symlink: {path}"
+        assert path.resolve() == victim.resolve(), path
+
+    shell_state.unlink(missing_ok=True)
+    shell_lock.unlink(missing_ok=True)
+    plant_log.unlink(missing_ok=True)
+    event_log.write_text("")
+    planted_file = run_handoff_timed({
+        **plant_env, "PLANT_LOG": str(plant_log), "PLANT_KIND": "file",
+    })
+    assert planted_file.returncode == 0, (planted_file.returncode, planted_file.stderr)
+    assert shell_state.read_text().strip() == "open"
+    planted = [Path(line) for line in plant_log.read_text().splitlines()]
+    assert planted, "the helper never ran through the planting wrapper"
+    for path in planted:
+        assert path.read_text() == "sentinel-content\n", \
+            f"the helper truncated a pre-existing file at {path}"
+    for path in planted:
+        path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # The durable commit point is irreversible: once the journal says
@@ -1587,16 +1691,96 @@ exit 3
 
     installer.fsync_dir_strict = fail_only_a6
     try:
-        installer.recover_transactions(a6)  # must not raise and must not delete evidence
+        recovery_outcome = installer.recover_transactions(a6)
+        assert recovery_outcome == installer.TXN_OUTCOME_DURABILITY_PENDING, recovery_outcome
+        try:
+            installer.recover_transactions(a6, require_durable=True)
+        except installer.TransactionDurabilityError as exc:
+            assert "not confirmed durable" in str(exc), exc
+        else:
+            raise AssertionError("mutation recovery accepted an unresolved commit")
     finally:
         installer.fsync_dir_strict = original_fsync_strict
     assert a6_txn.is_dir(), "the evidence must survive a persistent fsync failure"
     assert (a6_txn / "backup" / "run.sh").is_file(), "backups must not be discarded"
     assert installer.installed_port_version(a6) == "v2.0.0"
     # Once the filesystem cooperates again, recovery finishes safely.
-    installer.recover_transactions(a6)
+    assert installer.recover_transactions(a6) is None
     assert not a6_txn.exists()
     assert installer.installed_port_version(a6) == "v2.0.0"
+
+    # ------------------------------------------------------------------
+    # An unresolved committed transaction blocks the *next* update at the real
+    # entry point, before staging or any live-file change, and keeps all its
+    # evidence. Recovery must resolve it before another update can proceed --
+    # while an ordinary cleanup failure (a5/cleanup-stuck) stays non-blocking.
+    # ------------------------------------------------------------------
+    a7 = root / "commit-fsync-blocks-followup"
+    install_quietly(a7, real1, "v1.0.0")
+    a7_fault = {"txn": None}
+    a7_rollbacks = {"n": 0}
+    original_a7_write_journal = installer.write_journal
+    original_a7_rollback = installer.rollback_transaction
+
+    def a7_strict(directory):
+        if a7_fault["txn"] is not None and Path(directory) == a7_fault["txn"]:
+            raise installer.TransactionDurabilityError(
+                "simulated persistent directory fsync failure")
+        return original_fsync_strict(directory)
+
+    def a7_write_journal(txn, journal, *args, **kwargs):
+        if journal.get("state") == "committed":
+            a7_fault["txn"] = Path(txn)
+        return original_a7_write_journal(txn, journal, *args, **kwargs)
+
+    def a7_count_rollback(*args, **kwargs):
+        a7_rollbacks["n"] += 1
+        return original_a7_rollback(*args, **kwargs)
+
+    installer.fsync_dir_strict = a7_strict
+    installer.write_journal = a7_write_journal
+    installer.rollback_transaction = a7_count_rollback
+    try:
+        try:
+            install_quietly(a7, real2, "v2.0.0")
+        except installer.CommitDurabilityPendingError as exc:
+            assert "durability" in str(exc).lower(), exc
+        else:
+            raise AssertionError("an unconfirmed commit was reported as a clean success")
+        a7_txn = a7_fault["txn"]
+        assert a7_txn is not None and a7_txn.is_dir(), a7_fault
+        assert installer.installed_port_version(a7) == "v2.0.0"
+        assert a7_rollbacks["n"] == 0, "an unconfirmed commit must never be rolled back"
+        a7_live = managed_snapshot(a7)
+        a7_journal = (a7_txn / "journal.json").read_bytes()
+        a7_backup = (a7_txn / "backup" / "run.sh").read_bytes()
+        before_txns = txns()
+        try:
+            # The second update must be refused while only a7_txn's directory
+            # fsync is failing; every unrelated fsync still succeeds.
+            install_quietly(a7, real3, "v3.0.0")
+        except installer.TransactionDurabilityError as exc:
+            assert "not confirmed durable" in str(exc), exc
+        else:
+            raise AssertionError("a second update started while commit durability was unresolved")
+        assert managed_snapshot(a7) == a7_live, "the refused update changed live files"
+        assert txns() == before_txns, "the refused update started a transaction"
+        assert (a7_txn / "journal.json").read_bytes() == a7_journal, "journal evidence changed"
+        assert (a7_txn / "backup" / "run.sh").read_bytes() == a7_backup, "backup evidence changed"
+        assert installer.installed_port_version(a7) == "v2.0.0"
+    finally:
+        installer.fsync_dir_strict = original_fsync_strict
+        installer.write_journal = original_a7_write_journal
+        installer.rollback_transaction = original_a7_rollback
+    # Recovery re-establishes durability and finishes cleanup.
+    assert installer.recover_transactions(a7) is None
+    assert not a7_txn.exists(), "recovery did not resolve the pending transaction"
+    assert installer.installed_port_version(a7) == "v2.0.0"
+    assert (a7 / "run.sh").read_bytes() == (real2 / "run.sh").read_bytes()
+    # Once resolved, a normal update proceeds.
+    install_quietly(a7, real3, "v3.0.0")
+    assert installer.installed_port_version(a7) == "v3.0.0"
+    assert (a7 / "run.sh").read_bytes() == (real3 / "run.sh").read_bytes()
 
     # The GTK UI must take the same lock and consult the same state file, so
     # the handshake cannot be bypassed by the window itself.

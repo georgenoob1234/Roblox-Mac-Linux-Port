@@ -6,16 +6,17 @@ An experimental, unofficial runner for the Intel macOS Roblox client on x86_64 L
 
 ## Install for one user
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/georgenoob1234/Roblox-Mac-Linux-Port/main/install.sh | sh
+```
+
+
 The supported per-user installer downloads the latest published
 `RobloxLinuxRelease.tar.gz` from this repository, verifies its published
 SHA-256 checksum, and installs it under
 `~/.local/opt/roblox-mac-linux-port`. It also installs a user-local desktop
 launcher, icon, and `roblox://` / `roblox-player:` associations when there is
 no ownership conflict. No root privileges or `sudo` are required.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/georgenoob1234/Roblox-Mac-Linux-Port/main/install.sh | sh
-```
 
 When run from a terminal, this command opens the installer menu. A fresh
 machine offers **Install** and **Exit**; later runs detect the installation and
@@ -143,6 +144,4 @@ See the [release README](RobloxLinuxRelease/README.md) for usage, and the [devel
 
 ## Status
 
-This is experimental. The tested LIVE client is `0.740.0.7400927` (`version-00a4ca14e31b41e9`). Startup and short TTK/Jailbreak gameplay sessions were checked; full gameplay compatibility and stable 240 FPS across games are not established. Shader preparation validated 1,938 of 1,950 shaders, with 12 unsupported translator cases remaining.
-
-Keep the release in a reasonably short path (for example `~/RobloxLinuxRelease`). Darling can fail to start when deeply nested folder names exceed Unix-socket path limits.
+This is experimental. The tested LIVE client is `0.740.0.7400927` (`version-00a4ca14e31b41e9`). Startup and short TTK/Jailbreak gameplay sessions were checked; full gameplay compatibility and stable 240 FPS across games are not established. Shader preparation validated 1,950 of 1,950 shaders.

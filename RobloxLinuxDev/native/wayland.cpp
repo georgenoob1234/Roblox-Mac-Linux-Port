@@ -188,6 +188,9 @@ int main() {
     assert(rbxWaylandEditAction(SDL_SCANCODE_W,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_NONE);
     assert(rbxWaylandEditAction(SDL_SCANCODE_C,0)==RBX_WL_EDIT_NONE);
     assert(rbxWaylandShortcutLetter(SDL_SCANCODE_C)=='c' && rbxWaylandShortcutLetter(SDL_SCANCODE_W)==0);
+    assert(rbxWaylandCopyModifiers(RBX_WL_MOD_CONTROL)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandCopyModifiers(RBX_WL_MOD_COMMAND)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandCopyModifiers(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT)==(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT));
     // Both pasteboard text formats have explicit, non-interchangeable encodings.
     assert(rbxPasteboardEncodingForType("NSStringPboardType")==RBX_PASTEBOARD_UTF16LE);
     assert(rbxPasteboardEncodingForType("public.utf8-plain-text")==RBX_PASTEBOARD_UTF8);

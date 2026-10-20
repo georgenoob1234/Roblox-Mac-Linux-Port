@@ -47,4 +47,12 @@ static inline char rbxWaylandShortcutLetter(unsigned scan) {
     }
 }
 
+// Roblox's engine copy handler is the Command+C path. A Control-only copy
+// chord must reach it as Command; a real Command chord is left untouched.
+static inline unsigned rbxWaylandCopyModifiers(unsigned modifiers) {
+    if (!(modifiers & RBX_WL_MOD_COMMAND))
+        modifiers = (modifiers & ~RBX_WL_MOD_CONTROL) | RBX_WL_MOD_COMMAND;
+    return modifiers;
+}
+
 #endif

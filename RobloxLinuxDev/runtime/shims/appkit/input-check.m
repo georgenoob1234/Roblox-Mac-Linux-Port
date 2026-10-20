@@ -8,6 +8,8 @@
 
 extern BOOL rbxWaylandTextEditingResponder(id responder);
 extern BOOL rbxWaylandPerformEditAction(id responder,int action);
+extern BOOL rbxWaylandCopyUsesEngine(id responder);
+extern NSUInteger rbxWaylandSelectedRangeLength(id responder);
 
 static int failures;
 static int checks;
@@ -22,21 +24,24 @@ static void expect(BOOL condition,const char *message) {
 
 static int copy_calls,paste_calls,cut_calls,select_all_calls;
 
-@interface FakeEditor:NSObject {BOOL editable;}
+@interface FakeEditor:NSObject {BOOL editable;NSUInteger selectionLength;}
 - (NSString*)string;
 - (NSRange)selectedRange;
 - (BOOL)isEditable;
 - (void)setEditable:(BOOL)value;
+- (void)setSelectionLength:(NSUInteger)value;
 - (void)copy:(id)sender;
 - (void)paste:(id)sender;
 - (void)cut:(id)sender;
 - (void)selectAll:(id)sender;
 @end
 @implementation FakeEditor
+- (id)init{if((self=[super init]))selectionLength=4;return self;}
 - (NSString*)string{return @"text";}
-- (NSRange)selectedRange{return NSMakeRange(0,4);}
+- (NSRange)selectedRange{return NSMakeRange(0,selectionLength);}
 - (BOOL)isEditable{return editable;}
 - (void)setEditable:(BOOL)value{editable=value;}
+- (void)setSelectionLength:(NSUInteger)value{selectionLength=value;}
 - (void)copy:(id)sender{(void)sender;copy_calls++;}
 - (void)paste:(id)sender{(void)sender;paste_calls++;}
 - (void)cut:(id)sender{(void)sender;cut_calls++;}
@@ -51,9 +56,18 @@ static int copy_calls,paste_calls,cut_calls,select_all_calls;
 - (void)paste:(id)sender{(void)sender;paste_calls++;}
 @end
 
+// Roblox's IME handler exposes inputHandler and owns the visible selection.
+@interface FakeEngineEditor:FakeEditor
+- (id)inputHandler;
+@end
+@implementation FakeEngineEditor
+- (id)inputHandler{return nil;}
+@end
+
 int main(void) {
     NSAutoreleasePool *pool=[NSAutoreleasePool new];
     FakeEditor *editor=[[FakeEditor new] autorelease];
+    FakeEngineEditor *engineEditor=[[FakeEngineEditor new] autorelease];
     NSObject *plain=[[NSObject new] autorelease];
     PasteOnly *pasteOnly=[[PasteOnly new] autorelease];
 
@@ -61,6 +75,16 @@ int main(void) {
     expect(!rbxWaylandTextEditingResponder(plain),"plain object is not a text editor");
     expect(!rbxWaylandTextEditingResponder(pasteOnly),"paste-only object is not a text editor");
     expect(rbxWaylandTextEditingResponder(editor),"editor-shaped responder is recognized");
+    expect(rbxWaylandSelectedRangeLength(editor)==4,"editor reports its native selection length");
+    expect(!rbxWaylandCopyUsesEngine(editor),"native selection keeps the copy: route");
+    [editor setSelectionLength:0];
+    expect(rbxWaylandSelectedRangeLength(editor)==0,"empty native selection is detected");
+    expect(rbxWaylandCopyUsesEngine(editor),"empty native selection routes copy through the engine");
+    expect(!rbxWaylandCopyUsesEngine(plain) && !rbxWaylandCopyUsesEngine(nil),"non-editors never use the engine copy route");
+    [engineEditor setSelectionLength:4];
+    expect(rbxWaylandTextEditingResponder(engineEditor),"engine editor is recognized");
+    expect(rbxWaylandCopyUsesEngine(engineEditor),"Roblox engine editor uses the engine copy route even with a native selection");
+    [editor setSelectionLength:4];
 
     [editor setEditable:YES];
     expect(rbxWaylandPerformEditAction(editor,RBX_WL_EDIT_COPY) && copy_calls==1,"Ctrl/Cmd+C dispatches copy:");
@@ -86,12 +110,15 @@ int main(void) {
     expect(rbxWaylandEditAction(6,RBX_WL_MOD_CONTROL|RBX_WL_MOD_SHIFT)==RBX_WL_EDIT_NONE,"Ctrl+Shift+C stays gameplay");
     expect(rbxWaylandEditAction(6,RBX_WL_MOD_CONTROL|RBX_WL_MOD_ALTERNATE)==RBX_WL_EDIT_NONE,"Ctrl+Alt+C stays gameplay");
     expect(rbxWaylandEditAction(6,0)==RBX_WL_EDIT_NONE,"unmodified C is typing");
+    expect(rbxWaylandCopyModifiers(RBX_WL_MOD_CONTROL)==RBX_WL_MOD_COMMAND,"Ctrl+C copy reaches the Command engine path");
+    expect(rbxWaylandCopyModifiers(RBX_WL_MOD_COMMAND)==RBX_WL_MOD_COMMAND,"Cmd+C keeps Command");
+    expect(rbxWaylandCopyModifiers(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT)==(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT),"unrelated modifiers are preserved");
 
     [pool release];
     if(failures) {
         fprintf(stderr,"FAIL: %d of %d input checks failed\n",failures,checks);
         return 1;
     }
-    printf("PASS Ctrl/Cmd editing-action dispatch, read-only handling, gameplay-key isolation, and modifier guards\n");
+    printf("PASS Ctrl/Cmd editing-action dispatch, empty-selection engine-copy routing, read-only handling, gameplay-key isolation, and modifier guards\n");
     return 0;
 }

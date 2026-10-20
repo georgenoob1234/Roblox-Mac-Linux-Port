@@ -141,6 +141,24 @@ int main(void) {
     [general writeObjects:[NSArray arrayWithObject:@"caf\xc3\xa9 \xf0\x9f\x99\x82"]];
     expect([[general stringForType:utf8] isEqual:@"caf\xc3\xa9 \xf0\x9f\x99\x82"],"writeObjects preserves Unicode");
 
+    // The copy path must preserve every text shape the editor can select.
+    const char *copied[]={"Hello world 123","\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xd0\xbc\xd0\xb8\xd1\x80",
+        "\xe4\xb8\xad\xe6\x96\x87\xe6\xb5\x8b\xe8\xaf\x95","emoji \xf0\x9f\x99\x82 \xf0\x9f\x9a\x80",
+        "line one\nline two\n"};
+    for(unsigned i=0;i<sizeof(copied)/sizeof(copied[0]);i++) {
+        NSString *text=[NSString stringWithUTF8String:copied[i]];
+        expect([general writeObjects:[NSArray arrayWithObject:text]],"copy writeObjects accepts selected text");
+        expect([[general stringForType:utf16] isEqual:text],"selected text reaches UTF-16 clipboard");
+        expect([[general stringForType:utf8] isEqual:text],"selected text reaches UTF-8 clipboard");
+        expect(!strcmp(clipboard_text,[text UTF8String]),"selected text reaches Linux clipboard");
+    }
+    // An empty selection must be a safe no-op, not a crash or stale value.
+    [general setString:@"stale" forType:utf16];
+    expect([general writeObjects:[NSArray arrayWithObject:@""]],"empty selection copy accepted");
+    expect(!strcmp(clipboard_text,""),"empty selection clears the Linux clipboard");
+    expect([[general stringForType:utf16] isEqual:@""],"empty selection reads back empty");
+    expect([general writeObjects:[NSArray array]],"empty object array accepted");
+
     // Clearing and change counts stay consistent for both boards.
     NSInteger before=[general changeCount];
     expect([general clearContents]>before,"clearContents advances changeCount");

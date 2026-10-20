@@ -3,6 +3,10 @@
 // Plain C ABI between the Mach-O AppKit backend and native GTK/SDL.
 struct RbxWaylandEvent {
     uint32_t type,button,key,modifiers,repeat,clicks;
+    // Recognized text-editing chord (RBX_WL_EDIT_*), or RBX_WL_EDIT_NONE.
+    // The AppKit side uses it to dispatch the edit action instead of letting
+    // the shortcut's printable letter reach the text field.
+    uint32_t shortcut;
     double x,y,dx,dy;
     char text[256];
 };

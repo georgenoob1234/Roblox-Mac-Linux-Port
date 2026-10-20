@@ -61,16 +61,28 @@ typedef void UCKeyboardLayout;
 extern int CGLRegisterNativeDisplay(void*);
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
+#import <Foundation/NSRange.h>
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include "../../browser/wayland-api.h"
 #include "../../browser/keyboard-map.h"
+#include "../../browser/keyboard-shortcut.h"
+#include "pasteboard-encoding.h"
+
+@interface NSObject (RbxWaylandTextEditing)
+- (BOOL)isEditable;
+- (NSRange)selectedRange;
+- (id)inputHandler;
+- (void)handleKeyEvent:(NSEvent*)event;
+- (void)handleModifiers:(unsigned short)keycode newModifierFlags:(unsigned)flags;
+@end
 
 struct WaylandElfCalls {void *(*open)(const char*);int (*close)(void*);void *(*symbol)(void*,const char*);char *(*error)(void);};
 extern struct WaylandElfCalls *_elfcalls;
 static const struct RbxWaylandAPI *api;
+static BOOL clipboardTrace(void);
 static void (*hide_vulkan)(void);
 static BOOL enabled(void){const char *v=getenv("ROBLOX_MAC_WAYLAND");return v && !strcmp(v,"1");}
 CGImageRef rbxWaylandCursorImage(NSPoint *hot) {
@@ -266,35 +278,128 @@ static void cancelCapture(void) {
 // remain local to their named pasteboard instead of clobbering desktop text.
 @interface RbxWaylandPasteboard:NSPasteboard {NSString *boardName;NSMutableDictionary *values;NSInteger changes;}
 - (id)initWithName:(NSString*)name;
+- (BOOL)writeObjects:(NSArray*)objects;
 @end
+
+// NSStringPboardType is UTF-16 in Cocotron; public.utf8-plain-text is UTF-8.
+// Every read and write of a declared text format must use the same encoding,
+// otherwise a value produced by one method is decoded with the other's rules.
+static BOOL pasteboardTextEncoding(NSString *type, NSStringEncoding *encoding) {
+    switch(rbxPasteboardEncodingForType(type?[type UTF8String]:NULL)) {
+        case RBX_PASTEBOARD_UTF16LE:if(encoding)*encoding=NSUTF16LittleEndianStringEncoding;return YES;
+        case RBX_PASTEBOARD_UTF8:if(encoding)*encoding=NSUTF8StringEncoding;return YES;
+        default:return NO;
+    }
+}
 @implementation RbxWaylandPasteboard
 - (id)initWithName:(NSString*)name{if((self=[super init])){boardName=[name copy];values=[NSMutableDictionary new];}return self;}
 - (void)dealloc{[boardName release];[values release];[super dealloc];}
 - (NSString*)name{return boardName;}
 - (NSInteger)changeCount{return changes;}
 - (BOOL)general{return [boardName isEqual:@"NSGeneralPboard"] || [boardName isEqual:@"Apple CFPasteboard general"];}
-- (BOOL)textType:(NSString*)type{return [type isEqual:@"NSStringPboardType"] || [type isEqual:@"public.utf8-plain-text"];}
+- (BOOL)textType:(NSString*)type{return pasteboardTextEncoding(type,NULL);}
 - (NSInteger)clearContents{[values removeAllObjects];if([self general] && api){void (^clear)(void)=^{api->clipboard("");};if([NSThread isMainThread])clear();else dispatch_sync(dispatch_get_main_queue(),clear);}return ++changes;}
 - (NSInteger)declareTypes:(NSArray*)types owner:(id)owner{return [self clearContents];}
 - (NSInteger)addTypes:(NSArray*)types owner:(id)owner{return ++changes;}
 - (NSArray*)types{return [self general]?[NSArray arrayWithObjects:@"NSStringPboardType",@"public.utf8-plain-text",nil]:[values allKeys];}
 - (NSData*)dataForType:(NSString*)type {
-    if(![self general] || ![self textType:type] || !api)return [values objectForKey:type];
-    __block NSData *result=nil;
-    void (^read)(void)=^{const char *text=api->clipboard(NULL);if(text)result=[[[NSString stringWithUTF8String:text] dataUsingEncoding:[type isEqual:@"NSStringPboardType"]?NSUnicodeStringEncoding:NSUTF8StringEncoding] retain];};
+    if(!type)return nil;
+    NSStringEncoding encoding;
+    if(![self general] || !pasteboardTextEncoding(type,&encoding) || !api)return [values objectForKey:type];
+    __block NSString *text=nil;
+    void (^read)(void)=^{
+        const char *bytes=api->clipboard(NULL);
+        if(!bytes)return;
+        size_t length=strlen(bytes);
+        // Linux clipboard text is UTF-8. An empty clipboard is an empty
+        // string, not an invalid conversion; malformed bytes stay nil.
+        text=length?[[NSString alloc] initWithBytes:bytes length:length encoding:NSUTF8StringEncoding]:[@"" retain];
+    };
     if([NSThread isMainThread])read();else dispatch_sync(dispatch_get_main_queue(),read);
-    return [result autorelease];
+    NSData *result=text?[text dataUsingEncoding:encoding]:nil;
+    [text release];
+    return result;
+}
+- (NSString*)stringForType:(NSString*)type {
+    if(!type)return nil;
+    NSStringEncoding encoding=NSUnicodeStringEncoding;
+    pasteboardTextEncoding(type,&encoding); // Keep Cocotron's Unicode default for other types.
+    NSData *data=[self dataForType:type];
+    if(!data)return nil;
+    if(![data length])return @"";
+    return [[[NSString alloc] initWithData:data encoding:encoding] autorelease];
 }
 - (BOOL)setData:(NSData*)data forType:(NSString*)type {
     if(!data || !type)return NO;
-    if([self general] && [self textType:type] && api) {
-        NSString *text=[[[NSString alloc] initWithData:data encoding:[type isEqual:@"NSStringPboardType"]?NSUnicodeStringEncoding:NSUTF8StringEncoding] autorelease];if(!text)return NO;
-        __block BOOL ok=NO;void (^write)(void)=^{ok=api->clipboard([text UTF8String])!=NULL;};
-        if([NSThread isMainThread])write();else dispatch_sync(dispatch_get_main_queue(),write);if(!ok)return NO;
+    if(clipboardTrace())fprintf(stderr,"CLIP setData type=%s len=%lu general=%d api=%d\n",[type UTF8String],(unsigned long)[data length],[self general],api!=NULL);
+    NSStringEncoding encoding;
+    if([self general] && pasteboardTextEncoding(type,&encoding) && api) {
+        NSString *text=[data length]?[[NSString alloc] initWithData:data encoding:encoding]:[@"" retain];
+        if(!text){
+            if(clipboardTrace())fprintf(stderr,"CLIP setData decode=failed type=%s\n",[type UTF8String]);
+            return NO;
+        }
+        const char *bytes=[text UTF8String];
+        if(!bytes){[text release];if(clipboardTrace())fprintf(stderr,"CLIP setData utf8=failed\n");return NO;}
+        __block BOOL ok=NO;void (^write)(void)=^{ok=api->clipboard(bytes)!=NULL;};
+        if([NSThread isMainThread])write();else dispatch_sync(dispatch_get_main_queue(),write);
+        [text release];
+        if(clipboardTrace())fprintf(stderr,"CLIP setData clipboard=%d\n",ok);
+        if(!ok)return NO;
     }
-    [values setObject:data forKey:type];changes++;return YES;
+    [values setObject:data forKey:type];changes++;
+    if(clipboardTrace())fprintf(stderr,"CLIP setData stored type=%s\n",[type UTF8String]);
+    return YES;
+}
+- (BOOL)setString:(NSString*)string forType:(NSString*)type {
+    if(!string || !type)return NO;
+    NSStringEncoding encoding=NSUnicodeStringEncoding;
+    pasteboardTextEncoding(type,&encoding); // Match the inherited Unicode default.
+    NSData *data=[string dataUsingEncoding:encoding];
+    if(!data)return NO;
+    return [self setData:data forType:type];
+}
+- (BOOL)writeObjects:(NSArray*)objects {
+    if(!objects)return NO;
+    if(clipboardTrace()) {
+        id first=[objects count]?[objects objectAtIndex:0]:nil;
+        const char *kind="nil";
+        NSUInteger length=0;
+        if([first isKindOfClass:[NSString class]]){kind="NSString";length=[first length];}
+        else if(first)kind=class_getName(object_getClass(first));
+        fprintf(stderr,"CLIP writeObjects count=%lu first=%s len=%lu\n",(unsigned long)[objects count],kind,(unsigned long)length);
+    }
+    [self clearContents];
+    BOOL wrote=NO;
+    for(id object in objects) {
+        NSString *string=nil;
+        if([object isKindOfClass:[NSString class]])string=object;
+        else if(object && class_respondsToSelector(object_getClass(object),sel_registerName("string")))
+            string=[object performSelector:sel_registerName("string")];
+        if(![string isKindOfClass:[NSString class]])continue;
+        // Roblox's copy path passes an NSString. Publish both declared text
+        // formats so either reader sees the same string; only the general
+        // board forwards that text to the Linux desktop clipboard.
+        if(![self setString:string forType:@"NSStringPboardType"]){
+            if(clipboardTrace())fprintf(stderr,"CLIP writeObjects setString=UTF16 failed\n");
+            return NO;
+        }
+        if(![self setString:string forType:@"public.utf8-plain-text"]){
+            if(clipboardTrace())fprintf(stderr,"CLIP writeObjects setString=UTF8 failed\n");
+            return NO;
+        }
+        wrote=YES;
+    }
+    BOOL result=wrote || [objects count]==0;
+    if(clipboardTrace())fprintf(stderr,"CLIP writeObjects result=%d\n",result);
+    return result;
 }
 @end
+
+// Test-only entry point. The shipped app installs the real bridge through
+// initializeNative; this lets the pasteboard conversion be exercised without
+// creating a Wayland window or touching the user's real clipboard.
+void rbxWaylandPasteboardSetClipboardForTest(const struct RbxWaylandAPI *test_api) {api=test_api;}
 
 // Roblox's modern 64px cursor textures place their hotspot at the center.
 // Keep game-provided NSCursor images and all other system shapes independent.
@@ -330,6 +435,90 @@ static int pollInput(struct RbxWaylandEvent *event,BOOL queueBusy) {
     }
     return 1;
 }
+static BOOL rbxResponderHas(id object,const char *selector) {
+    return object && class_respondsToSelector(object_getClass(object),sel_registerName(selector));
+}
+static BOOL clipboardTrace(void) {
+    const char *value=getenv("ROBLOX_MAC_CLIPBOARD_TRACE");
+    return value && !strcmp(value,"1");
+}
+BOOL rbxWaylandTextEditingResponder(id responder) {
+    if(!responder)return NO;
+    // Roblox's IME handler is an NSTextView subclass; field editors are too.
+    Class textView=objc_getClass("NSTextView");
+    if(textView && [responder isKindOfClass:textView])return YES;
+    // Keep a structural fallback for any other custom editor implementation.
+    return rbxResponderHas(responder,"string") && rbxResponderHas(responder,"selectedRange") &&
+        rbxResponderHas(responder,"paste:");
+}
+NSUInteger rbxWaylandSelectedRangeLength(id responder) {
+    if(!rbxResponderHas(responder,"selectedRange"))return 0;
+    return [responder selectedRange].length;
+}
+// Roblox keeps the visible TextBox selection in engine state. The native
+// NSTextView is often only the IME/field editor, so its selectedRange can be
+// empty while text is visibly selected. In that case the engine's original
+// Command+C handler is the only owner of the selection.
+BOOL rbxWaylandCopyUsesEngine(id responder) {
+    if(!rbxWaylandTextEditingResponder(responder))return NO;
+    // Roblox's InputMethodHandler exposes inputHandler and owns the visible
+    // TextBox selection even when its native selectedRange is stale or empty.
+    if(rbxResponderHas(responder,"inputHandler"))return YES;
+    return rbxWaylandSelectedRangeLength(responder)==0;
+}
+// Which editing actions the engine has to perform. It owns the visible TextBox
+// selection and its undo stack, so cut/undo/redo/select-all must not be handed
+// to the native text view when a handler is present. Copy additionally needs
+// the engine when the native selection range is empty.
+BOOL rbxWaylandEditActionUsesEngine(int action,BOOL engineOwned,BOOL nativeSelectionEmpty) {
+    switch(action) {
+        case RBX_WL_EDIT_COPY:return engineOwned||nativeSelectionEmpty;
+        case RBX_WL_EDIT_CUT:
+        case RBX_WL_EDIT_UNDO:
+        case RBX_WL_EDIT_REDO:
+        case RBX_WL_EDIT_SELECT_ALL:return engineOwned;
+        default:return NO;
+    }
+}
+BOOL rbxWaylandPerformEditAction(id responder,int action) {
+    const char *name=NULL;
+    switch(action) {
+        case RBX_WL_EDIT_COPY:name="copy:";break;
+        case RBX_WL_EDIT_PASTE:name="paste:";break;
+        case RBX_WL_EDIT_CUT:name="cut:";break;
+        case RBX_WL_EDIT_SELECT_ALL:name="selectAll:";break;
+        case RBX_WL_EDIT_UNDO:name="undo:";break;
+        case RBX_WL_EDIT_REDO:name="redo:";break;
+        default:return NO;
+    }
+    if(!rbxResponderHas(responder,name)) {
+        // Cocotron's NSTextView has no undo:/redo:. Consume the chord so the
+        // letter cannot reach the text field, but never pretend to edit.
+        return action==RBX_WL_EDIT_UNDO || action==RBX_WL_EDIT_REDO;
+    }
+    // Read-only editors still support copy/select-all, but must not accept
+    // paste, cut, undo or redo. Consume the chord either way so it cannot leak
+    // as text.
+    if((action==RBX_WL_EDIT_PASTE || action==RBX_WL_EDIT_CUT ||
+        action==RBX_WL_EDIT_UNDO || action==RBX_WL_EDIT_REDO) &&
+       rbxResponderHas(responder,"isEditable") && ![responder isEditable])return YES;
+    [responder performSelector:sel_registerName(name) withObject:nil];
+    return YES;
+}
+// Feed the engine's own input handler directly. This is the same entry point
+// Roblox's keyDown:/performKeyEquivalent: use for Command+C; queued synthetic
+// key events alone were not enough to make the engine copy.
+void rbxWaylandSendEngineChord(id engine,unsigned short key,NSString *plain,NSUInteger flags,NSUInteger restore,NSPoint location,NSInteger windowNumber) {
+    if(!engine || !rbxResponderHas(engine,"handleKeyEvent:"))return;
+    BOOL modifiers=rbxResponderHas(engine,"handleModifiers:newModifierFlags:");
+    if(modifiers)[engine handleModifiers:55 newModifierFlags:(unsigned)flags];
+    NSEvent *down=[NSEvent keyEventWithType:NSKeyDown location:location modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:windowNumber context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:NO keyCode:key];
+    [engine handleKeyEvent:down];
+    NSEvent *up=[NSEvent keyEventWithType:NSKeyUp location:location modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:windowNumber context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:NO keyCode:key];
+    [engine handleKeyEvent:up];
+    if(modifiers)[engine handleModifiers:55 newModifierFlags:(unsigned)restore];
+}
+static BOOL textShortcutSwallowed[512];
 @implementation RbxWaylandDisplay
 + (void)initialize {
     if(self!=[RbxWaylandDisplay class])return;
@@ -498,9 +687,75 @@ static BOOL isLegacyCursorAppearance(void) {
             unsigned short key=macKey(e.key);if(key==0xffff)continue;
             if((e.key>=83 && e.key<=99) || e.key==103)modifiers|=1u<<21; // NSNumericPadKeyMask
             if(pointerTrace() && e.key>=224)fprintf(stderr,"POINTER modifier key=%u down=%d flags=%u\n",e.key,e.type==RBX_WL_KEY_DOWN,modifiers);
-            NSString *text=[NSString stringWithUTF8String:e.text];
+            int action=e.shortcut?e.shortcut:rbxWaylandEditAction(e.key,e.modifiers);
+            NSString *plain=[NSString stringWithUTF8String:e.text];
+            // Swallow the matching key-up even if the modifier was released
+            // first, so the engine never sees a one-sided key sequence.
+            if(e.key<512 && e.type==RBX_WL_KEY_UP && textShortcutSwallowed[e.key]) {
+                textShortcutSwallowed[e.key]=NO;
+                continue;
+            }
+            if(action!=RBX_WL_EDIT_NONE && e.key<512 && e.type==RBX_WL_KEY_DOWN) {
+                // Only a focused text editor turns Ctrl/Cmd chords into
+                // editing actions. Gameplay keeps its Ctrl bindings.
+                id responder=[window firstResponder];
+                if(rbxWaylandTextEditingResponder(responder)) {
+                    NSUInteger selection=rbxWaylandSelectedRangeLength(responder);
+                    // A read-only editor must not lose text or touch the
+                    // clipboard through cut, and must not undo/redo edits.
+                    BOOL readOnly=rbxResponderHas(responder,"isEditable") && ![responder isEditable];
+                    if(readOnly && (action==RBX_WL_EDIT_CUT || action==RBX_WL_EDIT_UNDO ||
+                        action==RBX_WL_EDIT_REDO)) {
+                        textShortcutSwallowed[e.key]=YES;
+                        continue;
+                    }
+                    BOOL engineOwned=rbxResponderHas(responder,"inputHandler");
+                    BOOL useEngine=rbxWaylandEditActionUsesEngine(action,engineOwned,selection==0);
+                    if(useEngine) {
+                        // Roblox's engine owns the visible TextBox selection and
+                        // its undo stack. Copy, cut, undo, redo and select-all
+                        // must reach it as their native Command chords; queued
+                        // synthetic events alone do not drive it.
+                        id engine=engineOwned?[responder inputHandler]:nil;
+                        unsigned engineScan=rbxWaylandEngineScancode(action,e.key);
+                        unsigned short engineKey=macKey(engineScan);
+                        char engineLetter=rbxWaylandShortcutLetter(engineScan);
+                        NSString *enginePlain=engineLetter?[NSString stringWithFormat:@"%c",engineLetter]:plain;
+                        NSUInteger flags=rbxWaylandEngineModifiers(action,modifiers);
+                        if(clipboardTrace())fprintf(stderr,"CLIP action=%d route=engine-direct responder=%s selection=%lu control=%d command=%d shift=%d engine=%s key=%u\n",
+                            action,class_getName(object_getClass(responder)),(unsigned long)selection,
+                            !!(modifiers&RBX_WL_MOD_CONTROL),!!(modifiers&RBX_WL_MOD_COMMAND),
+                            !!(flags&RBX_WL_MOD_SHIFT),engine?class_getName(object_getClass(engine)):"nil",engineScan);
+                        if(engine && rbxResponderHas(engine,"handleKeyEvent:")) {
+                            rbxWaylandSendEngineChord(engine,engineKey,enginePlain,flags,modifiers,[self mouseLocation],[window windowNumber]);
+                        } else {
+                            // Fallback for an editor-shaped responder without a
+                            // direct engine handler: use the normal event route.
+                            if(!(modifiers&RBX_WL_MOD_COMMAND))
+                                [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
+                            [self postEvent:[NSEvent keyEventWithType:NSKeyDown location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:enginePlain charactersIgnoringModifiers:enginePlain isARepeat:e.repeat keyCode:engineKey] atStart:NO];
+                            [self postEvent:[NSEvent keyEventWithType:NSKeyUp location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:enginePlain charactersIgnoringModifiers:enginePlain isARepeat:NO keyCode:engineKey] atStart:NO];
+                            if(!(modifiers&RBX_WL_MOD_COMMAND))
+                                [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:modifiers timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
+                        }
+                        textShortcutSwallowed[e.key]=YES;
+                        continue;
+                    }
+                    if(rbxWaylandPerformEditAction(responder,action)) {
+                        if(clipboardTrace())fprintf(stderr,"CLIP action=%d route=native responder=%s selection=%lu\n",
+                            action,class_getName(object_getClass(responder)),(unsigned long)selection);
+                        textShortcutSwallowed[e.key]=YES;
+                        continue;
+                    }
+                }
+            }
+            // Keep charactersIgnoringModifiers so Cocoa can still match a key
+            // equivalent, but never let a shortcut's printable letter become
+            // text. Normal keys keep both fields identical.
+            BOOL shortcut=action!=RBX_WL_EDIT_NONE;
+            NSString *text=shortcut?@"":plain;
             NSEventType type=e.key>=224?NSFlagsChanged:e.type==RBX_WL_KEY_DOWN?NSKeyDown:NSKeyUp;
-            [self postEvent:[NSEvent keyEventWithType:type location:[self mouseLocation] modifierFlags:modifiers timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:text charactersIgnoringModifiers:text isARepeat:e.repeat keyCode:key] atStart:NO];continue;
+            [self postEvent:[NSEvent keyEventWithType:type location:[self mouseLocation] modifierFlags:modifiers timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:text charactersIgnoringModifiers:plain isARepeat:e.repeat keyCode:key] atStart:NO];continue;
         }
         pointer=NSMakePoint(e.x,e.y);NSPoint position=[gameWindow transformPoint:locked?anchor:pointer];
         if(e.type==RBX_WL_MOTION && pointerTrace())fprintf(stderr,"POINTER motion dx=%.1f dy=%.1f locked=%d buttons=%u\n",e.dx,e.dy,locked,buttons);

@@ -2,6 +2,7 @@
 #import <Foundation/NSObject.h>
 #import <Foundation/NSString.h>
 #import <Foundation/NSRange.h>
+#import <Foundation/NSGeometry.h>
 #import <Foundation/NSAutoreleasePool.h>
 #include "../../browser/keyboard-shortcut.h"
 #include <stdio.h>
@@ -10,6 +11,7 @@ extern BOOL rbxWaylandTextEditingResponder(id responder);
 extern BOOL rbxWaylandPerformEditAction(id responder,int action);
 extern BOOL rbxWaylandCopyUsesEngine(id responder);
 extern NSUInteger rbxWaylandSelectedRangeLength(id responder);
+extern void rbxWaylandSendEngineChord(id engine,unsigned short key,NSString *plain,NSUInteger flags,NSUInteger restore,NSPoint location,NSInteger windowNumber);
 
 static int failures;
 static int checks;
@@ -64,6 +66,23 @@ static int copy_calls,paste_calls,cut_calls,select_all_calls;
 - (id)inputHandler{return nil;}
 @end
 
+@interface FakeEngine:NSObject {int key_events;int modifier_events;unsigned first_flags;unsigned last_flags;}
+- (void)handleKeyEvent:(id)event;
+- (void)handleModifiers:(unsigned short)keycode newModifierFlags:(unsigned)flags;
+- (int)keyEvents;
+- (int)modifierEvents;
+- (unsigned)firstFlags;
+- (unsigned)lastFlags;
+@end
+@implementation FakeEngine
+- (void)handleKeyEvent:(id)event{(void)event;key_events++;}
+- (void)handleModifiers:(unsigned short)keycode newModifierFlags:(unsigned)flags{(void)keycode;if(!modifier_events)first_flags=flags;last_flags=flags;modifier_events++;}
+- (int)keyEvents{return key_events;}
+- (int)modifierEvents{return modifier_events;}
+- (unsigned)firstFlags{return first_flags;}
+- (unsigned)lastFlags{return last_flags;}
+@end
+
 int main(void) {
     NSAutoreleasePool *pool=[NSAutoreleasePool new];
     FakeEditor *editor=[[FakeEditor new] autorelease];
@@ -85,6 +104,13 @@ int main(void) {
     expect(rbxWaylandTextEditingResponder(engineEditor),"engine editor is recognized");
     expect(rbxWaylandCopyUsesEngine(engineEditor),"Roblox engine editor uses the engine copy route even with a native selection");
     [editor setSelectionLength:4];
+
+    FakeEngine *engine=[[FakeEngine new] autorelease];
+    rbxWaylandSendEngineChord(engine,8,@"c",RBX_WL_MOD_COMMAND,RBX_WL_MOD_CONTROL,NSMakePoint(0,0),1);
+    expect([engine keyEvents]==2,"engine receives Command+C key down and up");
+    expect([engine modifierEvents]==2,"engine modifier state is set and restored");
+    expect([engine firstFlags]==RBX_WL_MOD_COMMAND,"engine sees Command while copying");
+    expect([engine lastFlags]==RBX_WL_MOD_CONTROL,"engine modifier state is restored to Control");
 
     [editor setEditable:YES];
     expect(rbxWaylandPerformEditAction(editor,RBX_WL_EDIT_COPY) && copy_calls==1,"Ctrl/Cmd+C dispatches copy:");
@@ -119,6 +145,6 @@ int main(void) {
         fprintf(stderr,"FAIL: %d of %d input checks failed\n",failures,checks);
         return 1;
     }
-    printf("PASS Ctrl/Cmd editing-action dispatch, empty-selection engine-copy routing, read-only handling, gameplay-key isolation, and modifier guards\n");
+    printf("PASS Ctrl/Cmd editing-action dispatch, direct engine copy/select-all chord, empty-selection routing, read-only handling, gameplay-key isolation, and modifier guards\n");
     return 0;
 }

@@ -74,6 +74,9 @@ extern int CGLRegisterNativeDisplay(void*);
 @interface NSObject (RbxWaylandTextEditing)
 - (BOOL)isEditable;
 - (NSRange)selectedRange;
+- (id)inputHandler;
+- (void)handleKeyEvent:(NSEvent*)event;
+- (void)handleModifiers:(unsigned short)keycode newModifierFlags:(unsigned)flags;
 @end
 
 struct WaylandElfCalls {void *(*open)(const char*);int (*close)(void*);void *(*symbol)(void*,const char*);char *(*error)(void);};
@@ -480,6 +483,19 @@ BOOL rbxWaylandPerformEditAction(id responder,int action) {
     [responder performSelector:sel_registerName(name) withObject:nil];
     return YES;
 }
+// Feed the engine's own input handler directly. This is the same entry point
+// Roblox's keyDown:/performKeyEquivalent: use for Command+C; queued synthetic
+// key events alone were not enough to make the engine copy.
+void rbxWaylandSendEngineChord(id engine,unsigned short key,NSString *plain,NSUInteger flags,NSUInteger restore,NSPoint location,NSInteger windowNumber) {
+    if(!engine || !rbxResponderHas(engine,"handleKeyEvent:"))return;
+    BOOL modifiers=rbxResponderHas(engine,"handleModifiers:newModifierFlags:");
+    if(modifiers)[engine handleModifiers:55 newModifierFlags:(unsigned)flags];
+    NSEvent *down=[NSEvent keyEventWithType:NSKeyDown location:location modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:windowNumber context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:NO keyCode:key];
+    [engine handleKeyEvent:down];
+    NSEvent *up=[NSEvent keyEventWithType:NSKeyUp location:location modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:windowNumber context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:NO keyCode:key];
+    [engine handleKeyEvent:up];
+    if(modifiers)[engine handleModifiers:55 newModifierFlags:(unsigned)restore];
+}
 static BOOL textShortcutSwallowed[512];
 @implementation RbxWaylandDisplay
 + (void)initialize {
@@ -668,20 +684,39 @@ static BOOL isLegacyCursorAppearance(void) {
                         // the native IME text view has no selected range. Use
                         // Roblox's original Command+C handler instead of copy:.
                         NSUInteger flags=rbxWaylandCopyModifiers(modifiers);
-                        if(clipboardTrace())fprintf(stderr,"CLIP copy route=engine responder=%s selection=%lu control=%d command=%d\n",
+                        id engine=rbxResponderHas(responder,"inputHandler")?[responder inputHandler]:nil;
+                        if(clipboardTrace())fprintf(stderr,"CLIP copy route=engine-direct responder=%s selection=%lu control=%d command=%d engine=%s\n",
                             class_getName(object_getClass(responder)),(unsigned long)selection,
-                            !!(modifiers&RBX_WL_MOD_CONTROL),!!(modifiers&RBX_WL_MOD_COMMAND));
-                        // InputCapture keeps its own modifier flags. A
-                        // Control-only chord must look like Command while the
-                        // engine handles the copy, then the real state is restored.
-                        if(!(modifiers&RBX_WL_MOD_COMMAND))
-                            [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
-                        [self postEvent:[NSEvent keyEventWithType:NSKeyDown location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:e.repeat keyCode:key] atStart:NO];
-                        [self postEvent:[NSEvent keyEventWithType:NSKeyUp location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:NO keyCode:key] atStart:NO];
-                        if(!(modifiers&RBX_WL_MOD_COMMAND))
-                            [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:modifiers timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
+                            !!(modifiers&RBX_WL_MOD_CONTROL),!!(modifiers&RBX_WL_MOD_COMMAND),
+                            engine?class_getName(object_getClass(engine)):"nil");
+                        if(engine && rbxResponderHas(engine,"handleKeyEvent:")) {
+                            rbxWaylandSendEngineChord(engine,key,plain,flags,modifiers,[self mouseLocation],[window windowNumber]);
+                        } else {
+                            // Fallback for an editor-shaped responder without a
+                            // direct engine handler: use the normal event route.
+                            if(!(modifiers&RBX_WL_MOD_COMMAND))
+                                [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
+                            [self postEvent:[NSEvent keyEventWithType:NSKeyDown location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:e.repeat keyCode:key] atStart:NO];
+                            [self postEvent:[NSEvent keyEventWithType:NSKeyUp location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:NO keyCode:key] atStart:NO];
+                            if(!(modifiers&RBX_WL_MOD_COMMAND))
+                                [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:modifiers timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
+                        }
                         textShortcutSwallowed[e.key]=YES;
                         continue;
+                    }
+                    if(action==RBX_WL_EDIT_SELECT_ALL && rbxResponderHas(responder,"inputHandler")) {
+                        // Same engine-owned selection model: Ctrl/Cmd+A must
+                        // reach the engine's select-all handler, not NSTextView.
+                        id engine=[responder inputHandler];
+                        if(engine && rbxResponderHas(engine,"handleKeyEvent:")) {
+                            NSUInteger flags=rbxWaylandCopyModifiers(modifiers);
+                            if(clipboardTrace())fprintf(stderr,"CLIP selectAll route=engine-direct responder=%s selection=%lu engine=%s\n",
+                                class_getName(object_getClass(responder)),(unsigned long)selection,
+                                class_getName(object_getClass(engine)));
+                            rbxWaylandSendEngineChord(engine,key,plain,flags,modifiers,[self mouseLocation],[window windowNumber]);
+                            textShortcutSwallowed[e.key]=YES;
+                            continue;
+                        }
                     }
                     if(rbxWaylandPerformEditAction(responder,action)) {
                         if(clipboardTrace())fprintf(stderr,"CLIP action=%d route=native responder=%s selection=%lu\n",

@@ -19,6 +19,10 @@ for name in ('browser', 'profiler'):
 shutil.copy2(source / 'runtime/optimized/ui-build.sh', runtime / 'optimized')
 (work / 'native').mkdir()
 shutil.copy2(source / 'native/wayland.cpp', work / 'native')
+# native/wayland.cpp includes ../runtime/shims/appkit/pasteboard-encoding.h.
+(runtime / 'shims' / 'appkit').mkdir(parents=True)
+shutil.copy2(source / 'runtime/shims/appkit/pasteboard-encoding.h',
+             runtime / 'shims/appkit/pasteboard-encoding.h')
 env = dict(os.environ, ROBLOX_MAC_PORTABLE_ROOT='/')
 for script in ('browser/build.sh', 'optimized/ui-build.sh'):
     subprocess.run(['sh', str(runtime / script)], env=env, check=True)

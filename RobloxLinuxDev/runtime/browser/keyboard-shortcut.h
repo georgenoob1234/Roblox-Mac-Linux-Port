@@ -59,6 +59,14 @@ static inline char rbxWaylandShortcutLetter(unsigned scan) {
 
 // Undo and redo are Command+Z / Command+Shift+Z in macOS applications. A
 // Linux-style Ctrl+Y redo therefore has to reach the engine as Shift+Z, not Y.
+//
+// Verified 2026-10-20 against the 0.743 Player client: Ctrl+X copies and
+// deletes, but neither Command+Z nor Command+Shift+Z changes the text, even
+// with FFlag/DFFlag TextBoxUndo, TextBoxRedo and FInt/DFInt
+// UndoRedoTextBoxStackSize forced on through ClientAppSettings.json. The
+// shipped engine has no working TextBox undo stack, so these two chords are
+// consumed without effect. Keep the mapping: a client that implements undo
+// picks it up, and consuming the chord stops 'z' being typed into the field.
 static inline unsigned rbxWaylandEngineScancode(int action, unsigned scan) {
     if (action == RBX_WL_EDIT_UNDO || action == RBX_WL_EDIT_REDO) return 29; // SDL_SCANCODE_Z
     return scan;

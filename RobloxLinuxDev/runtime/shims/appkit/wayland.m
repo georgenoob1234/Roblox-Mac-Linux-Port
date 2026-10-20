@@ -466,6 +466,20 @@ BOOL rbxWaylandCopyUsesEngine(id responder) {
     if(rbxResponderHas(responder,"inputHandler"))return YES;
     return rbxWaylandSelectedRangeLength(responder)==0;
 }
+// Which editing actions the engine has to perform. It owns the visible TextBox
+// selection and its undo stack, so cut/undo/redo/select-all must not be handed
+// to the native text view when a handler is present. Copy additionally needs
+// the engine when the native selection range is empty.
+BOOL rbxWaylandEditActionUsesEngine(int action,BOOL engineOwned,BOOL nativeSelectionEmpty) {
+    switch(action) {
+        case RBX_WL_EDIT_COPY:return engineOwned||nativeSelectionEmpty;
+        case RBX_WL_EDIT_CUT:
+        case RBX_WL_EDIT_UNDO:
+        case RBX_WL_EDIT_REDO:
+        case RBX_WL_EDIT_SELECT_ALL:return engineOwned;
+        default:return NO;
+    }
+}
 BOOL rbxWaylandPerformEditAction(id responder,int action) {
     const char *name=NULL;
     switch(action) {
@@ -473,12 +487,20 @@ BOOL rbxWaylandPerformEditAction(id responder,int action) {
         case RBX_WL_EDIT_PASTE:name="paste:";break;
         case RBX_WL_EDIT_CUT:name="cut:";break;
         case RBX_WL_EDIT_SELECT_ALL:name="selectAll:";break;
+        case RBX_WL_EDIT_UNDO:name="undo:";break;
+        case RBX_WL_EDIT_REDO:name="redo:";break;
         default:return NO;
     }
-    if(!rbxResponderHas(responder,name))return NO;
+    if(!rbxResponderHas(responder,name)) {
+        // Cocotron's NSTextView has no undo:/redo:. Consume the chord so the
+        // letter cannot reach the text field, but never pretend to edit.
+        return action==RBX_WL_EDIT_UNDO || action==RBX_WL_EDIT_REDO;
+    }
     // Read-only editors still support copy/select-all, but must not accept
-    // paste or cut. Consume the chord either way so it cannot leak as text.
-    if((action==RBX_WL_EDIT_PASTE || action==RBX_WL_EDIT_CUT) &&
+    // paste, cut, undo or redo. Consume the chord either way so it cannot leak
+    // as text.
+    if((action==RBX_WL_EDIT_PASTE || action==RBX_WL_EDIT_CUT ||
+        action==RBX_WL_EDIT_UNDO || action==RBX_WL_EDIT_REDO) &&
        rbxResponderHas(responder,"isEditable") && ![responder isEditable])return YES;
     [responder performSelector:sel_registerName(name) withObject:nil];
     return YES;
@@ -674,49 +696,50 @@ static BOOL isLegacyCursorAppearance(void) {
                 continue;
             }
             if(action!=RBX_WL_EDIT_NONE && e.key<512 && e.type==RBX_WL_KEY_DOWN) {
-                // Only a focused text editor turns Ctrl/Cmd+C/V/X/A into
+                // Only a focused text editor turns Ctrl/Cmd chords into
                 // editing actions. Gameplay keeps its Ctrl bindings.
                 id responder=[window firstResponder];
                 if(rbxWaylandTextEditingResponder(responder)) {
                     NSUInteger selection=rbxWaylandSelectedRangeLength(responder);
-                    if(action==RBX_WL_EDIT_COPY && rbxWaylandCopyUsesEngine(responder)) {
-                        // The visible selection lives in Roblox's engine state;
-                        // the native IME text view has no selected range. Use
-                        // Roblox's original Command+C handler instead of copy:.
-                        NSUInteger flags=rbxWaylandCopyModifiers(modifiers);
-                        id engine=rbxResponderHas(responder,"inputHandler")?[responder inputHandler]:nil;
-                        if(clipboardTrace())fprintf(stderr,"CLIP copy route=engine-direct responder=%s selection=%lu control=%d command=%d engine=%s\n",
-                            class_getName(object_getClass(responder)),(unsigned long)selection,
+                    // A read-only editor must not lose text or touch the
+                    // clipboard through cut, and must not undo/redo edits.
+                    BOOL readOnly=rbxResponderHas(responder,"isEditable") && ![responder isEditable];
+                    if(readOnly && (action==RBX_WL_EDIT_CUT || action==RBX_WL_EDIT_UNDO ||
+                        action==RBX_WL_EDIT_REDO)) {
+                        textShortcutSwallowed[e.key]=YES;
+                        continue;
+                    }
+                    BOOL engineOwned=rbxResponderHas(responder,"inputHandler");
+                    BOOL useEngine=rbxWaylandEditActionUsesEngine(action,engineOwned,selection==0);
+                    if(useEngine) {
+                        // Roblox's engine owns the visible TextBox selection and
+                        // its undo stack. Copy, cut, undo, redo and select-all
+                        // must reach it as their native Command chords; queued
+                        // synthetic events alone do not drive it.
+                        id engine=engineOwned?[responder inputHandler]:nil;
+                        unsigned engineScan=rbxWaylandEngineScancode(action,e.key);
+                        unsigned short engineKey=macKey(engineScan);
+                        char engineLetter=rbxWaylandShortcutLetter(engineScan);
+                        NSString *enginePlain=engineLetter?[NSString stringWithFormat:@"%c",engineLetter]:plain;
+                        NSUInteger flags=rbxWaylandEngineModifiers(action,modifiers);
+                        if(clipboardTrace())fprintf(stderr,"CLIP action=%d route=engine-direct responder=%s selection=%lu control=%d command=%d shift=%d engine=%s key=%u\n",
+                            action,class_getName(object_getClass(responder)),(unsigned long)selection,
                             !!(modifiers&RBX_WL_MOD_CONTROL),!!(modifiers&RBX_WL_MOD_COMMAND),
-                            engine?class_getName(object_getClass(engine)):"nil");
+                            !!(flags&RBX_WL_MOD_SHIFT),engine?class_getName(object_getClass(engine)):"nil",engineScan);
                         if(engine && rbxResponderHas(engine,"handleKeyEvent:")) {
-                            rbxWaylandSendEngineChord(engine,key,plain,flags,modifiers,[self mouseLocation],[window windowNumber]);
+                            rbxWaylandSendEngineChord(engine,engineKey,enginePlain,flags,modifiers,[self mouseLocation],[window windowNumber]);
                         } else {
                             // Fallback for an editor-shaped responder without a
                             // direct engine handler: use the normal event route.
                             if(!(modifiers&RBX_WL_MOD_COMMAND))
                                 [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
-                            [self postEvent:[NSEvent keyEventWithType:NSKeyDown location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:e.repeat keyCode:key] atStart:NO];
-                            [self postEvent:[NSEvent keyEventWithType:NSKeyUp location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:plain charactersIgnoringModifiers:plain isARepeat:NO keyCode:key] atStart:NO];
+                            [self postEvent:[NSEvent keyEventWithType:NSKeyDown location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:enginePlain charactersIgnoringModifiers:enginePlain isARepeat:e.repeat keyCode:engineKey] atStart:NO];
+                            [self postEvent:[NSEvent keyEventWithType:NSKeyUp location:[self mouseLocation] modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:enginePlain charactersIgnoringModifiers:enginePlain isARepeat:NO keyCode:engineKey] atStart:NO];
                             if(!(modifiers&RBX_WL_MOD_COMMAND))
                                 [self postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:[self mouseLocation] modifierFlags:modifiers timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:[window windowNumber] context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:55] atStart:NO];
                         }
                         textShortcutSwallowed[e.key]=YES;
                         continue;
-                    }
-                    if(action==RBX_WL_EDIT_SELECT_ALL && rbxResponderHas(responder,"inputHandler")) {
-                        // Same engine-owned selection model: Ctrl/Cmd+A must
-                        // reach the engine's select-all handler, not NSTextView.
-                        id engine=[responder inputHandler];
-                        if(engine && rbxResponderHas(engine,"handleKeyEvent:")) {
-                            NSUInteger flags=rbxWaylandCopyModifiers(modifiers);
-                            if(clipboardTrace())fprintf(stderr,"CLIP selectAll route=engine-direct responder=%s selection=%lu engine=%s\n",
-                                class_getName(object_getClass(responder)),(unsigned long)selection,
-                                class_getName(object_getClass(engine)));
-                            rbxWaylandSendEngineChord(engine,key,plain,flags,modifiers,[self mouseLocation],[window windowNumber]);
-                            textShortcutSwallowed[e.key]=YES;
-                            continue;
-                        }
                     }
                     if(rbxWaylandPerformEditAction(responder,action)) {
                         if(clipboardTrace())fprintf(stderr,"CLIP action=%d route=native responder=%s selection=%lu\n",

@@ -174,23 +174,39 @@ int main() {
     assert(!rbx_client_url(nullptr) && !rbx_client_url((std::string("roblox:")+std::string(16384,'x')).c_str()));
     // No video initialization: exercise the actual SDL FIFO and capture filter.
     assert(SDL_Init(SDL_INIT_EVENTS));
-    // Editing chords are only recognized without Shift/Alt and only for the
-    // four Rust standard actions. Everything else stays a gameplay key.
+    // Editing chords are only recognized for the supported actions. Shift and
+    // Alt combinations otherwise stay with the game or the input method.
     assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_COPY);
     assert(rbxWaylandEditAction(SDL_SCANCODE_V,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_PASTE);
     assert(rbxWaylandEditAction(SDL_SCANCODE_X,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_CUT);
     assert(rbxWaylandEditAction(SDL_SCANCODE_A,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_SELECT_ALL);
     assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_COPY);
     assert(rbxWaylandEditAction(SDL_SCANCODE_V,RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_PASTE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Z,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_UNDO);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Z,RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_UNDO);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Y,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_REDO);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Z,RBX_WL_MOD_CONTROL|RBX_WL_MOD_SHIFT)==RBX_WL_EDIT_REDO);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Z,RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT)==RBX_WL_EDIT_REDO);
     assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL|RBX_WL_MOD_SHIFT)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_X,RBX_WL_MOD_CONTROL|RBX_WL_MOD_SHIFT)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Y,RBX_WL_MOD_CONTROL|RBX_WL_MOD_SHIFT)==RBX_WL_EDIT_NONE);
     assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL|RBX_WL_MOD_ALTERNATE)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Z,RBX_WL_MOD_CONTROL|RBX_WL_MOD_ALTERNATE)==RBX_WL_EDIT_NONE);
     assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL|RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_NONE);
     assert(rbxWaylandEditAction(SDL_SCANCODE_W,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_NONE);
     assert(rbxWaylandEditAction(SDL_SCANCODE_C,0)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_Z,0)==RBX_WL_EDIT_NONE);
     assert(rbxWaylandShortcutLetter(SDL_SCANCODE_C)=='c' && rbxWaylandShortcutLetter(SDL_SCANCODE_W)==0);
-    assert(rbxWaylandCopyModifiers(RBX_WL_MOD_CONTROL)==RBX_WL_MOD_COMMAND);
-    assert(rbxWaylandCopyModifiers(RBX_WL_MOD_COMMAND)==RBX_WL_MOD_COMMAND);
-    assert(rbxWaylandCopyModifiers(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT)==(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT));
+    assert(rbxWaylandShortcutLetter(SDL_SCANCODE_X)=='x' && rbxWaylandShortcutLetter(SDL_SCANCODE_Z)=='z');
+    assert(rbxWaylandEngineModifiers(RBX_WL_EDIT_COPY,RBX_WL_MOD_CONTROL)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandEngineModifiers(RBX_WL_EDIT_CUT,RBX_WL_MOD_CONTROL)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandEngineModifiers(RBX_WL_EDIT_UNDO,RBX_WL_MOD_CONTROL)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandEngineModifiers(RBX_WL_EDIT_REDO,RBX_WL_MOD_CONTROL)==(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT));
+    assert(rbxWaylandEngineModifiers(RBX_WL_EDIT_REDO,RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT)==(RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT));
+    assert(rbxWaylandEngineModifiers(RBX_WL_EDIT_CUT,RBX_WL_MOD_COMMAND|RBX_WL_MOD_SHIFT)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandEngineScancode(RBX_WL_EDIT_UNDO,SDL_SCANCODE_Z)==SDL_SCANCODE_Z);
+    assert(rbxWaylandEngineScancode(RBX_WL_EDIT_REDO,SDL_SCANCODE_Y)==SDL_SCANCODE_Z);
+    assert(rbxWaylandEngineScancode(RBX_WL_EDIT_CUT,SDL_SCANCODE_X)==SDL_SCANCODE_X);
     // Both pasteboard text formats have explicit, non-interchangeable encodings.
     assert(rbxPasteboardEncodingForType("NSStringPboardType")==RBX_PASTEBOARD_UTF16LE);
     assert(rbxPasteboardEncodingForType("public.utf8-plain-text")==RBX_PASTEBOARD_UTF8);

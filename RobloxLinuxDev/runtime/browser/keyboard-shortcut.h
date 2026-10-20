@@ -9,7 +9,9 @@ enum RbxWaylandEditAction {
     RBX_WL_EDIT_COPY,
     RBX_WL_EDIT_PASTE,
     RBX_WL_EDIT_CUT,
-    RBX_WL_EDIT_SELECT_ALL
+    RBX_WL_EDIT_SELECT_ALL,
+    RBX_WL_EDIT_UNDO,
+    RBX_WL_EDIT_REDO
 };
 
 enum {
@@ -22,16 +24,22 @@ enum {
 static inline int rbxWaylandEditAction(unsigned scan, unsigned modifiers) {
     unsigned command = modifiers & RBX_WL_MOD_COMMAND;
     unsigned control = modifiers & RBX_WL_MOD_CONTROL;
-    // Shift/Alt combinations stay with the input method or the game. A
+    // Alt combinations stay with the input method or the game. A
     // command+control chord is not a standard text-editing shortcut either.
-    if (modifiers & (RBX_WL_MOD_SHIFT | RBX_WL_MOD_ALTERNATE)) return RBX_WL_EDIT_NONE;
+    if (modifiers & RBX_WL_MOD_ALTERNATE) return RBX_WL_EDIT_NONE;
     if (!command && !control) return RBX_WL_EDIT_NONE;
     if (command && control) return RBX_WL_EDIT_NONE;
+    // Shift is only meaningful for redo. Every other shifted chord, including
+    // Ctrl+Shift+C, stays with the game or the input method.
+    if (modifiers & RBX_WL_MOD_SHIFT)
+        return scan == 29 ? RBX_WL_EDIT_REDO : RBX_WL_EDIT_NONE; // SDL_SCANCODE_Z
     switch (scan) {
         case 6: return RBX_WL_EDIT_COPY;       // SDL_SCANCODE_C
         case 25: return RBX_WL_EDIT_PASTE;     // SDL_SCANCODE_V
         case 27: return RBX_WL_EDIT_CUT;       // SDL_SCANCODE_X
         case 4: return RBX_WL_EDIT_SELECT_ALL; // SDL_SCANCODE_A
+        case 29: return RBX_WL_EDIT_UNDO;      // SDL_SCANCODE_Z
+        case 28: return RBX_WL_EDIT_REDO;      // SDL_SCANCODE_Y
         default: return RBX_WL_EDIT_NONE;
     }
 }
@@ -43,16 +51,27 @@ static inline char rbxWaylandShortcutLetter(unsigned scan) {
         case 25: return 'v';
         case 27: return 'x';
         case 4: return 'a';
+        case 28: return 'y';
+        case 29: return 'z';
         default: return 0;
     }
 }
 
-// Roblox's engine copy handler is the Command+C path. A Control-only copy
-// chord must reach it as Command; a real Command chord is left untouched.
-static inline unsigned rbxWaylandCopyModifiers(unsigned modifiers) {
-    if (!(modifiers & RBX_WL_MOD_COMMAND))
-        modifiers = (modifiers & ~RBX_WL_MOD_CONTROL) | RBX_WL_MOD_COMMAND;
-    return modifiers;
+// Undo and redo are Command+Z / Command+Shift+Z in macOS applications. A
+// Linux-style Ctrl+Y redo therefore has to reach the engine as Shift+Z, not Y.
+static inline unsigned rbxWaylandEngineScancode(int action, unsigned scan) {
+    if (action == RBX_WL_EDIT_UNDO || action == RBX_WL_EDIT_REDO) return 29; // SDL_SCANCODE_Z
+    return scan;
+}
+
+// The engine's editing handlers are the Command chords. A Control-only chord
+// must reach them as Command, with Shift kept only for redo.
+static inline unsigned rbxWaylandEngineModifiers(int action, unsigned modifiers) {
+    unsigned flags = modifiers & ~(RBX_WL_MOD_CONTROL | RBX_WL_MOD_ALTERNATE);
+    if (!(modifiers & RBX_WL_MOD_COMMAND)) flags |= RBX_WL_MOD_COMMAND;
+    if (action == RBX_WL_EDIT_REDO) flags |= RBX_WL_MOD_SHIFT;
+    else flags &= ~RBX_WL_MOD_SHIFT;
+    return flags;
 }
 
 #endif

@@ -5,6 +5,8 @@
 #include <deque>
 #include <array>
 #include "../runtime/browser/keyboard-map.h"
+#include "../runtime/browser/keyboard-shortcut.h"
+#include "../runtime/shims/appkit/pasteboard-encoding.h"
 
 static GtkIMContext *text_context;
 static std::deque<std::string> committed_text;
@@ -172,6 +174,59 @@ int main() {
     assert(!rbx_client_url(nullptr) && !rbx_client_url((std::string("roblox:")+std::string(16384,'x')).c_str()));
     // No video initialization: exercise the actual SDL FIFO and capture filter.
     assert(SDL_Init(SDL_INIT_EVENTS));
+    // Editing chords are only recognized without Shift/Alt and only for the
+    // four Rust standard actions. Everything else stays a gameplay key.
+    assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_COPY);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_V,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_PASTE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_X,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_CUT);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_A,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_SELECT_ALL);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_COPY);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_V,RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_PASTE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL|RBX_WL_MOD_SHIFT)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL|RBX_WL_MOD_ALTERNATE)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_C,RBX_WL_MOD_CONTROL|RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_W,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_C,0)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandShortcutLetter(SDL_SCANCODE_C)=='c' && rbxWaylandShortcutLetter(SDL_SCANCODE_W)==0);
+    // Both pasteboard text formats have explicit, non-interchangeable encodings.
+    assert(rbxPasteboardEncodingForType("NSStringPboardType")==RBX_PASTEBOARD_UTF16LE);
+    assert(rbxPasteboardEncodingForType("public.utf8-plain-text")==RBX_PASTEBOARD_UTF8);
+    for(const char *type:{(const char*)nullptr,"","NSRTFPboardType","public.utf16-plain-text"})
+        assert(rbxPasteboardEncodingForType(type)==RBX_PASTEBOARD_NOT_TEXT);
+    // The producer keeps the unmodified letter for key equivalents but must
+    // consume SDL's text payload instead of merging it into a shortcut.
+    game=reinterpret_cast<SDL_Window*>(uintptr_t(1));
+    SDL_FlushEvents(SDL_EVENT_FIRST,SDL_EVENT_LAST);
+    auto push_key=[&](Uint32 type,Uint32 scan,Uint32 keycode,Uint16 mod){
+        SDL_Event event{};event.type=type;event.key.scancode=static_cast<SDL_Scancode>(scan);event.key.key=keycode;event.key.mod=mod;
+        assert(SDL_PushEvent(&event));
+    };
+    static char text_buffer[64];
+    auto push_text=[&](const char *text){
+        SDL_Event event{};event.type=SDL_EVENT_TEXT_INPUT;
+        g_strlcpy(text_buffer,text,sizeof(text_buffer));event.text.text=text_buffer;
+        assert(SDL_PushEvent(&event));
+    };
+    RbxWaylandEvent key_event{};
+    auto reset_queue=[&]{SDL_FlushEvents(SDL_EVENT_FIRST,SDL_EVENT_LAST);};
+    reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_C,'c',SDL_KMOD_CTRL);push_text("c");
+    assert(poll_event(&key_event)==1 && key_event.type==RBX_WL_KEY_DOWN);
+    assert(key_event.shortcut==RBX_WL_EDIT_COPY && !strcmp(key_event.text,"c"));
+    assert(poll_event(&key_event)==0); // The shortcut's text payload was consumed.
+    reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_A,'a',0);push_text("a");
+    assert(poll_event(&key_event)==1 && key_event.type==RBX_WL_KEY_DOWN);
+    assert(key_event.shortcut==RBX_WL_EDIT_NONE && !strcmp(key_event.text,"a"));
+    reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_W,'w',SDL_KMOD_CTRL);
+    assert(poll_event(&key_event)==1 && key_event.type==RBX_WL_KEY_DOWN);
+    assert(key_event.shortcut==RBX_WL_EDIT_NONE);
+    reset_queue();
+    push_key(SDL_EVENT_KEY_UP,SDL_SCANCODE_V,'v',SDL_KMOD_CTRL);
+    assert(poll_event(&key_event)==1 && key_event.type==RBX_WL_KEY_UP);
+    assert(key_event.shortcut==RBX_WL_EDIT_PASTE && !strcmp(key_event.text,"v"));
+    game=nullptr;
     // Event delivery and label lookup must use the same physical key mapping.
     for(unsigned scan=1;scan<SDL_SCANCODE_COUNT;++scan)
         if(macKey(scan)!=0xffff)assert(key_scancode(macKey(scan))==scan);

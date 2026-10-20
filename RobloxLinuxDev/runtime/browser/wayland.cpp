@@ -5,6 +5,7 @@
 #include "host.cpp"
 #undef main
 #include "wayland-api.h"
+#include "keyboard-shortcut.h"
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL_main.h>
@@ -543,10 +544,19 @@ static int poll_event(RbxWaylandEvent *out) {
                     request_close();close_requested=false;out->type=RBX_WL_CLOSE;return 1;
                 }
                 out->type=e.type==SDL_EVENT_KEY_DOWN?RBX_WL_KEY_DOWN:RBX_WL_KEY_UP;out->key=e.key.scancode;out->repeat=e.key.repeat;out->modifiers=modifiers(e.key.mod);
+                out->shortcut=rbxWaylandEditAction(e.key.scancode,out->modifiers);
                 if(!(e.key.key & SDLK_SCANCODE_MASK) && e.key.key<128){out->text[0]=(char)e.key.key;out->text[1]=0;}
                 if(e.type==SDL_EVENT_KEY_DOWN) {
                     SDL_Event next;
-                    if(SDL_PeepEvents(&next,1,SDL_PEEKEVENT,SDL_EVENT_FIRST,SDL_EVENT_LAST)==1 && next.type==SDL_EVENT_TEXT_INPUT) {
+                    int haveNext=SDL_PeepEvents(&next,1,SDL_PEEKEVENT,SDL_EVENT_FIRST,SDL_EVENT_LAST)==1;
+                    if(out->shortcut!=RBX_WL_EDIT_NONE) {
+                        // A command/control chord is an editing action, not text.
+                        // Keep its unmodified letter for charactersIgnoringModifiers,
+                        // but drop SDL's text payload instead of merging it.
+                        char letter=rbxWaylandShortcutLetter(e.key.scancode);
+                        if(letter){out->text[0]=letter;out->text[1]=0;}
+                        if(haveNext && next.type==SDL_EVENT_TEXT_INPUT)SDL_PollEvent(&next);
+                    } else if(haveNext && next.type==SDL_EVENT_TEXT_INPUT) {
                         g_strlcpy(out->text,next.text.text,sizeof(out->text));SDL_PollEvent(&next);
                     } else if(e.key.key>=32 && e.key.key<127 && !(e.key.mod&(SDL_KMOD_CTRL|SDL_KMOD_GUI)))out->text[0]=0;
                 }

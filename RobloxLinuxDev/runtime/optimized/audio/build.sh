@@ -7,7 +7,7 @@ SDK=$A/src/darling/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
 SRC=$A/src/darling/src/CoreAudio
 mkdir -p "$OUT/tmp"
 export TMPDIR=$OUT/tmp
-for PROBE in device-check fmod-unit-check host-clock-check capture-check; do
+for PROBE in device-check fmod-unit-check host-clock-check capture-check component-lifecycle-check; do
 clang++ --target=x86_64-apple-macos11 -D__DARWIN_ONLY_UNIX_CONFORMANCE=1 -DTARGET_OS_WASI=0 -std=c++17 -fblocks -O2 -fuse-ld=lld -Wl,-no_adhoc_codesign \
  -isysroot "$A/darling-root" -nostdinc++ -isystem "$A/src/darling/src/external/libcxx/include" \
  -isystem "$SDK/usr/include" -I "$SRC/include" -I "$A/src/darling/src/frameworks/CoreServices/include" -F "$SDK/System/Library/Frameworks" \

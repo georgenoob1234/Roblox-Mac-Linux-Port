@@ -297,6 +297,9 @@ python3 runtime/optimized/check-launch.py
 
 # Audio capture check (needs PipeWire, pipewire-pulse, WirePlumber)
 python3 runtime/optimized/audio/check-capture.py
+
+# AudioUnit device-change teardown regression (no audio hardware needed)
+python3 runtime/optimized/audio/check-component-lifecycle.py
 ```
 
 ### Shell / Darling runtime checks

@@ -1,5 +1,6 @@
 {
   "overrides": [
+    "src/CoreAudio/AudioToolbox/ComponentDispatch.h",
     "src/external/metal/private-include/Metal/MTLTextureInternal.h",
     "src/external/metal/private-include/Metal/MTLBufferInternal.h",
     "src/external/metal/private-include/Metal/MTLRenderCommandEncoderInternal.h",

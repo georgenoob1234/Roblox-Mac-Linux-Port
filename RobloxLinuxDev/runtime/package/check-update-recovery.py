@@ -53,6 +53,14 @@ assert 'rm -rf -- "$WORK"' in UPDATE
 assert "stat -c %d" in UPDATE
 # Traps keep the standard exit codes.
 assert "trap 'exit 130' INT" in UPDATE and "trap 'exit 143' TERM HUP" in UPDATE
+# FD 8 is the bootstrapper's progress channel. The updater lock lives on FD 7,
+# and both lock descriptors are closed before an AppImage-spawning child runs.
+assert 'exec 7<"$HERE"' in UPDATE
+assert 'flock -n -E 74 7' in UPDATE
+assert 'exec 8<"$HERE"' not in UPDATE
+assert '--client-version 7>&- 8>&- 9>&-' in UPDATE
+assert '--download-client 7>&- 9>&-' in UPDATE
+assert '--prepare-shaders 7>&- 8>&- 9>&-' in UPDATE
 # The updater stages inside the launcher-managed work directory; the runtime's
 # release confinement accepts ROBLOX_MAC_DATA there by canonical path prefix,
 # so staging must not masquerade as a live-launch alias data directory.
@@ -103,8 +111,9 @@ set -eu
 # that outlives its command and keeps every inherited descriptor open, as
 # squashfuse does when uruntime keeps a mount for reuse. The updater and the
 # bootstrapper must close their lock descriptors for AppImage-spawning
-# children (8>&- 9>&-), or this sleeper strands the instance lock and the
-# update lock. Output is redirected so it never keeps the harness's capture
+# children (7>&- 9>&-), or this sleeper strands the instance lock and the
+# update lock. FD 8 remains open only for the download progress channel.
+# Output is redirected so it never keeps the harness's capture
 # pipes open.
 sleep 30 >/dev/null 2>&1 </dev/null &
 # run.sh must hand every AppImage invocation a mount directory outside the
@@ -115,15 +124,17 @@ case "$APPIMAGE_TARGET_DIR" in "$(dirname -- "$0")"/*) exit 9;; esac
 version=${TEST_CLIENT_VERSION:-version-abcd}
 [ "${1:-}" != --debug ] || shift
 case "${1:-}" in
---client-version) printf '%s\\n' "$version";;
+--client-version) test ! -e /proc/$$/fd/7; test ! -e /proc/$$/fd/9; printf '%s\\n' "$version";;
 --client-version-display) printf '0.740.0.7400927\\n';;
 --download-client)
+    test ! -e /proc/$$/fd/7; test ! -e /proc/$$/fd/9
     base="$ROBLOX_MAC_DATA"
     mkdir -p "$base/RobloxPlayer.app/Contents/MacOS"
     printf '#!/bin/sh\\nexit 0\\n' > "$base/RobloxPlayer.app/Contents/MacOS/RobloxPlayer"
     chmod +x "$base/RobloxPlayer.app/Contents/MacOS/RobloxPlayer"
     printf '%s\\n' "$version" > "$base/.version";;
 --prepare-shaders)
+    test ! -e /proc/$$/fd/7; test ! -e /proc/$$/fd/8; test ! -e /proc/$$/fd/9
     cache="$(dirname "$ROBLOX_MAC_APP")/spv-cache-v1"
     mkdir -p "$cache"; printf '{}\\n' > "$cache/report.json";;
 --shell) mkdir -p "$(dirname -- "$0")/DO_NOT_SHARE/prefix";;

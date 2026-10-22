@@ -231,6 +231,95 @@ exit 3
     phases = [json.loads(line)["phase"] for line in event_log.read_text().splitlines()]
     assert phases[:2] == ["checking", "downloading"] and phases[-1] == "update"
 
+    # Exercise the real bootstrapper -> updater -> run.sh descriptor handoff.
+    # The fake AppImage emits increasing byte counts through the inherited
+    # progress FIFO and refuses to run if either updater lock is still open.
+    handoff_release = tmp / "progress-handoff"
+    handoff_release.mkdir()
+    handoff_private = handoff_release / "DO_NOT_SHARE"
+    (handoff_private / "prefix").mkdir(parents=True)
+    (handoff_private / "first-run.initialized").write_text("initialized\n")
+    (handoff_private / "bootstrapper.json").write_text(
+        json.dumps({"auto_update": "auto", "check_interval_hours": 0}))
+    (handoff_release / "RobloxVersion/.version").parent.mkdir(parents=True)
+    (handoff_release / "RobloxVersion/.version").write_text("version-old\n")
+    shutil.copy2(ROOT / "package/bootstrap.sh", handoff_release / "bootstrap.sh")
+    shutil.copy2(ROOT / "package/bootstrap.py", handoff_release / "bootstrap.py")
+    shutil.copy2(ROOT / "package/update-roblox.sh", handoff_release / "update-roblox.sh")
+    (handoff_release / "bootstrap.sh").chmod(0o755)
+    (handoff_release / "update-roblox.sh").chmod(0o755)
+    (handoff_release / "run.sh").write_text(
+        '#!/bin/sh\nexec "$(dirname -- "$0")/RobloxLinux.AppImage" "$@"\n')
+    (handoff_release / "run.sh").chmod(0o755)
+    handoff_trace = tmp / "progress-handoff.trace"
+    handoff_events = tmp / "progress-handoff.events"
+    (handoff_release / "RobloxLinux.AppImage").write_text("""#!/bin/sh
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case "${1:-}" in
+  --bootstrapper-ui)
+    [ "${2:-}" = --progress ] || exit 2
+    cat > "$PROGRESS_LOG"
+    exit 0
+    ;;
+  --client-version)
+    printf 'version-abcd\\n'
+    exit 0
+    ;;
+  --shell)
+    test ! -e /proc/$$/fd/9
+    mkdir -p "$HERE/DO_NOT_SHARE/prefix"
+    exit 0
+    ;;
+  --download-client)
+    test ! -e /proc/$$/fd/7
+    test ! -e /proc/$$/fd/9
+    test -e /proc/$$/fd/8
+    printf 'download-locks-closed\\n' >> "$TRACE"
+    printf '%s\\n' '{"phase":"downloading","percent":30,"message":"Downloading Roblox","bytes_done":10,"bytes_total":100,"cancellable":true}' >&8
+    sleep 0.15
+    printf '%s\\n' '{"phase":"downloading","percent":45,"message":"Downloading Roblox","bytes_done":40,"bytes_total":100,"cancellable":true}' >&8
+    mkdir -p "$ROBLOX_MAC_DATA/RobloxPlayer.app/Contents/MacOS"
+    printf '#!/bin/sh\\nexit 0\\n' > "$ROBLOX_MAC_DATA/RobloxPlayer.app/Contents/MacOS/RobloxPlayer"
+    chmod +x "$ROBLOX_MAC_DATA/RobloxPlayer.app/Contents/MacOS/RobloxPlayer"
+    printf 'version-abcd\\n' > "$ROBLOX_MAC_DATA/.version"
+    exit 0
+    ;;
+  --debug)
+    shift
+    ;;
+esac
+if [ "${1:-}" = --prepare-shaders ]; then
+    test ! -e /proc/$$/fd/7
+    test ! -e /proc/$$/fd/8
+    test ! -e /proc/$$/fd/9
+    printf 'prepare-locks-closed\\n' >> "$TRACE"
+    mkdir -p "$(dirname -- "$ROBLOX_MAC_APP")/spv-cache-v1"
+    printf '{}\\n' > "$(dirname -- "$ROBLOX_MAC_APP")/spv-cache-v1/report.json"
+    exit 0
+fi
+exit 2
+""")
+    (handoff_release / "RobloxLinux.AppImage").chmod(0o755)
+    handoff_result = subprocess.run(
+        [handoff_release / "bootstrap.sh", "update"],
+        env={**env, "ROBLOX_MAC_UI_APP": str(handoff_release / "RobloxLinux.AppImage"),
+             "PROGRESS_LOG": str(handoff_events), "TRACE": str(handoff_trace)},
+        capture_output=True, text=True)
+    assert handoff_result.returncode == 0, handoff_result.stderr + handoff_result.stdout
+    handoff_lines = [json.loads(line) for line in handoff_events.read_text().splitlines()]
+    assert handoff_lines[0]["phase"] == "checking"
+    assert any(event["phase"] == "downloading" and event["percent"] == 25
+               for event in handoff_lines), handoff_lines
+    byte_events = [event for event in handoff_lines
+                   if event["phase"] == "downloading" and event["bytes_total"] == 100]
+    assert [event["bytes_done"] for event in byte_events[:2]] == [10, 40], byte_events
+    assert any(event["phase"] == "verifying" for event in handoff_lines)
+    assert handoff_lines[-1]["phase"] == "update"
+    assert handoff_trace.read_text().splitlines() == [
+        "download-locks-closed", "prepare-locks-closed"]
+    assert (handoff_release / "RobloxVersion/.version").read_text().strip() == "version-abcd"
+
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "off", "check_interval_hours": 24}))
     notify_bin = Path(tmp) / "notify-bin"
     notify_bin.mkdir()

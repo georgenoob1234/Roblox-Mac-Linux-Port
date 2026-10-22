@@ -69,6 +69,7 @@ extern int CGLRegisterNativeDisplay(void*);
 #include "../../browser/wayland-api.h"
 #include "../../browser/keyboard-map.h"
 #include "../../browser/keyboard-shortcut.h"
+#include "../../browser/right-drag-anchor.h"
 #include "pasteboard-encoding.h"
 
 @interface NSObject (RbxWaylandTextEditing)
@@ -131,6 +132,7 @@ static void drawThemeFrame(id view,SEL selector,NSRect rect) {
     originalThemeDraw(view,selector,rect);
 }
 static NSPoint pointer,anchor,rightPressPoint;
+static RbxRightDragAnchor rightDragAnchor;
 static unsigned modifiers,buttons;
 static BOOL locked,focused,captureWanted,captureSuspended;
 static BOOL cursorVisible=YES;
@@ -141,9 +143,6 @@ static BOOL warpQueued;
 static BOOL pendingCapture,captureQueued;
 static unsigned pendingCaptureRequest;
 static BOOL pointerTrace(void){static int value=-1;if(value<0)value=getenv("ROBLOX_MAC_POINTER_TRACE") && !strcmp(getenv("ROBLOX_MAC_POINTER_TRACE"),"1");return value;}
-extern void rbxLockedCursor(id,void*,NSPoint,int);
-extern void rbxMoveLockedCursor(NSPoint);
-extern void rbxRefreshLockedCursor(void);
 static void markCursorTrackingDirty(void) {
     __atomic_store_n(&cursorTrackingDirty,1,__ATOMIC_RELEASE);
 }
@@ -155,7 +154,6 @@ static void setCursorVisibility(BOOL value) {
     if(api)api->action(NULL,RBX_WL_CURSOR_VISIBLE,value,0,NULL);
     // Pointer capture and cursor visibility are independent. A game may keep
     // raw camera input while hiding the OS cursor and drawing its own reticle.
-    if(gameWindow)rbxLockedCursor(gameWindow,NULL,anchor,locked && value);
     if(pointerTrace())fprintf(stderr,"CURSOR visible=%d locked=%d\n",value,locked);
 }
 static void applyCursorVisibility(unsigned request,BOOL value) {
@@ -171,8 +169,9 @@ static void warpPointer(NSPoint next) {
     // Engine warps change the lock anchor even while RMB remains held (for
     // example, enabling Shift Lock). Physical motion never changes this anchor.
     if(locked || captureSuspended){
+        if(rbxRightDragRestoresMotion(&rightDragAnchor,next.x,next.y))return;
         if(anchor.x!=next.x || anchor.y!=next.y)markCursorTrackingDirty();
-        anchor=next;rbxMoveLockedCursor(anchor);
+        anchor=next;api->action(gameWindow->native,RBX_WL_CURSOR_ANCHOR,anchor.x,anchor.y,NULL);
     }
     else {pointer=next;if(focused)api->action(gameWindow->native,RBX_WL_WARP,next.x,next.y,NULL);}
 }
@@ -181,6 +180,13 @@ static void applyCapture(BOOL value) {
     value=value && focused && gameWindow;
     if(pointerTrace())fprintf(stderr,"POINTER appkit apply=%d focused=%d locked=%d buttons=%u\n",value,focused,locked,buttons);
     if(gameWindow && api) {
+        if(locked!=value) {
+            markCursorTrackingDirty();
+            if(value && !captureSuspended)anchor=(buttons & (1u<<3))?rightPressPoint:pointer;
+            // Pin the host cursor before requesting capture. No Cocoa cursor
+            // layer or game presentation transition is needed on Wayland.
+            if(value)api->action(gameWindow->native,RBX_WL_CURSOR_ANCHOR,anchor.x,anchor.y,NULL);
+        }
         // Commit the engine's anchor before unlocking: Wayland otherwise
         // restores the compositor's old position (not the Shift Lock center).
         // Never relocate the desktop pointer when merely leaving a workspace.
@@ -191,13 +197,9 @@ static void applyCapture(BOOL value) {
         // Always forward release: SDL can already differ after host focus/browser
         // handling. Never let a cached Cocoa flag suppress an engine unlock.
         api->action(gameWindow->native,RBX_WL_LOCK,value,0,NULL);
-        if(locked!=value) {
-            markCursorTrackingDirty();
-            if(value && !captureSuspended)anchor=(buttons & (1u<<3))?rightPressPoint:pointer;
-            rbxLockedCursor(gameWindow,NULL,anchor,value && cursorVisible);
-        }
     }
     locked=value;
+    if(!value && !captureSuspended)rightDragAnchor.active=0;
     if(pointerTrace())fprintf(stderr,"POINTER anchor x=%.1f y=%.1f locked=%d suspended=%d\n",anchor.x,anchor.y,locked,captureSuspended);
     if(value)captureSuspended=NO;
 }
@@ -207,7 +209,7 @@ static void captureFocus(BOOL value) {
     if(!value && locked)captureSuspended=YES;
     focused=value;applyCapture(value && captureWanted);
     if(value)markCursorTrackingDirty();
-    if(!value){buttons=0;modifiers=0;}
+    if(!value){buttons=0;modifiers=0;rightDragAnchor.active=0;}
 }
 static void cancelCapture(void) {
     __atomic_add_fetch(&captureRequest,1,__ATOMIC_SEQ_CST);
@@ -612,7 +614,6 @@ static BOOL isLegacyCursorAppearance(void) {
         api->cursor(CGBitmapContextGetData(context),size.width,size.height,CGBitmapContextGetBytesPerRow(context),cursor->hot.x,cursor->hot.y,NULL);CGContextRelease(context);
     } else api->cursor(NULL,0,0,0,0,0,cursor->name?[cursor->name UTF8String]:NULL);
     [cursor retain];[applied release];applied=cursor;
-    rbxRefreshLockedCursor();
 }
 - (void)warpMouse:(NSPoint)p {
     if(![NSThread isMainThread]){
@@ -762,7 +763,12 @@ static BOOL isLegacyCursorAppearance(void) {
         NSEventType type=NSMouseMoved;unsigned button=e.button;
         if(e.type==RBX_WL_DOWN || e.type==RBX_WL_UP) {
             if(pointerTrace())fprintf(stderr,"POINTER appkit button=%u down=%d locked=%d focused=%d\n",button,e.type==RBX_WL_DOWN,locked,focused);
-            if(e.type==RBX_WL_DOWN && button==3)rightPressPoint=pointer;
+            if(button==3) {
+                if(e.type==RBX_WL_DOWN) {
+                    rightPressPoint=pointer;
+                    rbxRightDragBegin(&rightDragAnchor,pointer.x,pointer.y,!locked && !captureSuspended);
+                } else if(!locked)rightDragAnchor.active=0;
+            }
             unsigned bit=button<32?1u<<button:0;
             if(e.type==RBX_WL_DOWN)buttons|=bit;else buttons&=~bit;
             type=button==1?(e.type==RBX_WL_DOWN?NSLeftMouseDown:NSLeftMouseUp):button==3?(e.type==RBX_WL_DOWN?NSRightMouseDown:NSRightMouseUp):(e.type==RBX_WL_DOWN?NSOtherMouseDown:NSOtherMouseUp);
@@ -772,6 +778,7 @@ static BOOL isLegacyCursorAppearance(void) {
         }
         else if(e.type==RBX_WL_MOTION){type=(buttons&(1<<1))?NSLeftMouseDragged:(buttons&(1<<3))?NSRightMouseDragged:NSMouseMoved;button=type==NSRightMouseDragged?3:1;}
         else continue;
+        if(e.type==RBX_WL_MOTION && !locked)rbxRightDragTrack(&rightDragAnchor,pointer.x,pointer.y);
         // Match Cocoa's physical deltas while flipping only the position origin.
         // Merge adjacent motion counts, never across a button/key/scroll event.
         NSEvent *last=[queue lastObject];

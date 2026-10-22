@@ -6,6 +6,7 @@
 #include <array>
 #include "../runtime/browser/keyboard-map.h"
 #include "../runtime/browser/keyboard-shortcut.h"
+#include "../runtime/browser/right-drag-anchor.h"
 #include "../runtime/shims/appkit/pasteboard-encoding.h"
 
 static GtkIMContext *text_context;
@@ -138,6 +139,23 @@ extern "C" uint32_t rbx_wayland_key_character(unsigned mac_key,unsigned carbon_m
 #ifdef TRACKB_WAYLAND_CHECK
 #include <cassert>
 int main() {
+    // Replay the captured first-motion sequence: an old engine restore may
+    // refer to the click or an absolute drag sample delivered before capture.
+    RbxRightDragAnchor right_drag{};
+    rbxRightDragBegin(&right_drag,675.4,239.9,true);
+    rbxRightDragTrack(&right_drag,674.45,239.9);
+    rbxRightDragTrack(&right_drag,673.5,239.9);
+    assert(rbxRightDragRestoresMotion(&right_drag,675.4,239.9));
+    assert(rbxRightDragRestoresMotion(&right_drag,673.5,239.9));
+    assert(rbxRightDragRestoresMotion(&right_drag,673.50001,239.9));
+    assert(!rbxRightDragRestoresMotion(&right_drag,673.6,239.9));
+    assert(!rbxRightDragRestoresMotion(&right_drag,550,400)); // new Shift Lock center
+    right_drag.active=false;
+    assert(!rbxRightDragRestoresMotion(&right_drag,673.5,239.9)); // focus/release reset
+    rbxRightDragBegin(&right_drag,100,150,true);
+    assert(!rbxRightDragRestoresMotion(&right_drag,673.5,239.9)); // independent presses
+    rbxRightDragBegin(&right_drag,100,150,false);
+    assert(!rbxRightDragRestoresMotion(&right_drag,100,150)); // already captured Shift Lock
     int w=0,h=0;
     assert(parse_render_size("1512x949",w,h) && w==1512 && h==949);
     for(auto invalid:{"", "0x949", "1512x0", "1512x949junk", "1512", "-1x949", "999999999999999999x949", "8193x949"})
@@ -297,7 +315,7 @@ int main() {
         assert(SDL_PushEvent(&event));
     };
     motion(SDL_EVENT_MOUSE_MOTION,3,-1.5);
-    queue_capture_state(true);assert(!capture_cursor_visible());
+    queue_capture_state(true);assert(capture_cursor_visible()); // ACK alone must never blank the cursor.
     motion(SDL_EVENT_MOUSE_MOTION,99,99); // duplicate absolute while locked
     motion(raw_motion_event,1.25,-2.5);
     SDL_Event release{};release.type=SDL_EVENT_MOUSE_BUTTON_UP;release.button.button=3;
@@ -315,12 +333,34 @@ int main() {
     }
     assert(received==4 && motion_x==6.25 && motion_y==0 && !queued_capture_active);
     // A persistent constraint can acknowledge lock again after compositor unlock.
-    queue_capture_state(true);assert(!capture_cursor_visible());
+    queue_capture_state(true);assert(capture_cursor_visible());
+    pointer_capture.focus(true);pointer_capture.request(true);
+    assert(capture_cursor_wanted());
+    capture_cursor_mapped=true;assert(!capture_cursor_visible());
     cursor_visible_requested=false;
+    assert(!capture_cursor_wanted() && !capture_cursor_visible()); // intentional first-person hide
     queue_capture_state(false);assert(!capture_cursor_visible());
+    capture_cursor_mapped=false;
     cursor_visible_requested=true;assert(capture_cursor_visible());
     while(SDL_PeepEvents(&queued,1,SDL_GETEVENT,SDL_EVENT_FIRST,SDL_EVENT_LAST)==1)assert(discard_pointer_event(queued));
-    assert(!queued_capture_active);SDL_Quit();
+    assert(!queued_capture_active);
+    // The first and subsequent physical packets cannot move the visual anchor,
+    // including a pending constraint and compositor unlock/relock cycle.
+    cursor_anchor_x=100.25;cursor_anchor_y=50.5;capture_x=100.25;capture_y=50.5;
+    queue_capture_state(true);
+    for(int i=0;i<3;++i)raw_motion(nullptr,nullptr,0,0,0,0,wl_fixed_from_double(1.25),wl_fixed_from_double(-2.5));
+    unsigned raw_count=0;
+    while(SDL_PeepEvents(&queued,1,SDL_GETEVENT,SDL_EVENT_FIRST,SDL_EVENT_LAST)==1) {
+        if(discard_pointer_event(queued))continue;
+        assert(queued.type==raw_motion_event && queued.motion.x==100.25f && queued.motion.y==50.5f);
+        assert(queued.motion.xrel==1.25f && queued.motion.yrel==-2.5f);++raw_count;
+    }
+    assert(raw_count==3 && cursor_anchor_x==100.25 && cursor_anchor_y==50.5);
+    pointer_capture.focus(false);assert(!capture_cursor_wanted());
+    pointer_capture.focus(true);assert(!capture_cursor_wanted()); // no spontaneous recapture after blur
+    queue_capture_state(false);
+    while(SDL_PeepEvents(&queued,1,SDL_GETEVENT,SDL_EVENT_FIRST,SDL_EVENT_LAST)==1)assert(discard_pointer_event(queued));
+    SDL_Quit();
     PointerCapture capture;
     capture.request(true);assert(!capture.requested); // stale request while unfocused
     assert(capture.focus(true));capture.request(true);assert(capture.requested);

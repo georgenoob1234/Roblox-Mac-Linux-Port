@@ -245,6 +245,8 @@ python3 runtime/package/check-port-updater.py
 
 # Wayland backend, IME, profiler overlay and desktop cursor tests
 sh runtime/optimized/ui-build.sh
+python3 runtime/package/check-cursor-handoff.py
+python3 runtime/package/check-pointer-unlock.py
 ```
 
 ### Desktop appearance and window decorations

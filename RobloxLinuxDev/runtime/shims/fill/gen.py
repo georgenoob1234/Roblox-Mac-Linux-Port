@@ -111,7 +111,9 @@ def main():
             funcs.add(bare)
         else:
             data.add(bare)
-    emit(funcs, data, classes, HERE / "fill.m")
+    generated = HERE / "build" / "fill.m"
+    generated.parent.mkdir(parents=True, exist_ok=True)
+    emit(funcs, data, classes, generated)
     print(f"missing {len(missing)}: {len(funcs)} functions, {len(data)} data, {len(classes)} classes")
     (ROOT / "logs/missing-symbols.txt").write_text(
         "\n".join(f"{'FUNC' if v else 'DATA'} {k}" for k, v in sorted(missing.items())) + "\n")

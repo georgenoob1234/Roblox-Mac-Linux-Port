@@ -10,5 +10,5 @@ clang --target=x86_64-apple-macos11 -fuse-ld=lld -dynamiclib \
     -isysroot "$DR" -nostdlibinc -Wno-objc-root-class \
     -install_name "@rpath/librbxfill.dylib" \
     -F "$DR/System/Library/Frameworks" -framework Foundation \
-    -o "$HERE/librbxfill.dylib" "$HERE/fill.m"
+    -o "$HERE/librbxfill.dylib" "$HERE/build/fill.m"
 echo "built $HERE/librbxfill.dylib"

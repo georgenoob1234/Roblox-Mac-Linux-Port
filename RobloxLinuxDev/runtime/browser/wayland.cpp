@@ -14,6 +14,7 @@
 #include <wayland-egl.h>
 #include "protocols/relative-pointer.h"
 #include "protocols/pointer-constraints.h"
+#include "protocols/viewporter.h"
 #include <X11/Xcursor/Xcursor.h>
 #include <vector>
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <charconv>
 #include <sched.h>
 #include <signal.h>
+#include <sys/mman.h>
 #ifdef RBX_PROFILER
 #include "../profiler/api.h"
 #include <chrono>
@@ -39,6 +41,8 @@ extern "C" uint64_t rbx_profiler_revision();
 static SDL_Window *game;
 static wl_subcompositor *subcompositor;
 static wl_compositor *compositor;
+static wl_shm *cursor_shm;
+static wp_viewporter *cursor_viewporter;
 static wl_subsurface *subsurface;
 static wl_display *display;
 static wl_event_queue *pointer_queue;
@@ -144,8 +148,82 @@ static zwp_relative_pointer_v1 *relative_pointer;
 static zwp_locked_pointer_v1 *locked_pointer;
 static bool capture_active;
 static bool queued_capture_active,cursor_visible_requested=true;
+static bool right_button_cursor;
+static bool cursor_inside;
+static unsigned cursor_update_source;
 static Uint32 raw_motion_event,capture_state_event;
 static float capture_x,capture_y;
+// This surface belongs to the GTK parent, independently of either game
+// presenter. Keep the same image over the focused game before, during and
+// after RMB; switching cursor representations on press causes visible changes.
+static wl_surface *capture_cursor_surface;
+static wl_subsurface *capture_cursor_subsurface;
+static wp_viewport *capture_cursor_viewport;
+static double cursor_anchor_x,cursor_anchor_y;
+static int capture_cursor_hot_x,capture_cursor_hot_y;
+static bool capture_cursor_mapped,capture_cursor_dirty=true;
+static double published_cursor_x,published_cursor_y;
+
+static wl_buffer *capture_cursor_buffer() {
+    if(cursor_pixels.empty() || cursor_width<1 || cursor_height<1)return nullptr;
+    // One transparent pixel on each side lets the viewport preserve a
+    // fractional image origin without scaling or clipping any cursor pixels.
+    int pad=cursor_viewporter?1:0;
+    int width=cursor_width+pad*2,height=cursor_height+pad*2;
+    int stride=width*4,size=stride*height;
+    int fd=memfd_create("roblox-capture-cursor",MFD_CLOEXEC);
+    if(fd<0)return nullptr;
+    if(ftruncate(fd,size)){close(fd);return nullptr;}
+    auto pixels=static_cast<unsigned char*>(mmap(nullptr,size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0));
+    if(pixels==MAP_FAILED){close(fd);return nullptr;}
+    for(int row=0;row<cursor_height;++row)
+        memcpy(pixels+(row+pad)*stride+pad*4,cursor_pixels.data()+row*cursor_pitch,cursor_width*4);
+    capture_cursor_hot_x=cursor_x;capture_cursor_hot_y=cursor_y;
+    auto pool=wl_shm_create_pool(cursor_shm,fd,size);
+    auto buffer=wl_shm_pool_create_buffer(pool,0,width,height,stride,WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);munmap(pixels,size);close(fd);
+    // Immutable per-image storage. The server owns the shared FD after the
+    // request and retains it until it has finished with this buffer.
+    static const wl_buffer_listener listener={[](void*,wl_buffer *buffer){wl_buffer_destroy(buffer);}};
+    wl_buffer_add_listener(buffer,&listener,nullptr);
+    return buffer;
+}
+static bool prepare_capture_cursor() {
+    if(!cursor_shm || !gtk_cursor)return false;
+    wl_buffer *buffer=nullptr;
+    if(!capture_cursor_mapped || capture_cursor_dirty) {
+        buffer=capture_cursor_buffer();if(!buffer)return capture_cursor_mapped;
+    }
+    if(!capture_cursor_surface) {
+        auto parent=gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window));
+        capture_cursor_surface=wl_compositor_create_surface(compositor);
+        auto empty=wl_compositor_create_region(compositor);
+        wl_surface_set_input_region(capture_cursor_surface,empty);wl_region_destroy(empty);
+        capture_cursor_subsurface=wl_subcompositor_get_subsurface(subcompositor,capture_cursor_surface,parent);
+        if(cursor_viewporter)capture_cursor_viewport=wp_viewporter_get_viewport(cursor_viewporter,capture_cursor_surface);
+        // Synchronized commits publish the cursor and its parent position
+        // together, without waiting for a game frame or a lock acknowledgement.
+    }
+    int x=0,y=0;gtk_widget_translate_coordinates(socket_view,window,0,0,&x,&y);
+    if(capture_cursor_viewport) {
+        // Rounding in window-local coordinates disagrees with native cursor
+        // placement when KWin places the window at a fractional screen origin.
+        // Keep the fraction in a 1:1 crop; let the compositor rasterize once.
+        double base_x=std::floor(cursor_anchor_x),base_y=std::floor(cursor_anchor_y);
+        wp_viewport_set_source(capture_cursor_viewport,
+            wl_fixed_from_double(1-(cursor_anchor_x-base_x)),wl_fixed_from_double(1-(cursor_anchor_y-base_y)),
+            wl_fixed_from_int(cursor_width+1),wl_fixed_from_int(cursor_height+1));
+        wp_viewport_set_destination(capture_cursor_viewport,cursor_width+1,cursor_height+1);
+        wl_subsurface_set_position(capture_cursor_subsurface,base_x+x-capture_cursor_hot_x,base_y+y-capture_cursor_hot_y);
+    } else wl_subsurface_set_position(capture_cursor_subsurface,
+        std::lround(cursor_anchor_x)+x-capture_cursor_hot_x,std::lround(cursor_anchor_y)+y-capture_cursor_hot_y);
+    if(buffer) {
+        wl_surface_attach(capture_cursor_surface,buffer,0,0);
+        wl_surface_damage(capture_cursor_surface,0,0,INT32_MAX,INT32_MAX);
+        capture_cursor_dirty=false;
+    }
+    return true;
+}
 // Commit the last anchor only while releasing the lock. Re-centering warps
 // during capture must stay local; committing every one stalls the compositor.
 template<class Hint,class Commit> static bool capture_release_hint(double x,double y,int offset_x,int offset_y,Hint hint,Commit commit) {
@@ -175,13 +253,64 @@ static void commit_capture_hint() {
         [](wl_fixed_t sx,wl_fixed_t sy){zwp_locked_pointer_v1_set_cursor_position_hint(locked_pointer,sx,sy);},
         [surface]{wl_surface_commit(surface);});
 }
-static bool capture_cursor_visible(){return cursor_visible_requested && !capture_active;}
+static bool capture_cursor_wanted(){return cursor_visible_requested && (cursor_inside || pointer_capture.requested || right_button_cursor) && pointer_capture.focused;}
+static bool capture_cursor_visible(){return cursor_visible_requested && !capture_cursor_mapped;}
+static GdkCursor *transparent_capture_cursor() {
+    static GdkCursor *cursor;
+    static int width,height,hot_x,hot_y;
+    int w=std::max(1,cursor_width),h=std::max(1,cursor_height);
+    int x=std::clamp(cursor_x,0,w-1),y=std::clamp(cursor_y,0,h-1);
+    if(cursor && width==w && height==h && hot_x==x && hot_y==y)return cursor;
+    auto image=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,w,h);
+    if(!image)return nullptr;
+    gdk_pixbuf_fill(image,0);
+    auto next=gdk_cursor_new_from_pixbuf(gdk_display_get_default(),image,x,y);
+    g_object_unref(image);
+    if(!next)return nullptr;
+    if(cursor)g_object_unref(cursor);
+    cursor=next;width=w;height=h;hot_x=x;hot_y=y;
+    return cursor;
+}
 static void update_capture_cursor(){
     auto target=gtk_widget_get_window(socket_view);
     if(!target)return;
-    auto blank=gdk_cursor_new_for_display(gdk_display_get_default(),GDK_BLANK_CURSOR);
-    gdk_window_set_cursor(target,capture_cursor_visible()?gtk_cursor:blank);
-    g_object_unref(blank);
+    bool wanted=capture_cursor_wanted();
+    if(wanted && capture_cursor_mapped && !capture_cursor_dirty &&
+       published_cursor_x==cursor_anchor_x && published_cursor_y==cursor_anchor_y)return;
+    bool mapped=wanted && prepare_capture_cursor();
+    if(!mapped && capture_cursor_mapped)wl_surface_attach(capture_cursor_surface,nullptr,0,0);
+    capture_cursor_mapped=mapped;
+    if(pointer_trace())g_printerr("POINTER cursor mapped=%d visible=%d anchor=%.2f,%.2f hot=%d,%d requested=%d active=%d\n",
+        mapped,cursor_visible_requested,cursor_anchor_x,cursor_anchor_y,capture_cursor_hot_x,capture_cursor_hot_y,pointer_capture.requested,capture_active);
+    // GTK sends wl_pointer.set_cursor (immediate hotspot) before committing
+    // its new image. GDK_BLANK_CURSOR resets the hotspot to 0,0 and can expose
+    // the previous image shifted down/right until the null buffer commit.
+    // Keep the hotspot unchanged while replacing those pixels with alpha zero.
+    auto blank=capture_cursor_visible()?nullptr:transparent_capture_cursor();
+    // A cursor-surface commit can take effect independently of its parent.
+    // Publish the replacement first on entry; restore native pixels first on
+    // exit. There must be no intermediate state with both cursors absent.
+    if(!mapped)gdk_window_set_cursor(target,blank?blank:gtk_cursor);
+    if(capture_cursor_surface) {
+        wl_surface_commit(capture_cursor_surface);
+        wl_surface_commit(gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window)));
+    }
+    if(mapped)gdk_window_set_cursor(target,blank?blank:gtk_cursor);
+    if(mapped){published_cursor_x=cursor_anchor_x;published_cursor_y=cursor_anchor_y;}
+    wl_display_flush(display);
+}
+static void queue_cursor_update() {
+    if(cursor_update_source)return;
+    cursor_update_source=g_idle_add([](void*)->int{
+        cursor_update_source=0;update_capture_cursor();return 0;
+    },nullptr);
+}
+static void track_cursor_position(double x,double y) {
+    cursor_inside=true;
+    // This only draws the cursor. Absolute events and camera deltas are left
+    // untouched, including the initial motions before Roblox requests capture.
+    if(pointer_capture.requested || right_button_cursor)return;
+    cursor_anchor_x=x;cursor_anchor_y=y;queue_cursor_update();
 }
 // Acknowledgments share the motion/button FIFO; the producer may already have
 // changed state again by the time an older event reaches poll_event.
@@ -220,8 +349,8 @@ static void apply_capture(const char *reason) {
         auto surface=gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window));
         locked_pointer=zwp_pointer_constraints_v1_lock_pointer(pointer_constraints,surface,pointer,nullptr,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
         static const zwp_locked_pointer_v1_listener lock_listener={
-            [](void*,zwp_locked_pointer_v1*){queue_capture_state(true);update_capture_cursor();if(pointer_trace())g_printerr("POINTER native locked\n");},
-            [](void*,zwp_locked_pointer_v1*){queue_capture_state(false);update_capture_cursor();if(pointer_trace())g_printerr("POINTER native unlocked\n");}
+            [](void*,zwp_locked_pointer_v1*){queue_capture_state(true);if(pointer_trace())g_printerr("POINTER native locked\n");},
+            [](void*,zwp_locked_pointer_v1*){queue_capture_state(false);if(pointer_trace())g_printerr("POINTER native unlocked\n");}
         };
         zwp_locked_pointer_v1_add_listener(locked_pointer,&lock_listener,nullptr);
         // Commit the parent surface after installing its pointer constraint.
@@ -244,6 +373,7 @@ static void apply_capture(const char *reason) {
 static void refresh_pointer_focus() {
     bool focused=game && !current && !pointer_closing && gtk_window_is_active(GTK_WINDOW(window)) && gtk_widget_get_visible(window);
     if(pointer_capture.focus(focused)) {
+        if(!focused)right_button_cursor=false;
         focus_changes.push_back(focused?RBX_WL_FOCUS:RBX_WL_BLUR);
         if(!focused)SDL_FlushEvent(raw_motion_event);
 #ifdef RBX_PROFILER
@@ -251,12 +381,17 @@ static void refresh_pointer_focus() {
 #endif
         if(pointer_trace())g_printerr("POINTER helper focus=%d browser=%d\n",focused,current!=nullptr);
         apply_capture("focus");
+        update_capture_cursor();
     }
 }
 
 static void registry_global(void*,wl_registry *registry,uint32_t name,const char *interface,uint32_t) {
     if(!strcmp(interface,wl_compositor_interface.name))
         compositor=(wl_compositor*)wl_registry_bind(registry,name,&wl_compositor_interface,1);
+    else if(!strcmp(interface,wl_shm_interface.name))
+        cursor_shm=(wl_shm*)wl_registry_bind(registry,name,&wl_shm_interface,1);
+    else if(!strcmp(interface,wp_viewporter_interface.name))
+        cursor_viewporter=(wp_viewporter*)wl_registry_bind(registry,name,&wp_viewporter_interface,1);
     else if(!strcmp(interface,wl_subcompositor_interface.name))
         subcompositor=(wl_subcompositor*)wl_registry_bind(registry,name,&wl_subcompositor_interface,1);
     else if(!strcmp(interface,zwp_relative_pointer_manager_v1_interface.name))
@@ -274,6 +409,7 @@ static void layout(GtkWidget*,GtkAllocation *allocation,gpointer) {
     vulkan_width=content_width;vulkan_height=content_height;
     SDL_SetWindowSize(game,content_width,content_height);
     if(egl_window)wl_egl_window_resize(egl_window,content_width,content_height,0,0);
+    if(capture_cursor_mapped){published_cursor_x=NAN;update_capture_cursor();}
 }
 static wl_callback *gl_handoff_callback;
 static wl_callback *vulkan_handoff_callback;
@@ -337,10 +473,12 @@ static void connect_pointer_input() {
     gtk_widget_add_events(socket_view,GDK_POINTER_MOTION_MASK|GDK_BUTTON_PRESS_MASK|GDK_BUTTON_RELEASE_MASK|GDK_SCROLL_MASK|GDK_SMOOTH_SCROLL_MASK|GDK_ENTER_NOTIFY_MASK|GDK_LEAVE_NOTIFY_MASK);
     g_signal_connect(socket_view,"motion-notify-event",G_CALLBACK(+[](GtkWidget*,GdkEventMotion *m,gpointer)->gboolean{
         if(current || !game)return FALSE;
+        if(pointer_trace())g_printerr("POINTER absolute x=%.2f y=%.2f active=%d\n",m->x,m->y,capture_active);
         SDL_Event e{};e.type=SDL_EVENT_MOUSE_MOTION;e.motion.windowID=SDL_GetWindowID(game);
         e.motion.x=m->x;e.motion.y=m->y;
         if(pointer_position_known){e.motion.xrel=m->x-pointer_x;e.motion.yrel=m->y-pointer_y;}
-        pointer_x=m->x;pointer_y=m->y;pointer_position_known=true;SDL_PushEvent(&e);return TRUE;
+        pointer_x=m->x;pointer_y=m->y;pointer_position_known=true;SDL_PushEvent(&e);
+        track_cursor_position(m->x,m->y);return TRUE;
     }),nullptr);
     auto button=+[](GtkWidget *widget,GdkEventButton *b,gpointer)->gboolean{
         if(current || !game)return FALSE;
@@ -352,6 +490,16 @@ static void connect_pointer_input() {
         // Wayland buttons reuse GTK's last motion coordinates; they cannot
         // validate an absolute baseline invalidated by a capture release hint.
         pointer_x=b->x;pointer_y=b->y;
+        cursor_inside=true;
+        if(b->button==3) {
+            // Visual only: Roblox requests capture after the first drag, too
+            // late to stop the native cursor's initial motion. Pin its image
+            // now; keep every original event and the engine's capture timing.
+            if(b->type==GDK_BUTTON_PRESS && !pointer_capture.requested) {
+                cursor_anchor_x=b->x;cursor_anchor_y=b->y;right_button_cursor=true;
+            } else if(b->type==GDK_BUTTON_RELEASE)right_button_cursor=false;
+            update_capture_cursor();
+        }
         SDL_PushEvent(&e);return TRUE;
     };
     g_signal_connect(socket_view,"button-press-event",G_CALLBACK(button),nullptr);
@@ -361,7 +509,18 @@ static void connect_pointer_input() {
         SDL_Event e{};translate_gtk_scroll(*s,e.wheel);e.wheel.windowID=SDL_GetWindowID(game);
         SDL_PushEvent(&e);return TRUE;
     }),nullptr);
-    g_signal_connect(socket_view,"leave-notify-event",G_CALLBACK(+[](GtkWidget*,GdkEventCrossing*,gpointer)->gboolean{pointer_position_known=false;return FALSE;}),nullptr);
+    g_signal_connect(socket_view,"enter-notify-event",G_CALLBACK(+[](GtkWidget*,GdkEventCrossing *e,gpointer)->gboolean{
+        track_cursor_position(e->x,e->y);return FALSE;
+    }),nullptr);
+    g_signal_connect(socket_view,"leave-notify-event",G_CALLBACK(+[](GtkWidget*,GdkEventCrossing*,gpointer)->gboolean{
+        pointer_position_known=false;cursor_inside=false;queue_cursor_update();return FALSE;
+    }),nullptr);
+    // An enter may precede signal installation during window creation. Read
+    // the current visual position without changing the input-delta baseline.
+    auto device=gdk_seat_get_pointer(gdk_display_get_default_seat(gdk_display_get_default()));
+    double x=0,y=0;
+    if(device && gdk_device_get_window_at_position_double(device,&x,&y)==gtk_widget_get_window(socket_view))
+        track_cursor_position(x,y);
 }
 // Keep the game widget at an exact pixel size; GTK can still enlarge the
 // surrounding window. Input coordinates remain local to this same widget.
@@ -441,6 +600,7 @@ static bool create_vulkan_surface() {
     vulkan_subsurface=wl_subcompositor_get_subsurface(subcompositor,vulkan_surface,parent);
     wl_subsurface_set_desync(vulkan_subsurface);
     wl_subsurface_place_above(vulkan_subsurface,sdl);
+    if(capture_cursor_subsurface)wl_subsurface_place_above(capture_cursor_subsurface,vulkan_surface);
     GtkAllocation allocation;gtk_widget_get_allocation(socket_view,&allocation);layout(socket_view,&allocation,nullptr);
     // Stacking and position are parent state: have GTK commit the parent.
     gtk_widget_queue_draw(window);
@@ -478,6 +638,7 @@ static void action(void*,int op,double x,double y,const char *text) {
         case RBX_WL_LOCK:
             refresh_pointer_focus();pointer_capture.request(x!=0);
             if(!x)commit_capture_hint();
+            update_capture_cursor();
             apply_capture("engine");
             if(pointer_trace())g_printerr("POINTER helper engine=%d accepted=%d pending=%d actual=%d\n",x!=0,pointer_capture.requested,locked_pointer!=nullptr,capture_active);
             break;
@@ -492,6 +653,12 @@ static void action(void*,int op,double x,double y,const char *text) {
         }
         case RBX_WL_MINIMIZE:gtk_window_iconify(GTK_WINDOW(window));break;
         case RBX_WL_CURSOR_VISIBLE:cursor_visible_requested=x!=0;update_capture_cursor();break;
+        case RBX_WL_CURSOR_ANCHOR:
+            if(!std::isfinite(x) || !std::isfinite(y))break;
+            if(pointer_trace())g_printerr("POINTER visual anchor x=%.2f y=%.2f\n",x,y);
+            cursor_anchor_x=x;cursor_anchor_y=y;
+            if(capture_cursor_mapped)update_capture_cursor();
+            break;
     }
 }
 static unsigned modifiers(SDL_Keymod m) {
@@ -659,7 +826,20 @@ static void generate_fallback_cursor(CursorKind kind,std::vector<uint32_t> &out,
         }
     }
 }
+static GdkCursor *native_image_cursor(const void *pixels,int w,int h,int pitch,int x,int y) {
+    // Cairo and wl_shm both use premultiplied native-endian ARGB32 (BGRA on
+    // x86_64). Avoid a lossy unpremultiply/re-premultiply of antialiased edges
+    // when switching between native and pinned representations of this image.
+    auto surface=cairo_image_surface_create_for_data(
+        const_cast<unsigned char*>(static_cast<const unsigned char*>(pixels)),CAIRO_FORMAT_ARGB32,w,h,pitch);
+    auto result=cairo_surface_status(surface)==CAIRO_STATUS_SUCCESS?
+        gdk_cursor_new_from_surface(gdk_display_get_default(),surface,x,y):nullptr;
+    // GDK copies the source into its own Wayland shared-memory cursor surface.
+    cairo_surface_destroy(surface);
+    return result;
+}
 static void cursor(const void *pixels,int w,int h,int pitch,int x,int y,const char *name) {
+    if(pointer_trace())g_printerr("POINTER cursor image name=%s size=%dx%d hot=%d,%d\n",name?name:"custom",w,h,x,y);
     auto kind=resolve_cursor_kind(name);
     auto spec=get_cursor_spec(kind);
     XcursorImage *theme=nullptr;
@@ -696,18 +876,12 @@ static void cursor(const void *pixels,int w,int h,int pitch,int x,int y,const ch
     auto dpy=gdk_display_get_default();
     if(dpy) {
         GdkCursor *next_gtk=nullptr;
-        if(name && spec.gdk_name)next_gtk=gdk_cursor_new_from_name(dpy,spec.gdk_name);
-        if(!next_gtk && pixels && w>0 && h>0 && w<=1024 && h<=1024) {
-            auto rgba=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,w,h);
-            auto dest=gdk_pixbuf_get_pixels(rgba);int stride=gdk_pixbuf_get_rowstride(rgba);
-            for(int row=0;row<h;++row)for(int col=0;col<w;++col){
-                const auto src=(const unsigned char*)pixels+row*pitch+col*4;auto d=dest+row*stride+col*4;
-                for(int ch=0;ch<3;++ch)d[ch]=src[3]?std::min(255,int(src[2-ch])*255/src[3]):0;
-                d[3]=src[3];
-            }
-            next_gtk=gdk_cursor_new_from_pixbuf(dpy,rgba,x,y);g_object_unref(rgba);
-        }
-        if(next_gtk){if(gtk_cursor)g_object_unref(gtk_cursor);gtk_cursor=next_gtk;update_capture_cursor();}
+        // Use the same pixels and hotspot for the native and pinned cursor.
+        // A separately resolved GTK theme cursor can have a different hotspot.
+        if(pixels && w>0 && h>0 && w<=1024 && h<=1024 && pitch>=w*4)
+            next_gtk=native_image_cursor(pixels,w,h,pitch,x,y);
+        if(!next_gtk && spec.gdk_name)next_gtk=gdk_cursor_new_from_name(dpy,spec.gdk_name);
+        if(next_gtk){if(gtk_cursor)g_object_unref(gtk_cursor);gtk_cursor=next_gtk;capture_cursor_dirty=true;update_capture_cursor();}
     }
     if(theme)XcursorImageDestroy(theme);
 }
@@ -886,7 +1060,7 @@ extern "C" const RbxWaylandAPI *rbx_wayland_api() {
     static RbxWaylandAPI api={native_display,
         [](int w,int h)->void*{return on_ui([=]{return create_window(w,h);});},native_surface,
         [](void *w,int op,double x,double y,const char *text){
-            if(op==RBX_WL_LOCK || op==RBX_WL_WARP || op==RBX_WL_CURSOR_VISIBLE)action_async(w,op,x,y);
+            if(op==RBX_WL_LOCK || op==RBX_WL_WARP || op==RBX_WL_CURSOR_VISIBLE || op==RBX_WL_CURSOR_ANCHOR)action_async(w,op,x,y);
             else on_ui([=]{action(w,op,x,y,text);});
         },
         [](RbxWaylandEvent *event)->int{return on_ui([=]{pump();return poll_event(event);});},

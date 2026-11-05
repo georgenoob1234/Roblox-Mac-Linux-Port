@@ -14,6 +14,28 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <dlfcn.h>
+#include <crt_externs.h>
+#include <unistd.h>
+
+extern const char *getprogname(void);
+
+/* Short-circuit background RobloxPlayerInstaller to prevent teardown SIGSEGV in mldr */
+__attribute__((constructor(101)))
+static void rbx_skip_background_installer(void) {
+    const char *prog = getprogname();
+    if (prog != NULL && strcmp(prog, "RobloxPlayerInstaller") == 0) {
+        _exit(0);
+    }
+
+    char ***argv_ptr = _NSGetArgv();
+    int *argc_ptr = _NSGetArgc();
+    if (argv_ptr != NULL && *argv_ptr != NULL && argc_ptr != NULL && *argc_ptr > 0) {
+        const char *arg0 = (*argv_ptr)[0];
+        if (arg0 != NULL && strstr(arg0, "RobloxPlayerInstaller") != NULL) {
+            _exit(0);
+        }
+    }
+}
 
 typedef struct { uint32_t platform, version; } TrackABuildVersion;
 typedef struct { unsigned major, minor, patch; } TrackASystemVersion;

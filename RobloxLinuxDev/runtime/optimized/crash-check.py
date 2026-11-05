@@ -2,6 +2,9 @@
 """Verify the fatal report with a tiny crashing probe, never RobloxPlayer."""
 import os,pathlib,resource,shlex,subprocess,tempfile
 here=pathlib.Path(__file__).resolve().parent;root=here.parent
+compat=(here/'compat.m').read_text()
+assert 'rbx_skip_background_installer' in compat and '"RobloxPlayerInstaller"' in compat, \
+    'compat.m lost the background RobloxPlayerInstaller short-circuit'
 out=pathlib.Path(os.environ.get('OUT',str(here))).resolve()
 state=pathlib.Path(tempfile.mkdtemp(prefix='rbx-crash-',dir='/tmp'));report=state/'fatal.log'
 guest='/Volumes/SystemRoot'

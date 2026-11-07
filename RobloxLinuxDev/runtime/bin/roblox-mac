@@ -465,6 +465,10 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$HL
 
 # SDL_VIDEODRIVER (wayland first, X11 fallback) was exported before the re-exec; unshare keeps env.
 export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-nvidia}
+# Prevent audio underruns and NVIDIA CPU busy-spin during heavy GPU load
+export PULSE_LATENCY_MSEC="${PULSE_LATENCY_MSEC:-45}"
+export PIPEWIRE_LATENCY="${PIPEWIRE_LATENCY:-2048/48000}"
+export __GL_YIELD="${__GL_YIELD:-USLEEP}"
 
 # X11 (Xwayland). Darling's AppKit is cocotron on X11. The X socket needs no mount work: the ELF
 # side of Darling runs in this namespace's own mount view, where the host's /tmp is untouched.

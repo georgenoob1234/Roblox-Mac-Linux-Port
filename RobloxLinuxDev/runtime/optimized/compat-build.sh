@@ -32,6 +32,8 @@ fi
 if [ "${1:-}" = --check ]; then
     build "$HERE/video-check.m" -o "$OUT/video-check"
     python3 "$HERE/video-check.py"
+    build -x c "$HERE/installer-probe.c" -o "$OUT/installer-probe"
+    python3 "$HERE/installer-check.py" "$OUT/installer-probe"
     build "$HERE/compat.m" -DTRACKA_COMPAT_CHECK -o "$OUT/compat-check"
     STATE=$(mktemp -d /tmp/rbx-compat.XXXXXX)
     COMMAND=$(python3 - "$OUT" "$ROOT" <<'PY'

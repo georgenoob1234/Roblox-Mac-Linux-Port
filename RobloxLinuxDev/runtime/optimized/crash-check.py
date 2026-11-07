@@ -3,7 +3,8 @@
 import os,pathlib,resource,shlex,subprocess,tempfile
 here=pathlib.Path(__file__).resolve().parent;root=here.parent
 compat=(here/'compat.m').read_text()
-assert 'rbx_skip_background_installer' in compat and '"RobloxPlayerInstaller"' in compat, \
+assert 'rbx_skip_background_installer' in compat and 'rbxIsBackgroundInstaller' in compat and \
+    '"RobloxPlayerInstaller"' in (here/'installer-skip.h').read_text(), \
     'compat.m lost the background RobloxPlayerInstaller short-circuit'
 out=pathlib.Path(os.environ.get('OUT',str(here))).resolve()
 state=pathlib.Path(tempfile.mkdtemp(prefix='rbx-crash-',dir='/tmp'));report=state/'fatal.log'

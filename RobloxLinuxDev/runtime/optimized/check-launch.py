@@ -42,4 +42,9 @@ with tempfile.TemporaryDirectory(prefix='launch-check-', dir=root/'logs') as tmp
     path.write_text('preserve this trace')
     result = subprocess.run([root/'bin/roblox-mac', '--frame-trace', path], capture_output=True)
     assert result.returncode and path.read_text() == 'preserve this trace'
-print('PASS: launcher syntax, place IDs, channel defaults/overrides, persistent client temp paths, quoted arguments, CPU affinity, FD limits and trace preservation')
+for default in ('export PULSE_LATENCY_MSEC="${PULSE_LATENCY_MSEC:-45}"',
+                'export PIPEWIRE_LATENCY="${PIPEWIRE_LATENCY:-2048/48000}"',
+                'export __GL_YIELD="${__GL_YIELD:-USLEEP}"'):
+    assert default in source, 'missing audio/GPU-yield launch default: ' + default
+    assert default in (root/'package/run.sh').read_text(), 'run.sh missing: ' + default
+print('PASS: launcher syntax, audio latency/GPU yield defaults, place IDs, channel defaults/overrides, persistent client temp paths, quoted arguments, CPU affinity, FD limits and trace preservation')

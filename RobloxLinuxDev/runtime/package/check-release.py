@@ -17,7 +17,8 @@ assert 'installer.py' in (Path(__file__).resolve().parents[3] / '.github/scripts
 update_source = (root / 'package/update-roblox.sh').read_text()
 assert 'ROBLOX_MAC_PROGRESS_FD' in update_source and 'ROBLOX_MAC_CANCEL_FILE' in update_source
 assert 'spv-cache-v1' in update_source and 'previous' in update_source
-env = {k: v for k, v in os.environ.items() if not k.startswith(('ROBLOX_', 'APPIMAGE', 'APPDIR', 'TRACKA_NATIVE_MEMORY'))}
+env = {k: v for k, v in os.environ.items() if not k.startswith(('ROBLOX_', 'APPIMAGE', 'APPDIR', 'TRACKA_NATIVE_MEMORY'))
+       and k not in ('PULSE_LATENCY_MSEC', 'PIPEWIRE_LATENCY', '__GL_YIELD')}
 with tempfile.TemporaryDirectory(prefix='roblox release ') as tmp:
     folder = Path(tmp)
     release = folder / 'RobloxLinux'
@@ -112,6 +113,8 @@ with tempfile.TemporaryDirectory(prefix='roblox release ') as tmp:
 set -eu
 [ "$APPIMAGELAUNCHER_DISABLE" = 1 ] && [ "$_FORCE_HEADLESS" = 1 ]
 [ "$TARGET_APPIMAGE" = "$0" ]
+# Audio headroom and NVIDIA yield defaults must reach every launch.
+[ "$PULSE_LATENCY_MSEC" = 45 ] && [ "$PIPEWIRE_LATENCY" = 2048/48000 ] && [ "$__GL_YIELD" = USLEEP ]
 # run.sh must hand every AppImage invocation a mount directory outside the
 # release folder, and so outside DO_NOT_SHARE: a FUSE mount below the data
 # directory makes the launch-time bind-mount fail with EINVAL.

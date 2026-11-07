@@ -107,6 +107,10 @@ export ROBLOX_MAC_NOTIFY_HOME=${HOME:-}
 export ROBLOX_MAC_HOST_HOME=${ROBLOX_MAC_HOST_HOME:-${HOME:-}}
 export ROBLOX_MAC_HOST_CONFIG=${ROBLOX_MAC_HOST_CONFIG:-${XDG_CONFIG_HOME:-${HOME:-}/.config}}
 export ROBLOX_MAC_HOST_DATA_DIRS=${ROBLOX_MAC_HOST_DATA_DIRS:-${XDG_DATA_DIRS:-/usr/local/share:/usr/share}}
+# Prevent audio underruns and NVIDIA CPU busy-spin during heavy GPU load
+export PULSE_LATENCY_MSEC="${PULSE_LATENCY_MSEC:-45}"
+export PIPEWIRE_LATENCY="${PIPEWIRE_LATENCY:-2048/48000}"
+export __GL_YIELD="${__GL_YIELD:-USLEEP}"
 [ -f "$HERE/icon.png" ] && export ROBLOX_MAC_ICON_PATH=${ROBLOX_MAC_ICON_PATH:-$HERE/icon.png}
 # >>> update transaction recovery (must stay byte-identical in bootstrap.sh
 # and run.sh; check-update-recovery.py compares the marked blocks) >>>

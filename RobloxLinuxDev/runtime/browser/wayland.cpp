@@ -186,8 +186,26 @@ static void keyboard_modifiers(void*,wl_keyboard*,uint32_t,uint32_t depressed,ui
     keyboard_physical=physical;keyboard_known=true;
     if(stale)reset_keyboard_state();
 }
+// wl_keyboard v4+ always sends repeat_info. libwayland wl_abort()s on an event
+// whose listener slot is NULL, so fill every slot; SDL's keyboard owns repeat.
+static void keyboard_repeat_info(void*,wl_keyboard*,int32_t,int32_t) {}
 static const wl_keyboard_listener keyboard_listener={
-    keyboard_keymap,keyboard_enter,keyboard_leave,keyboard_key,keyboard_modifiers,nullptr};
+    keyboard_keymap,keyboard_enter,keyboard_leave,keyboard_key,keyboard_modifiers,keyboard_repeat_info};
+// Ask for the keyboard only once the seat advertises one, and drop it when it
+// goes away. Every slot must be filled: libwayland aborts on a NULL listener.
+static void seat_capabilities(void*,wl_seat *seat,uint32_t capabilities) {
+    bool has=capabilities&WL_SEAT_CAPABILITY_KEYBOARD;
+    if(has && !keyboard_device) {
+        keyboard_device=wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(keyboard_device,&keyboard_listener,nullptr);
+    } else if(!has && keyboard_device) {
+        if(wl_keyboard_get_version(keyboard_device)>=WL_KEYBOARD_RELEASE_SINCE_VERSION)wl_keyboard_release(keyboard_device);
+        else wl_keyboard_destroy(keyboard_device);
+        keyboard_device=nullptr;keyboard_known=false;keyboard_physical=0;
+    }
+}
+static void seat_name(void*,wl_seat*,const char*) {}
+static const wl_seat_listener seat_listener={seat_capabilities,seat_name};
 static bool pointer_trace() {
     static bool enabled=g_strcmp0(g_getenv("ROBLOX_MAC_POINTER_TRACE"),"1")==0;
     return enabled;
@@ -454,8 +472,7 @@ static void registry_global(void*,wl_registry *registry,uint32_t name,const char
         // A second keyboard on the same seat is read-only: SDL keeps its own
         // for input, this one tells us what the compositor considers held.
         keyboard_seat=(wl_seat*)wl_registry_bind(registry,name,&wl_seat_interface,version<5?version:5);
-        keyboard_device=wl_seat_get_keyboard(keyboard_seat);
-        wl_keyboard_add_listener(keyboard_device,&keyboard_listener,nullptr);
+        wl_seat_add_listener(keyboard_seat,&seat_listener,nullptr);
     }
     else if(!strcmp(interface,wp_viewporter_interface.name))
         cursor_viewporter=(wp_viewporter*)wl_registry_bind(registry,name,&wp_viewporter_interface,1);

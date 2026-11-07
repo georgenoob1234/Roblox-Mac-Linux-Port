@@ -303,6 +303,15 @@ int main() {
     push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_1,'1',SDL_KMOD_GUI);
     assert(poll_event(&key_event)==1 && key_event.modifiers==0 && key_event.shortcut==RBX_WL_EDIT_NONE);
 
+    // libwayland wl_abort()s when an event arrives for a NULL listener slot, and
+    // compositors always send wl_keyboard.repeat_info (v4+) and wl_seat.name (v2+).
+    {
+        void *const *keyboard_slots=reinterpret_cast<void *const*>(&keyboard_listener);
+        for(size_t i=0;i<sizeof(keyboard_listener)/sizeof(void*);++i)assert(keyboard_slots[i]);
+        void *const *seat_slots=reinterpret_cast<void *const*>(&seat_listener);
+        for(size_t i=0;i<sizeof(seat_listener)/sizeof(void*);++i)assert(seat_slots[i]);
+    }
+
     // AltGr is Mod5 on most layouts. A held, unmapped-to-Mod1 modifier must not
     // be mistaken for the compositor's reset.
     keyboard_known=true;keyboard_physical=0;

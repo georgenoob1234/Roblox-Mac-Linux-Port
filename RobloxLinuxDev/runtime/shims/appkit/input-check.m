@@ -240,6 +240,13 @@ int main(void) {
     expect(rbxWaylandModifierBitForKey(RBX_EVDEV_KEY_LEFTMETA)==RBX_WL_MOD_COMMAND,"Super maps to Command");
     expect(rbxWaylandModifierBitForKey(RBX_EVDEV_KEY_LEFTCTRL)==RBX_WL_MOD_CONTROL,"Ctrl maps to Control");
     expect(rbxWaylandModifiersFromDepressed((1u<<6)|(1u<<3))==(RBX_WL_MOD_COMMAND|RBX_WL_MOD_ALTERNATE),"xkb Mod4/Mod1 map to Command/Option");
+    expect(rbxWaylandModifiersFromDepressed(1u<<7)==RBX_WL_MOD_ALTERNATE,"xkb Mod5 (AltGr) maps to Option");
+    {
+        unsigned engine=0;
+        expect(rbxWaylandKeyEventDropped(&engine,RBX_WL_MOD_COMMAND,1)==0,"modifier key down releases nothing");
+        expect(rbxWaylandKeyEventDropped(&engine,0,0)==RBX_WL_MOD_COMMAND,"swallowed Command is released before the next key");
+        expect(rbxWaylandKeyEventDropped(&engine,0,0)==0,"a release is posted once");
+    }
     expect(macKey(30)==0x12,"SDL key 1 is kVK_ANSI_1");
     expect(rbxWaylandEditAction(30,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_NONE,"Ctrl+1 is not an editing chord");
     expect(rbxWaylandEditAction(30,RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_NONE,"Cmd+1 is never remapped");

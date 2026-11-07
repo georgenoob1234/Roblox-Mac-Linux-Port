@@ -54,12 +54,13 @@ static inline unsigned rbxWaylandModifierBitForScancode(unsigned scan) {
 }
 
 // xkb modifier indices as used by wl_keyboard.modifiers: Shift, Control,
-// Mod1 (Alt) and Mod4 (Super). Lock (Caps) is a lock, not a held modifier.
+// Mod1 (Alt), Mod4 (Super) and Mod5 (ISO_Level3_Shift, i.e. AltGr on most
+// non-US layouts). Lock (Caps) is a lock, not a held modifier.
 static inline unsigned rbxWaylandModifiersFromDepressed(unsigned depressed) {
     unsigned bits = 0;
     if (depressed & (1u << 0)) bits |= RBX_WL_MOD_SHIFT;
     if (depressed & (1u << 2)) bits |= RBX_WL_MOD_CONTROL;
-    if (depressed & (1u << 3)) bits |= RBX_WL_MOD_ALTERNATE;
+    if (depressed & ((1u << 3) | (1u << 7))) bits |= RBX_WL_MOD_ALTERNATE;
     if (depressed & (1u << 6)) bits |= RBX_WL_MOD_COMMAND;
     return bits;
 }
@@ -77,6 +78,16 @@ static inline unsigned rbxWaylandReconcileModifiers(unsigned reported, unsigned 
 static inline unsigned rbxWaylandDroppedModifiers(unsigned previous, unsigned current) {
     return previous & ~current &
         (RBX_WL_MOD_SHIFT | RBX_WL_MOD_CONTROL | RBX_WL_MOD_ALTERNATE | RBX_WL_MOD_COMMAND);
+}
+
+// Key-path bookkeeping for the AppKit shim. `engineFlags` holds the modifier
+// flags the engine last saw on a *key* event; mouse events must not touch it.
+// Returns the modifiers to release before a non-modifier key, then records
+// `current` as what the engine now believes.
+static inline unsigned rbxWaylandKeyEventDropped(unsigned *engineFlags, unsigned current, int isModifierKey) {
+    unsigned dropped = isModifierKey ? 0 : rbxWaylandDroppedModifiers(*engineFlags, current);
+    *engineFlags = current;
+    return dropped;
 }
 
 #endif

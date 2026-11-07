@@ -135,6 +135,10 @@ static void drawThemeFrame(id view,SEL selector,NSRect rect) {
 static NSPoint pointer,anchor,rightPressPoint;
 static RbxRightDragAnchor rightDragAnchor;
 static unsigned modifiers,buttons;
+// Modifier flags the engine last saw on a key event. Mouse events also carry
+// flags, so comparing against `modifiers` would hide a drop that happened
+// during a mouse move.
+static unsigned engineKeyModifiers;
 // Key-down state used to end every held key when focus moves. Without this a
 // swallowed modifier release leaves the engine's InputObject down, and the
 // next gameplay key looks like a Command chord (Roblox Capture is Command+1).
@@ -689,7 +693,7 @@ static BOOL isLegacyCursorAppearance(void) {
     struct RbxWaylandEvent e;
     for(unsigned i=0;i<512 && pollInput(&e,[queue count]!=0);i++) {
         if(!gameWindow)continue;NSWindow *window=gameWindow->owner;
-        unsigned previousModifiers=modifiers;modifiers=e.modifiers;
+        modifiers=e.modifiers;
         if(e.type==RBX_WL_RESIZE) {
             NSRect frame=NSMakeRect(0,0,e.x,e.y);gameWindow->frame=frame;
             [gameWindow->bitmap release];gameWindow->bitmap=nil;
@@ -706,7 +710,8 @@ static BOOL isLegacyCursorAppearance(void) {
             // Same rule for the keyboard: a compositor shortcut can take focus
             // before the modifier release arrives. Tell the engine every held
             // key is up so the next gameplay key cannot inherit Command+1.
-            unsigned heldModifiers=modifiers&(RBX_WL_MOD_SHIFT|RBX_WL_MOD_CONTROL|RBX_WL_MOD_ALTERNATE|RBX_WL_MOD_COMMAND);
+            unsigned heldModifiers=engineKeyModifiers&(RBX_WL_MOD_SHIFT|RBX_WL_MOD_CONTROL|RBX_WL_MOD_ALTERNATE|RBX_WL_MOD_COMMAND);
+            engineKeyModifiers=0;
             for(unsigned scan=224;scan<=231;scan++)
                 if(waylandKeysDown[scan>>3]&(1u<<(scan&7)))heldModifiers|=rbxWaylandModifierBitForScancode(scan);
             postModifierReleases(self,heldModifiers,position,windowNumber);
@@ -732,10 +737,8 @@ static BOOL isLegacyCursorAppearance(void) {
             // A modifier present on the previous event but gone from this one
             // had its release swallowed. Deliver that release before the key,
             // or the engine keeps the scancode latched as an InputObject.
-            if(e.key<224 || e.key>231) {
-                unsigned dropped=(unsigned)rbxWaylandDroppedModifiers(previousModifiers,modifiers);
-                if(dropped)postModifierReleases(self,dropped,[self mouseLocation],[window windowNumber]);
-            }
+            unsigned dropped=rbxWaylandKeyEventDropped(&engineKeyModifiers,modifiers,e.key>=224 && e.key<=231);
+            if(dropped)postModifierReleases(self,dropped,[self mouseLocation],[window windowNumber]);
             if(pointerTrace() && e.key>=224)fprintf(stderr,"POINTER modifier key=%u down=%d flags=%u\n",e.key,e.type==RBX_WL_KEY_DOWN,modifiers);
             int action=e.shortcut?e.shortcut:rbxWaylandEditAction(e.key,e.modifiers);
             NSString *plain=[NSString stringWithUTF8String:e.text];

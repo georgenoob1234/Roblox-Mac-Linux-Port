@@ -180,7 +180,9 @@ static void keyboard_modifiers(void*,wl_keyboard*,uint32_t,uint32_t depressed,ui
     unsigned physical=rbxWaylandModifiersFromDepressed(depressed);
     // A modifiers event with nothing depressed is the compositor's reset. If
     // we still track a held modifier, SDL is the stale side; clear it too.
-    bool stale=keyboard_known && physical==0 && keyboard_physical!=0;
+    // Test the raw mask: a depressed modifier we do not map (e.g. a custom
+    // xkb Level3/Level5 shift) is still a held key, not a compositor reset.
+    bool stale=keyboard_known && depressed==0 && keyboard_physical!=0;
     keyboard_physical=physical;keyboard_known=true;
     if(stale)reset_keyboard_state();
 }

@@ -303,6 +303,28 @@ int main() {
     push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_1,'1',SDL_KMOD_GUI);
     assert(poll_event(&key_event)==1 && key_event.modifiers==0 && key_event.shortcut==RBX_WL_EDIT_NONE);
 
+    // AltGr is Mod5 on most layouts. A held, unmapped-to-Mod1 modifier must not
+    // be mistaken for the compositor's reset.
+    keyboard_known=true;keyboard_physical=0;
+    keyboard_key(nullptr,nullptr,0,0,RBX_EVDEV_KEY_RIGHTALT,WL_KEYBOARD_KEY_STATE_PRESSED);
+    keyboard_modifiers(nullptr,nullptr,0,1u<<7,0,0,0);
+    assert(keyboard_physical==RBX_WL_MOD_ALTERNATE);
+    keyboard_key(nullptr,nullptr,0,0,RBX_EVDEV_KEY_RIGHTALT,WL_KEYBOARD_KEY_STATE_RELEASED);
+    keyboard_modifiers(nullptr,nullptr,0,0,0,0,0);
+    assert(keyboard_physical==0);
+
+    {   // Super down, then a mouse move reports no Command (release swallowed): the
+        // next key must still get the release, because mouse events never update
+        // the engine's key-flag record.
+        unsigned engine=0;
+        assert(rbxWaylandKeyEventDropped(&engine,RBX_WL_MOD_COMMAND,1)==0);
+        assert(rbxWaylandKeyEventDropped(&engine,0,0)==RBX_WL_MOD_COMMAND);
+        assert(rbxWaylandKeyEventDropped(&engine,0,0)==0); // released once only
+        engine=RBX_WL_MOD_CONTROL;
+        assert(rbxWaylandKeyEventDropped(&engine,0,1)==0); // a modifier's own event is not double-released
+        assert(engine==0);
+    }
+
     // Overlapping Ctrl and Super presses/releases end clean before 1. Queue the
     // whole chord first: SDL hides a push that lands between two polls.
     keyboard_known=true;keyboard_physical=0;reset_queue();

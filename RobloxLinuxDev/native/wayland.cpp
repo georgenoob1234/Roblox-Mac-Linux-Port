@@ -263,6 +263,60 @@ int main() {
     push_key(SDL_EVENT_KEY_UP,SDL_SCANCODE_V,'v',SDL_KMOD_CTRL);
     assert(poll_event(&key_event)==1 && key_event.type==RBX_WL_KEY_UP);
     assert(key_event.shortcut==RBX_WL_EDIT_PASTE && !strcmp(key_event.text,"v"));
+
+    // A modifier release swallowed by the compositor must not leak Command or
+    // Control into the next gameplay key (Roblox Capture is Command+1).
+    assert(rbxWaylandReconcileModifiers(RBX_WL_MOD_COMMAND,0,1)==0);
+    assert(rbxWaylandReconcileModifiers(RBX_WL_MOD_COMMAND|RBX_WL_MOD_CAPS,0,1)==RBX_WL_MOD_CAPS);
+    assert(rbxWaylandReconcileModifiers(RBX_WL_MOD_COMMAND,RBX_WL_MOD_COMMAND,1)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandReconcileModifiers(RBX_WL_MOD_COMMAND|RBX_WL_MOD_CONTROL,RBX_WL_MOD_CONTROL,1)==RBX_WL_MOD_CONTROL);
+    assert(rbxWaylandReconcileModifiers(RBX_WL_MOD_COMMAND,0,0)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandModifierBitForKey(RBX_EVDEV_KEY_LEFTCTRL)==RBX_WL_MOD_CONTROL);
+    assert(rbxWaylandModifierBitForKey(RBX_EVDEV_KEY_LEFTMETA)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandModifierBitForKey(RBX_EVDEV_KEY_RIGHTALT)==RBX_WL_MOD_ALTERNATE);
+    assert(rbxWaylandModifierBitForKey(RBX_EVDEV_KEY_LEFTSHIFT)==RBX_WL_MOD_SHIFT);
+    assert(rbxWaylandModifierBitForScancode(SDL_SCANCODE_LGUI)==RBX_WL_MOD_COMMAND);
+    assert(rbxWaylandModifierBitForScancode(SDL_SCANCODE_1)==0);
+    assert(rbxWaylandModifiersFromDepressed((1u<<6)|(1u<<2))==(RBX_WL_MOD_COMMAND|RBX_WL_MOD_CONTROL));
+
+    // No physical modifier, but SDL still reports GUI: plain 1, no Capture chord.
+    keyboard_known=true;keyboard_physical=0;reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_1,'1',SDL_KMOD_GUI);
+    assert(poll_event(&key_event)==1 && key_event.type==RBX_WL_KEY_DOWN);
+    assert(key_event.key==SDL_SCANCODE_1 && key_event.modifiers==0 && key_event.shortcut==RBX_WL_EDIT_NONE);
+
+    // Ctrl+1 stays Ctrl+1; number keys never become the engine's Command chord.
+    keyboard_physical=RBX_WL_MOD_CONTROL;reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_1,'1',SDL_KMOD_CTRL);
+    assert(poll_event(&key_event)==1 && key_event.modifiers==RBX_WL_MOD_CONTROL);
+    assert(key_event.shortcut==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_1,RBX_WL_MOD_CONTROL)==RBX_WL_EDIT_NONE);
+    assert(rbxWaylandEditAction(SDL_SCANCODE_1,RBX_WL_MOD_COMMAND)==RBX_WL_EDIT_NONE);
+
+    // Super down, then the compositor's modifiers(0) with no key-up at all.
+    keyboard_known=true;keyboard_physical=0;reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_LGUI,0,SDL_KMOD_GUI);
+    assert(poll_event(&key_event)==1 && (key_event.modifiers&RBX_WL_MOD_COMMAND));
+    keyboard_modifiers(nullptr,nullptr,0,0,0,0,0);
+    assert(keyboard_physical==0);
+    reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_1,'1',SDL_KMOD_GUI);
+    assert(poll_event(&key_event)==1 && key_event.modifiers==0 && key_event.shortcut==RBX_WL_EDIT_NONE);
+
+    // Overlapping Ctrl and Super presses/releases end clean before 1. Queue the
+    // whole chord first: SDL hides a push that lands between two polls.
+    keyboard_known=true;keyboard_physical=0;reset_queue();
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_LCTRL,0,SDL_KMOD_CTRL);
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_LGUI,0,SDL_KMOD_CTRL|SDL_KMOD_GUI);
+    push_key(SDL_EVENT_KEY_UP,SDL_SCANCODE_LCTRL,0,SDL_KMOD_GUI);
+    push_key(SDL_EVENT_KEY_UP,SDL_SCANCODE_LGUI,0,0);
+    push_key(SDL_EVENT_KEY_DOWN,SDL_SCANCODE_1,'1',SDL_KMOD_CTRL|SDL_KMOD_GUI);
+    assert(poll_event(&key_event)==1 && (key_event.modifiers&RBX_WL_MOD_CONTROL));
+    assert(poll_event(&key_event)==1 &&
+        (key_event.modifiers&(RBX_WL_MOD_CONTROL|RBX_WL_MOD_COMMAND))==(RBX_WL_MOD_CONTROL|RBX_WL_MOD_COMMAND));
+    assert(poll_event(&key_event)==1 && (key_event.modifiers&RBX_WL_MOD_COMMAND) && !(key_event.modifiers&RBX_WL_MOD_CONTROL));
+    assert(poll_event(&key_event)==1 && !(key_event.modifiers&(RBX_WL_MOD_CONTROL|RBX_WL_MOD_COMMAND)));
+    assert(poll_event(&key_event)==1 && key_event.modifiers==0 && key_event.shortcut==RBX_WL_EDIT_NONE);
     game=nullptr;
     // Event delivery and label lookup must use the same physical key mapping.
     for(unsigned scan=1;scan<SDL_SCANCODE_COUNT;++scan)

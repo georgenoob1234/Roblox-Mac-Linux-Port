@@ -15,6 +15,7 @@ enum RbxWaylandEditAction {
 };
 
 enum {
+    RBX_WL_MOD_CAPS = 1u << 16,
     RBX_WL_MOD_SHIFT = 1u << 17,
     RBX_WL_MOD_CONTROL = 1u << 18,
     RBX_WL_MOD_ALTERNATE = 1u << 19,

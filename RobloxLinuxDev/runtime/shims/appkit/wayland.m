@@ -69,6 +69,7 @@ extern int CGLRegisterNativeDisplay(void*);
 #include "../../browser/wayland-api.h"
 #include "../../browser/keyboard-map.h"
 #include "../../browser/keyboard-shortcut.h"
+#include "../../browser/keyboard-modifier-state.h"
 #include "../../browser/right-drag-anchor.h"
 #include "pasteboard-encoding.h"
 
@@ -134,6 +135,15 @@ static void drawThemeFrame(id view,SEL selector,NSRect rect) {
 static NSPoint pointer,anchor,rightPressPoint;
 static RbxRightDragAnchor rightDragAnchor;
 static unsigned modifiers,buttons;
+// Key-down state used to end every held key when focus moves. Without this a
+// swallowed modifier release leaves the engine's InputObject down, and the
+// next gameplay key looks like a Command chord (Roblox Capture is Command+1).
+static unsigned char waylandKeysDown[64];
+static void rememberWaylandKey(unsigned scan,BOOL down) {
+    if(scan>=512)return;
+    if(down)waylandKeysDown[scan>>3]|=1u<<(scan&7);
+    else waylandKeysDown[scan>>3]&=~(1u<<(scan&7));
+}
 static BOOL locked,focused,captureWanted,captureSuspended;
 static BOOL cursorVisible=YES;
 static unsigned cursorTrackingDirty,cursorVisibilityRequest;
@@ -520,6 +530,27 @@ void rbxWaylandSendEngineChord(id engine,unsigned short key,NSString *plain,NSUI
     [engine handleKeyEvent:up];
     if(modifiers)[engine handleModifiers:55 newModifierFlags:(unsigned)restore];
 }
+// One flagsChanged per held modifier, each clearing its own bit. The engine
+// identifies the modifier by keyCode, so an aggregate event is not enough when
+// Command and Control are latched together.
+static void postModifierReleases(id display,NSUInteger flags,NSPoint location,NSInteger windowNumber) {
+    static const unsigned short keys[]={55,59,58,56}; // kVK_Command, Control, Option, Shift
+    static const NSUInteger bits[]={RBX_WL_MOD_COMMAND,RBX_WL_MOD_CONTROL,RBX_WL_MOD_ALTERNATE,RBX_WL_MOD_SHIFT};
+    for(unsigned i=0;i<4;i++)if(flags&bits[i]) {
+        flags&=~bits[i];
+        [display postEvent:[NSEvent keyEventWithType:NSFlagsChanged location:location modifierFlags:flags timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:windowNumber context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:keys[i]] atStart:NO];
+    }
+}
+static void releaseHeldWaylandKeys(id display,NSPoint location,NSInteger windowNumber) {
+    for(unsigned scan=0;scan<512;scan++) {
+        if(!(waylandKeysDown[scan>>3]&(1u<<(scan&7))))continue;
+        if(scan>=224 && scan<=231)continue; // Modifiers travel as flagsChanged.
+        unsigned short key=macKey(scan);
+        if(key==0xffff)continue;
+        [display postEvent:[NSEvent keyEventWithType:NSKeyUp location:location modifierFlags:0 timestamp:[NSDate timeIntervalSinceReferenceDate] windowNumber:windowNumber context:nil characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO keyCode:key] atStart:NO];
+    }
+    memset(waylandKeysDown,0,sizeof(waylandKeysDown));
+}
 static BOOL textShortcutSwallowed[512];
 @implementation RbxWaylandDisplay
 + (void)initialize {
@@ -657,7 +688,8 @@ static BOOL isLegacyCursorAppearance(void) {
     id queue=object_getIvar(self,class_getInstanceVariable([NSDisplay class],"_eventQueue"));
     struct RbxWaylandEvent e;
     for(unsigned i=0;i<512 && pollInput(&e,[queue count]!=0);i++) {
-        if(!gameWindow)continue;NSWindow *window=gameWindow->owner;modifiers=e.modifiers;
+        if(!gameWindow)continue;NSWindow *window=gameWindow->owner;
+        unsigned previousModifiers=modifiers;modifiers=e.modifiers;
         if(e.type==RBX_WL_RESIZE) {
             NSRect frame=NSMakeRect(0,0,e.x,e.y);gameWindow->frame=frame;
             [gameWindow->bitmap release];gameWindow->bitmap=nil;
@@ -670,6 +702,15 @@ static BOOL isLegacyCursorAppearance(void) {
             // held buttons through normal window dispatch before deactivation; a
             // queued release could otherwise run after focus has already returned.
             NSPoint position=[gameWindow transformPoint:locked?anchor:pointer];
+            NSInteger windowNumber=[window windowNumber];
+            // Same rule for the keyboard: a compositor shortcut can take focus
+            // before the modifier release arrives. Tell the engine every held
+            // key is up so the next gameplay key cannot inherit Command+1.
+            unsigned heldModifiers=modifiers&(RBX_WL_MOD_SHIFT|RBX_WL_MOD_CONTROL|RBX_WL_MOD_ALTERNATE|RBX_WL_MOD_COMMAND);
+            for(unsigned scan=224;scan<=231;scan++)
+                if(waylandKeysDown[scan>>3]&(1u<<(scan&7)))heldModifiers|=rbxWaylandModifierBitForScancode(scan);
+            postModifierReleases(self,heldModifiers,position,windowNumber);
+            releaseHeldWaylandKeys(self,position,windowNumber);
             unsigned held=buttons;captureFocus(NO);
             for(unsigned button=1;button<32;button++)if(held&(1u<<button)) {
                 NSEventType type=button==1?NSLeftMouseUp:button==3?NSRightMouseUp:NSOtherMouseUp;
@@ -687,6 +728,14 @@ static BOOL isLegacyCursorAppearance(void) {
         if(e.type==RBX_WL_KEY_DOWN || e.type==RBX_WL_KEY_UP) {
             unsigned short key=macKey(e.key);if(key==0xffff)continue;
             if((e.key>=83 && e.key<=99) || e.key==103)modifiers|=1u<<21; // NSNumericPadKeyMask
+            if(e.key<512)rememberWaylandKey(e.key,e.type==RBX_WL_KEY_DOWN);
+            // A modifier present on the previous event but gone from this one
+            // had its release swallowed. Deliver that release before the key,
+            // or the engine keeps the scancode latched as an InputObject.
+            if(e.key<224 || e.key>231) {
+                unsigned dropped=(unsigned)rbxWaylandDroppedModifiers(previousModifiers,modifiers);
+                if(dropped)postModifierReleases(self,dropped,[self mouseLocation],[window windowNumber]);
+            }
             if(pointerTrace() && e.key>=224)fprintf(stderr,"POINTER modifier key=%u down=%d flags=%u\n",e.key,e.type==RBX_WL_KEY_DOWN,modifiers);
             int action=e.shortcut?e.shortcut:rbxWaylandEditAction(e.key,e.modifiers);
             NSString *plain=[NSString stringWithUTF8String:e.text];

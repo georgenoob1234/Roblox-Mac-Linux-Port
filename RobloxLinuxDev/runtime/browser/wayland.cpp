@@ -6,6 +6,7 @@
 #undef main
 #include "wayland-api.h"
 #include "keyboard-shortcut.h"
+#include "keyboard-modifier-state.h"
 #include <SDL3/SDL.h>
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL_main.h>
@@ -135,6 +136,58 @@ struct PointerCapture {
 };
 static PointerCapture pointer_capture;
 static std::deque<int> focus_changes;
+// Wayland is the authority for held modifiers. A compositor shortcut (Super
+// opening the overview, a grabbed Ctrl chord) can take keyboard focus before
+// the modifier's release reaches this client, leaving SDL's modifier mask
+// latched. Every later key would then look like a Command chord to Roblox,
+// turning gameplay key 1 into its Capture hotkey.
+static wl_seat *keyboard_seat;
+static wl_keyboard *keyboard_device;
+static unsigned keyboard_physical;
+static bool keyboard_known;
+static void reset_keyboard_state() {
+    if(!SDL_WasInit(SDL_INIT_VIDEO))return;
+    // Generates key-up events for everything SDL still believes is held, so
+    // the guest sees the end of the modifier instead of a phantom press.
+    SDL_ResetKeyboard();
+    SDL_SetModState(SDL_KMOD_NONE);
+    keyboard_physical=0;
+}
+static void keyboard_keymap(void*,wl_keyboard*,uint32_t,int32_t fd,uint32_t) {
+    if(fd>=0)close(fd); // SDL owns the real keymap; this listener only tracks modifiers.
+}
+static void keyboard_enter(void*,wl_keyboard*,uint32_t,wl_surface*,wl_array *keys) {
+    keyboard_physical=0;keyboard_known=true;
+    if(keys) {
+        const uint32_t *key=static_cast<const uint32_t*>(keys->data);
+        for(unsigned i=0;i<keys->size/sizeof(*key);i++)
+            keyboard_physical|=rbxWaylandModifierBitForKey(key[i]);
+    }
+}
+static void keyboard_leave(void*,wl_keyboard*,uint32_t,wl_surface*) {
+    bool stale=keyboard_physical!=0 || SDL_GetModState()!=SDL_KMOD_NONE;
+    keyboard_physical=0;keyboard_known=true;
+    if(stale)reset_keyboard_state();
+}
+static void keyboard_key(void*,wl_keyboard*,uint32_t,uint32_t,uint32_t key,uint32_t state) {
+    unsigned bit=rbxWaylandModifierBitForKey(key);
+    if(!bit)return;
+    keyboard_known=true;
+    if(state==WL_KEYBOARD_KEY_STATE_PRESSED)keyboard_physical|=bit;
+    else keyboard_physical&=~bit;
+}
+static void keyboard_modifiers(void*,wl_keyboard*,uint32_t,uint32_t depressed,uint32_t,uint32_t,uint32_t) {
+    unsigned physical=rbxWaylandModifiersFromDepressed(depressed);
+    // A modifiers event with nothing depressed is the compositor's reset. If
+    // we still track a held modifier, SDL is the stale side; clear it too.
+    // Test the raw mask: a depressed modifier we do not map (e.g. a custom
+    // xkb Level3/Level5 shift) is still a held key, not a compositor reset.
+    bool stale=keyboard_known && depressed==0 && keyboard_physical!=0;
+    keyboard_physical=physical;keyboard_known=true;
+    if(stale)reset_keyboard_state();
+}
+static const wl_keyboard_listener keyboard_listener={
+    keyboard_keymap,keyboard_enter,keyboard_leave,keyboard_key,keyboard_modifiers,nullptr};
 static bool pointer_trace() {
     static bool enabled=g_strcmp0(g_getenv("ROBLOX_MAC_POINTER_TRACE"),"1")==0;
     return enabled;
@@ -374,8 +427,15 @@ static void refresh_pointer_focus() {
     bool focused=game && !current && !pointer_closing && gtk_window_is_active(GTK_WINDOW(window)) && gtk_widget_get_visible(window);
     if(pointer_capture.focus(focused)) {
         if(!focused)right_button_cursor=false;
+        if(!focused) {
+            // The compositor will not deliver releases for keys held when
+            // focus moves. End them here instead of latching a phantom
+            // Command/Control into the next gameplay key.
+            keyboard_known=true;
+            reset_keyboard_state();
+            SDL_FlushEvent(raw_motion_event);
+        }
         focus_changes.push_back(focused?RBX_WL_FOCUS:RBX_WL_BLUR);
-        if(!focused)SDL_FlushEvent(raw_motion_event);
 #ifdef RBX_PROFILER
         if(!focused)rbx_profiler_mouse(4,0,0,0,false);
 #endif
@@ -385,11 +445,18 @@ static void refresh_pointer_focus() {
     }
 }
 
-static void registry_global(void*,wl_registry *registry,uint32_t name,const char *interface,uint32_t) {
+static void registry_global(void*,wl_registry *registry,uint32_t name,const char *interface,uint32_t version) {
     if(!strcmp(interface,wl_compositor_interface.name))
         compositor=(wl_compositor*)wl_registry_bind(registry,name,&wl_compositor_interface,1);
     else if(!strcmp(interface,wl_shm_interface.name))
         cursor_shm=(wl_shm*)wl_registry_bind(registry,name,&wl_shm_interface,1);
+    else if(!strcmp(interface,wl_seat_interface.name)) {
+        // A second keyboard on the same seat is read-only: SDL keeps its own
+        // for input, this one tells us what the compositor considers held.
+        keyboard_seat=(wl_seat*)wl_registry_bind(registry,name,&wl_seat_interface,version<5?version:5);
+        keyboard_device=wl_seat_get_keyboard(keyboard_seat);
+        wl_keyboard_add_listener(keyboard_device,&keyboard_listener,nullptr);
+    }
     else if(!strcmp(interface,wp_viewporter_interface.name))
         cursor_viewporter=(wp_viewporter*)wl_registry_bind(registry,name,&wp_viewporter_interface,1);
     else if(!strcmp(interface,wl_subcompositor_interface.name))
@@ -665,6 +732,11 @@ static unsigned modifiers(SDL_Keymod m) {
     return ((m&SDL_KMOD_SHIFT)?1u<<17:0)|((m&SDL_KMOD_CTRL)?1u<<18:0)|
         ((m&SDL_KMOD_ALT)?1u<<19:0)|((m&SDL_KMOD_GUI)?1u<<20:0)|((m&SDL_KMOD_CAPS)?1u<<16:0);
 }
+// SDL's mask is only trusted for modifiers the compositor confirms are held.
+// Caps Lock is a lock state, so it survives independently.
+static unsigned translate_modifiers(SDL_Keymod m) {
+    return rbxWaylandReconcileModifiers(modifiers(m),keyboard_physical,keyboard_known?1:0);
+}
 static int poll_event(RbxWaylandEvent *out) {
     // Caller drains GTK once before consuming this queue (or a whole batch).
     memset(out,0,sizeof(*out));
@@ -689,7 +761,7 @@ static int poll_event(RbxWaylandEvent *out) {
             if(w>0 && h>0 && rbx_profiler_mouse(hud_kind,hud_x/w,hud_y/h,hud_wheel,!current && pointer_capture.focused && !capture_active))continue;
         }
 #endif
-        out->modifiers=modifiers(SDL_GetModState());
+        out->modifiers=translate_modifiers(SDL_GetModState());
         if(e.type==raw_motion_event) {
             out->type=RBX_WL_MOTION;out->x=e.motion.x;out->y=e.motion.y;
             out->dx=e.motion.xrel;out->dy=e.motion.yrel;return 1;
@@ -703,14 +775,23 @@ static int poll_event(RbxWaylandEvent *out) {
                 if(e.wheel.direction==SDL_MOUSEWHEEL_FLIPPED){out->dx=-out->dx;out->dy=-out->dy;}
                 if(pointer_trace())g_printerr("POINTER helper wheel dx=%.2f dy=%.2f at=%.0f,%.0f relative=%d\n",out->dx,out->dy,out->x,out->y,capture_active);
                 break;
-            case SDL_EVENT_KEY_DOWN:case SDL_EVENT_KEY_UP:
+            case SDL_EVENT_KEY_DOWN:case SDL_EVENT_KEY_UP: {
 #ifdef RBX_PROFILER
                 if(rbx_profiler_key(e.key.scancode,e.type==SDL_EVENT_KEY_DOWN,e.key.mod&SDL_KMOD_SHIFT,e.key.repeat))continue;
 #endif
                 if(e.type==SDL_EVENT_KEY_DOWN && e.key.scancode==SDL_SCANCODE_F4 && (e.key.mod&SDL_KMOD_ALT)) {
                     request_close();close_requested=false;out->type=RBX_WL_CLOSE;return 1;
                 }
-                out->type=e.type==SDL_EVENT_KEY_DOWN?RBX_WL_KEY_DOWN:RBX_WL_KEY_UP;out->key=e.key.scancode;out->repeat=e.key.repeat;out->modifiers=modifiers(e.key.mod);
+                unsigned modifierBit=rbxWaylandModifierBitForScancode(e.key.scancode);
+                unsigned translated=translate_modifiers(e.key.mod);
+                if(modifierBit) {
+                    keyboard_known=true;
+                    // The modifier's own event is authoritative even if SDL's
+                    // accumulated mask lags behind the compositor.
+                    if(e.type==SDL_EVENT_KEY_DOWN){keyboard_physical|=modifierBit;translated|=modifierBit;}
+                    else {keyboard_physical&=~modifierBit;translated&=~modifierBit;}
+                }
+                out->type=e.type==SDL_EVENT_KEY_DOWN?RBX_WL_KEY_DOWN:RBX_WL_KEY_UP;out->key=e.key.scancode;out->repeat=e.key.repeat;out->modifiers=translated;
                 out->shortcut=rbxWaylandEditAction(e.key.scancode,out->modifiers);
                 if(!(e.key.key & SDLK_SCANCODE_MASK) && e.key.key<128){out->text[0]=(char)e.key.key;out->text[1]=0;}
                 if(e.type==SDL_EVENT_KEY_DOWN) {
@@ -728,6 +809,7 @@ static int poll_event(RbxWaylandEvent *out) {
                     } else if(e.key.key>=32 && e.key.key<127 && !(e.key.mod&(SDL_KMOD_CTRL|SDL_KMOD_GUI)))out->text[0]=0;
                 }
                 break;
+            }
             case SDL_EVENT_TEXT_INPUT:out->type=RBX_WL_TEXT;g_strlcpy(out->text,e.text.text,sizeof(out->text));break;
             case SDL_EVENT_WINDOW_FOCUS_GAINED:case SDL_EVENT_WINDOW_FOCUS_LOST:
                 // SDL is a child surface; GTK owns toplevel activation. Keep

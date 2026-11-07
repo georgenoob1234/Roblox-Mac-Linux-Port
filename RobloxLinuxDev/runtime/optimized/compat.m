@@ -16,25 +16,19 @@
 #include <dlfcn.h>
 #include <crt_externs.h>
 #include <unistd.h>
+#include "installer-skip.h"
 
 extern const char *getprogname(void);
 
-/* Short-circuit background RobloxPlayerInstaller to prevent teardown SIGSEGV in mldr */
+/* Short-circuit the background RobloxPlayerInstaller to prevent a teardown
+   SIGSEGV in mldr. Foreground runs and other programs are left alone. */
 __attribute__((constructor(101)))
 static void rbx_skip_background_installer(void) {
-    const char *prog = getprogname();
-    if (prog != NULL && strcmp(prog, "RobloxPlayerInstaller") == 0) {
-        _exit(0);
-    }
-
     char ***argv_ptr = _NSGetArgv();
     int *argc_ptr = _NSGetArgc();
-    if (argv_ptr != NULL && *argv_ptr != NULL && argc_ptr != NULL && *argc_ptr > 0) {
-        const char *arg0 = (*argv_ptr)[0];
-        if (arg0 != NULL && strstr(arg0, "RobloxPlayerInstaller") != NULL) {
-            _exit(0);
-        }
-    }
+    int argc = argc_ptr ? *argc_ptr : 0;
+    char **argv = argv_ptr ? *argv_ptr : NULL;
+    if (rbxIsBackgroundInstaller(getprogname(), argc, argv)) _exit(0);
 }
 
 typedef struct { uint32_t platform, version; } TrackABuildVersion;
@@ -304,7 +298,25 @@ static unsigned featureQueries;
 static signed char featureSet(id self,SEL selector,unsigned long feature) {
     ++featureQueries; assert(feature==10000); return baseline;
 }
+static void checkInstallerSkip(void) {
+    char *bg[]={"/x/RobloxPlayerInstaller","-background","true","-stage","prepare"};
+    char *fg[]={"/x/RobloxPlayerInstaller","-install"};
+    char *off[]={"/x/RobloxPlayerInstaller","-background","false"};
+    char *dangling[]={"/x/RobloxPlayerInstaller","-background"};
+    char *inPath[]={"/Apps/RobloxPlayerInstaller.app/Contents/MacOS/RobloxPlayer","-background","true"};
+    char *lookalike[]={"/x/MyRobloxPlayerInstaller2","-background","true"};
+    assert(rbxIsBackgroundInstaller("RobloxPlayerInstaller",5,bg));
+    assert(rbxIsBackgroundInstaller("other",5,bg)); // argv[0] alone is enough
+    assert(!rbxIsBackgroundInstaller("RobloxPlayerInstaller",2,fg));
+    assert(!rbxIsBackgroundInstaller("RobloxPlayerInstaller",3,off));
+    assert(!rbxIsBackgroundInstaller("RobloxPlayerInstaller",2,dangling));
+    assert(!rbxIsBackgroundInstaller("RobloxPlayer",3,inPath));
+    assert(!rbxIsBackgroundInstaller("MyRobloxPlayerInstaller2",3,lookalike));
+    assert(!rbxIsBackgroundInstaller(NULL,0,NULL));
+    puts("PASS background-installer short-circuit predicate");
+}
 static void checkHost(void) {
+    checkInstallerSkip();
     TrackASystemVersion version = {0};
     int (*getVersion)(TrackASystemVersion *) = dlsym(RTLD_DEFAULT, "os_system_version_get_current_version");
     assert(getVersion && !getVersion(&version) && version.major);

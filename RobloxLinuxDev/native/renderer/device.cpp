@@ -322,6 +322,20 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
 
 	DynamicVK::vkGetPhysicalDeviceFeatures2(_physicalDevice, &features);
 
+	// Diagnostic A/B only: drop the driver's per-access bounds checks to measure
+	// their shader cost. Out-of-bounds accesses in translated shaders then become
+	// undefined behavior (possible GPU faults), so this is never a default.
+	// Values: "buffer" or "image" disable only that check; anything else disables both.
+	if (const char* robust = std::getenv("RBX_NO_ROBUST_ACCESS")) {
+		const bool bufferOnly = strcmp(robust, "buffer") == 0, imageOnly = strcmp(robust, "image") == 0;
+		const bool dropBuffer = !imageOnly, dropImage = !bufferOnly;
+		fprintf(stderr, "Indium: RBX_NO_ROBUST_ACCESS=%s (diagnostic): robustBufferAccess %u->%u robustImageAccess %u->%u\n", robust,
+			features.features.robustBufferAccess, dropBuffer ? 0u : features.features.robustBufferAccess,
+			features13.robustImageAccess, dropImage ? 0u : features13.robustImageAccess);
+		if (dropBuffer) features.features.robustBufferAccess = VK_FALSE;
+		if (dropImage) features13.robustImageAccess = VK_FALSE;
+	}
+
 	// Only the dynamic state actually used is enabled; the rest stay off.
 	const VkBool32 depthClampState = dynamicState3.extendedDynamicState3DepthClampEnable && features.features.depthClamp;
 	dynamicState3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT, dynamicState3.pNext};

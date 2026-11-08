@@ -13,6 +13,9 @@
 #include <indium/depth-stencil.private.hpp>
 #include <indium/command-encoder.private.hpp>
 #include <indium/pipeline.private.hpp>
+#include <indium/pass-timing.hpp>
+#include <indium/barrier-merge.hpp>
+#include <indium/bind-stats.hpp>
 #include <indium/dynamic-vk.hpp>
 #include <vulkan/vulkan_core.h>
 #include <cstdlib>
@@ -201,7 +204,26 @@ Indium::PrivateRenderCommandEncoder::PrivateRenderCommandEncoder(std::shared_ptr
 	rendering.layerCount = layers;
 	rendering.colorAttachmentCount = colors.size();
 	rendering.pColorAttachments = colors.data();
-	memoryBarrier(vkCmdBuf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
+	// The previous full barrier already covers this pass when nothing was recorded since.
+	if (!BarrierMerge::consume(vkCmdBuf))
+		memoryBarrier(vkCmdBuf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT);
+	if (PassTiming::enabled()) {
+		// Identify recurring passes by target size, attachment formats and load ops.
+		std::string key = std::to_string(targetWidth) + "x" + std::to_string(targetHeight);
+		if (layers > 1) key += "x" + std::to_string(layers) + "L";
+		key += " color=";
+		bool any = false;
+		for (const auto& color : descriptor.colorAttachments) {
+			if (!color.texture) continue;
+			if (any) key += ",";
+			key += PassTiming::formatLabel(pixelFormatToVkFormat(color.texture->pixelFormat()));
+			key += color.loadAction == LoadAction::Clear ? "(clear)" : color.loadAction == LoadAction::Load ? "(load)" : "";
+			any = true;
+		}
+		if (!any) key += "none";
+		if (depthStencil) key += " depth=" + PassTiming::formatLabel(pixelFormatToVkFormat(depthStencil->texture->pixelFormat()));
+		PassTiming::passBegin(vkCmdBuf, std::move(key));
+	}
 	DynamicVK::vkCmdBeginRendering(vkCmdBuf, &rendering);
 
 	// set default values
@@ -370,6 +392,8 @@ void Indium::PrivateRenderCommandEncoder::updateBindings(VkCommandBuffer command
 	if (!_bindingsDirty[0] && !_bindingsDirty[1]) return;
 
 	const bool psoChanged = _descriptorPSO != _privatePSO;
+	BindStats::add(BindStats::BindCalls);
+	if (psoChanged) BindStats::add(BindStats::PsoChanges);
 	const auto& limits = _privateDevice->properties().limits;
 	const FunctionInfo* infos[] = {&_privatePSO->vertexFunctionInfo(), &_privatePSO->fragmentFunctionInfo()};
 	for (size_t stage = 0; stage < 2; ++stage) {
@@ -429,6 +453,7 @@ void Indium::PrivateRenderCommandEncoder::updateBindings(VkCommandBuffer command
 		}
 		if (!pushWrites.empty()) {
 			for (size_t i = 0; i < pushWrites.size(); ++i) pushWrites[i].pBufferInfo = &pushBuffers[i];
+			BindStats::push(this, stage, _privatePSO->pipelineLayout(), pushWrites, pushBuffers);
 			DynamicVK::vkCmdPushDescriptorSetKHR(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _privatePSO->pipelineLayout(), 0, pushWrites.size(), pushWrites.data());
 		}
 		if (ownSet) {
@@ -440,6 +465,7 @@ void Indium::PrivateRenderCommandEncoder::updateBindings(VkCommandBuffer command
 			offsets.clear();
 			for (const auto& offset : stageOffsets) offsets.push_back(offset.second);
 			if (!_boundSets[stage] || psoChanged || key != _descriptorKeys[stage]) {
+				BindStats::add(BindStats::SetLookups);
 				DescriptorArena::Entry* selected = nullptr;
 				size_t hash = DescriptorArena::keyHash(layout,key);
 				// Control blocks identify the pipeline state without locking its weak reference.
@@ -464,6 +490,7 @@ void Indium::PrivateRenderCommandEncoder::updateBindings(VkCommandBuffer command
 					}
 					if (!selected) { _descriptorArena->entries.emplace_back(); selected = &_descriptorArena->entries.back(); }
 					std::array<VkDescriptorSetLayout,1> layouts{layout};
+					BindStats::add(BindStats::SetMisses);
 					if (selected->set) ++_descriptorArena->rewrites; else ++_descriptorArena->allocations;
 					// The resource tables below retain every binding through completion,
 					// so the writer keeps nothing extra.
@@ -501,6 +528,7 @@ void Indium::PrivateRenderCommandEncoder::updateBindings(VkCommandBuffer command
 				bind |= _boundSets[stage] != selected->set;
 				_boundSets[stage] = selected->set; _descriptorKeys[stage] = key;
 			}
+			if (bind) BindStats::add(BindStats::SetBinds);
 			if (bind)
 				DynamicVK::vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, _privatePSO->pipelineLayout(),
 					1 + stage, 1, &_boundSets[stage], offsets.size(), offsets.data());
@@ -561,6 +589,7 @@ void Indium::PrivateRenderCommandEncoder::updateBindings(VkCommandBuffer command
 
 		if (buffers != _vertexBuffers || offsets != _vertexOffsets) {
 			DynamicVK::vkCmdBindVertexBuffers(commandBuffer, 0, vertexInputBindings.size(), buffers.data(), offsets.data());
+			BindStats::add(BindStats::VertexBinds);
 			_vertexBuffers.swap(buffers); _vertexOffsets.swap(offsets);
 		}
 	}
@@ -576,6 +605,7 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
 	VkPipeline pipeline = _privatePSO->pipelineFor(primitiveType, _depthClamp);
 	if (_boundPipeline!=pipeline) {
 		DynamicVK::vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		BindStats::add(BindStats::PipelineBinds);
 		_boundPipeline=pipeline;
 	}
 	auto topology=primitiveTypeToVkPrimitiveTopology(primitiveType);
@@ -590,6 +620,8 @@ void Indium::PrivateRenderCommandEncoder::drawPrimitives(PrimitiveType primitive
 	updateBindings(commandBuffer);
 
 	DynamicVK::vkCmdDraw(commandBuffer, vertexCount, instanceCount, vertexStart, baseInstance);
+	PassTiming::draw(commandBuffer);
+	BindStats::add(BindStats::Draws);
 
 	// updateBindings retains each distinct resource state through GPU completion.
 };
@@ -632,7 +664,9 @@ void Indium::PrivateRenderCommandEncoder::setVertexBytes(const void* bytes, size
 void Indium::PrivateRenderCommandEncoder::endEncoding() {
 	auto buf = _privateCommandBuffer.lock();
 	DynamicVK::vkCmdEndRendering(buf->commandBuffer());
+	PassTiming::passEnd(buf->commandBuffer());
 	memoryBarrier(buf->commandBuffer(), VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+	BarrierMerge::markFull(buf->commandBuffer());
 };
 
 void Indium::PrivateRenderCommandEncoder::setVertexBuffer(std::shared_ptr<Buffer> buffer, size_t offset, size_t index) {
@@ -762,6 +796,7 @@ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType pr
 	VkPipeline pipeline = _privatePSO->pipelineFor(primitiveType, _depthClamp);
 	if (_boundPipeline!=pipeline) {
 		DynamicVK::vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		BindStats::add(BindStats::PipelineBinds);
 		_boundPipeline=pipeline;
 	}
 	auto topology=primitiveTypeToVkPrimitiveTopology(primitiveType);
@@ -787,6 +822,8 @@ void Indium::PrivateRenderCommandEncoder::drawIndexedPrimitives(PrimitiveType pr
 		_indexBuffer = privateIndexBuffer->buffer(); _indexOffset = indexBufferOffset; _indexType = vkType;
 	}
 	DynamicVK::vkCmdDrawIndexed(commandBuffer, indexCount, instanceCount, 0, baseVertex, baseInstance);
+	PassTiming::draw(commandBuffer);
+	BindStats::add(BindStats::Draws);
 
 	// updateBindings retains each distinct resource state through GPU completion.
 };

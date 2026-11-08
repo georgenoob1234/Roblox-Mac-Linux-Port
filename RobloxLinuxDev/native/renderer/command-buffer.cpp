@@ -10,6 +10,8 @@
 #include <indium/uploads.hpp>
 #include <indium/tracked-blit.hpp>
 #include <indium/gpu-timing.hpp>
+#include <indium/pass-timing.hpp>
+#include <indium/barrier-merge.hpp>
 #include "presentation-semaphore.hpp"
 
 #include <condition_variable>
@@ -117,8 +119,10 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
 	}
 	begin.finish();
 	synchronizeGraphicsQueue(_commandBuffer);
+	BarrierMerge::markFull(_commandBuffer);
 	RbxProfiler::DiagnosticScope queries(RBX_DIAG_QUERY_SETUP,0,this);
 	_timestampPool = beginGpuTiming(*_privateDevice, _commandBuffer);
+	PassTiming::beginCommand(*_privateDevice, _commandBuffer);
 };
 
 Indium::PrivateCommandBuffer::~PrivateCommandBuffer() {
@@ -149,6 +153,7 @@ void Indium::PrivateCommandBuffer::recycleCommandPool() {
 };
 
 std::shared_ptr<Indium::RenderCommandEncoder> Indium::PrivateCommandBuffer::renderCommandEncoder(const RenderPassDescriptor& descriptor) {
+	PassTiming::boundary(_commandBuffer, 'R');
 	auto encoder = std::make_shared<Indium::PrivateRenderCommandEncoder>(shared_from_this(), descriptor);
 	{
 		std::scoped_lock lock(_mutex);
@@ -158,6 +163,8 @@ std::shared_ptr<Indium::RenderCommandEncoder> Indium::PrivateCommandBuffer::rend
 };
 
 std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCommandEncoder() {
+	PassTiming::boundary(_commandBuffer, 'B');
+	BarrierMerge::clear(_commandBuffer);
 	auto encoder = std::make_shared<Indium::TrackedBlit>(shared_from_this());
 	{
 		std::scoped_lock lock(_mutex);
@@ -167,6 +174,8 @@ std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCo
 };
 
 std::shared_ptr<Indium::BlitCommandEncoder> Indium::PrivateCommandBuffer::blitCommandEncoder(const BlitPassDescriptor& descriptor) {
+	PassTiming::boundary(_commandBuffer, 'B');
+	BarrierMerge::clear(_commandBuffer);
 	auto encoder = std::make_shared<Indium::TrackedBlit>(shared_from_this(), descriptor);
 	{
 		std::scoped_lock lock(_mutex);
@@ -180,6 +189,8 @@ std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::com
 };
 
 std::shared_ptr<Indium::ComputeCommandEncoder> Indium::PrivateCommandBuffer::computeCommandEncoder(const ComputePassDescriptor& descriptor) {
+	PassTiming::boundary(_commandBuffer, 'C');
+	BarrierMerge::clear(_commandBuffer);
 	auto encoder = std::make_shared<Indium::PrivateComputeCommandEncoder>(shared_from_this(), descriptor);
 	{
 		std::scoped_lock lock(_mutex);
@@ -256,6 +267,8 @@ void Indium::PrivateCommandBuffer::commit() {
 	if (_privateDevice->uploads) { _privateDevice->uploads->flush(); _privateDevice->uploads->collect(); }
 	const auto uploadsFinished = timingStart();
  phase.change(RBX_PROF_END_COMMAND);
+	PassTiming::boundary(_commandBuffer, 'E');
+	BarrierMerge::forget(_commandBuffer);
 	endGpuTiming(_commandBuffer, _timestampPool);
 	if (DynamicVK::vkEndCommandBuffer(_commandBuffer) != VK_SUCCESS) {
 		// TODO
@@ -361,6 +374,8 @@ void Indium::PrivateCommandBuffer::commit() {
 	auto completed = [self, timelineSemaphore, extraWaitSemaphores, presentationSemaphores]() {
 		reportCommandTiming(CommandSpan::Completion, self->_submittedAt);
 		reportGpuTiming(*self->_privateDevice, self->_timestampPool);
+		// Before recycleCommandPool(): the handle keys the pass-timing state.
+		PassTiming::complete(*self->_privateDevice, self->_commandBuffer);
 		std::vector<std::shared_ptr<CommandEncoder>> encoders;
 		{
 			std::unique_lock lock(self->_mutex);

@@ -32,6 +32,9 @@ namespace {
 // ponytail: reserve 128 completions at device setup; larger backlogs keep the
 // existing allocation fallback, and only 128 idle handles remain cached.
 constexpr size_t completionSemaphoreCapacity = 128;
+// See pollEvents: longer than NVIDIA's sub-millisecond spin threshold, and
+// shorter than a 60 Hz frame so a missed independent wait cannot stall for long.
+constexpr uint64_t activeWaitCapNanoseconds = 8000000;
 void semaphoreLifetimeDiagnostic(bool binary, bool created, bool exportable = false) {
 	if (!std::getenv("RBX_PRESENT_RESOURCE_TRACE")) return;
 	static std::atomic<uint64_t> made[2]{}, destroyed[2]{}, exported{0};
@@ -656,11 +659,19 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
 	info.pValues = values.data();
 	info.flags = VK_SEMAPHORE_WAIT_ANY_BIT;
 
-	// ponytail: cap an active GPU wait at 1 ms so newly registered independent
-	// waits get a fresh snapshot without a driver signal on every submission.
-	// Existing GPU completions still wake immediately; idle polls sleep above.
+	// ponytail: cap an active GPU wait so newly registered independent waits get
+	// a fresh snapshot without a driver signal on every submission. Existing GPU
+	// completions still wake immediately; idle polls sleep above.
+	//
+	// The cap is a safety net, not the normal wake-up: a wait registered after
+	// this snapshot was submitted after everything in it, so one of the
+	// snapshot's own completions returns first. It must not be short. NVIDIA
+	// (615.78) busy-spins through any wait of 1 ms or less instead of blocking:
+	// with a 1 ms cap this thread burned 50-60% of a core in-game, and a
+	// standalone wait loop measured 94-98% against 1.5-2.8% with a longer cap.
+	// Every expiry still costs ~0.4 ms of spinning, so keep expiries rare.
 	// Use an interruptible driver wait if tighter independent-wait latency is needed.
-	auto result = DynamicVK::vkWaitSemaphores(_device, &info, std::min<uint64_t>(timeoutNanoseconds, 1000000));
+	auto result = DynamicVK::vkWaitSemaphores(_device, &info, std::min<uint64_t>(timeoutNanoseconds, activeWaitCapNanoseconds));
 
 	if (result == VK_TIMEOUT) {
 		// timed out with no semaphores ready
@@ -750,7 +761,8 @@ void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t tar
 		_eventLoopCallbacks.push_back(std::move(callback));
 		registration.detail=_eventLoopCallbacks.size()-1; // Exclude the wakeup entry.
 		// Only an idle CPU wait needs a notification. Active GPU waits refresh
-		// their snapshot within 1 ms, even behind an unsignalled dependency.
+		// their snapshot at the next completion, or at the wait cap when they
+		// are behind an unsignalled dependency.
 		if (_eventLoopWaiting.exchange(false, std::memory_order_relaxed)) {
 			RbxProfiler::DiagnosticScope wake(RBX_DIAG_COMPLETION_WAKE,0,this,registration.detail);
 			_eventLoopIdle.notify_one();

@@ -61,6 +61,7 @@ c++ -std=c++17 -O2 -pthread -include array -include cstring \
 sh runtime/optimized/darling/build.sh
 python3 -B runtime/optimized/audio/check-component-lifecycle.py
 sh runtime/optimized/build.sh
+python3 -B runtime/probes/check-sockopt.py
 python3 -B runtime/optimized/native/timezone-sidecar/check.py --library runtime/optimized/native/lib/libsystem_c.dylib
 python3 -B runtime/package/check-release.py
 python3 -B runtime/package/check-update-recovery.py

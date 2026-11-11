@@ -13,7 +13,9 @@ static const char *defaultfile = "/Volumes/SystemRoot/mnt/default-zone",
                   *namedfile = "/Volumes/SystemRoot/mnt/named-zone";
 static const time_t winter = 1767268800, summer = 1782907200,
                     historical = -2208988800LL;
-static int done;
+static int done, seen[2];
+/* A changed zone file is noticed within 100 ms (TZFILE_RECHECK_NS). */
+static void settle(void) { usleep(150000); }
 static void copyzone(const char *source, const char *target, time_t stamp,
                      int replace) {
     char temporary[1024];
@@ -62,8 +64,24 @@ static void *reader(void *unused) {
         assert(tm.tm_year == 126 && tm.tm_mon == 0 && tm.tm_mday == 1);
         assert((tm.tm_gmtoff == 0 && tm.tm_hour == 12) ||
                (tm.tm_gmtoff == 3600 && tm.tm_hour == 13));
+        __atomic_store_n(&seen[tm.tm_gmtoff != 0], 1, __ATOMIC_SEQ_CST);
     }
     return NULL;
+}
+/* One stat() through the prefix costs about 30 us; a conversion must not pay it every time. */
+static double cost(void) {
+    enum { calls = 20000, limit_ms = 60 };
+    struct tm tm;
+    uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (int i = 0; i < calls; ++i)
+        assert(localtime_r(&winter, &tm));
+    uint64_t spent = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+    if (spent > limit_ms * 1000000ULL) {
+        fprintf(stderr, "%d conversions took %llu ms (limit %d ms)\n", calls,
+                (unsigned long long)(spent / 1000000), limit_ms);
+        abort();
+    }
+    return (double)spent / calls;
 }
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -75,6 +93,7 @@ int main(void) {
     assert(!unlink(defaultfile));
     zone(NULL, 0, 0, 0);
     copyzone(paris, defaultfile, 1700000000, 1);
+    settle();
     zone(NULL, 3600, 7200, 561);
     zone(":/usr/share/zoneinfo/Europe/Paris", 3600, 7200, 561);
     zone("UTC0", 0, 0, 0);
@@ -91,12 +110,16 @@ int main(void) {
     assert(!unsetenv("TZ"));
     offset(winter, 3600);
     copyzone(utc, defaultfile, 1700000000, 1);
+    settle();
     offset(winter, 0);
     copyzone(paris, defaultfile, 1600000000, 0);
+    settle();
     offset(winter, 3600);
     assert(!unlink(defaultfile));
+    settle();
     offset(winter, 0);
     copyzone(paris, defaultfile, 1500000000, 1);
+    settle();
     offset(winter, 3600);
     puts("PASS resolved default replacement equal mtime, in-place older mtime, "
          "missing file retry");
@@ -107,8 +130,10 @@ int main(void) {
     offset(winter, 3600);
     offset(historical, 561);
     copyzone(utc, namedfile, 1700000000, 1);
+    settle();
     offset(winter, 0);
     copyzone(paris, namedfile, 1600000000, 0);
+    settle();
     offset(winter, 3600);
     puts("PASS explicit TZ file appearance/replacement without changing TZ, "
          "equal and older mtimes");
@@ -117,15 +142,27 @@ int main(void) {
     pthread_t threads[4];
     for (int i = 0; i < 4; ++i)
         assert(!pthread_create(&threads[i], NULL, reader, NULL));
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < 12; ++i) {
         copyzone((i & 1) ? paris : utc, defaultfile, 1500000000 - i, 1);
-        usleep(1000);
+        settle();
     }
     __atomic_store_n(&done, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < 4; ++i)
         assert(!pthread_join(threads[i], NULL));
+    assert(seen[0] && seen[1]);
     copyzone(paris, defaultfile, 1700000000, 1);
+    settle();
     offset(winter, 3600);
     puts("PASS concurrent conversion and atomic default zone replacement");
+    double present = cost();
+    assert(!unlink(defaultfile));
+    settle();
+    offset(winter, 0);
+    double missing = cost();
+    copyzone(paris, defaultfile, 1700000000, 1);
+    settle();
+    offset(winter, 3600);
+    printf("PASS conversion cost without a zone file lookup per call: %.0f ns, "
+           "%.0f ns with the default file missing\n", present, missing);
     return 0;
 }

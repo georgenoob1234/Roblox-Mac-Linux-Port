@@ -114,7 +114,7 @@
  static struct timespec last_default_tzload_mtimespec = {0, 0};
  static void
  tzsetwall_check_default_file_timestamp(void)
-@@ -1553,18 +1546,57 @@
+@@ -1553,18 +1546,73 @@
  	}
  }
  
@@ -123,19 +123,35 @@
 +static int last_tzload_valid;
 +static char last_tzload_path[FILENAME_MAX + 1];
 +
++/*
++ * Every conversion asks whether the zone file changed, and one stat() through
++ * the prefix costs about 30 us. An answer is therefore trusted for 100 ms, so
++ * a changed zone is seen that much later. Zero means "ask the file".
++ * Readers update the stamp under the shared lock, hence the atomic accesses.
++ */
++#define TZFILE_RECHECK_NS 100000000ULL
++static uint64_t tzfile_checked;
++
 +/* Read under lcl_rwlock; only a successful load under its write lock commits. */
 +static int
 +tzfile_changed(const char *path)
 +{
 +	struct stat current;
-+	return !path || stat(path, &current) != 0 || !last_tzload_valid ||
++	uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++	uint64_t checked = __atomic_load_n(&tzfile_checked, __ATOMIC_RELAXED);
++	if (checked && now - checked < TZFILE_RECHECK_NS)
++		return 0;
++	if (!path || stat(path, &current) != 0 || !last_tzload_valid ||
 +		current.st_dev != last_tzload_stat.st_dev ||
 +		current.st_ino != last_tzload_stat.st_ino ||
 +		current.st_size != last_tzload_stat.st_size ||
 +		current.st_mtimespec.tv_sec != last_tzload_stat.st_mtimespec.tv_sec ||
 +		current.st_mtimespec.tv_nsec != last_tzload_stat.st_mtimespec.tv_nsec ||
 +		current.st_ctimespec.tv_sec != last_tzload_stat.st_ctimespec.tv_sec ||
-+		current.st_ctimespec.tv_nsec != last_tzload_stat.st_ctimespec.tv_nsec;
++		current.st_ctimespec.tv_nsec != last_tzload_stat.st_ctimespec.tv_nsec)
++		return 1;
++	__atomic_store_n(&tzfile_checked, now, __ATOMIC_RELAXED);
++	return 0;
 +}
 +#endif
 +
@@ -176,7 +192,7 @@
  
  	if (!rdlocked)
  		_RWLOCK_RDLOCK(&lcl_rwlock);
-@@ -1582,6 +1614,7 @@
+@@ -1582,6 +1630,7 @@
  	_RWLOCK_UNLOCK(&lcl_rwlock);
  
  	_RWLOCK_WRLOCK(&lcl_rwlock);
@@ -184,7 +200,7 @@
  	lcl_is_set = -1;
  
  #ifdef ALL_STATE
-@@ -1599,7 +1632,7 @@
+@@ -1599,7 +1648,7 @@
  #ifdef NOTIFY_TZ
  	{
  		char		fullname[FILENAME_MAX + 1];
@@ -193,7 +209,7 @@
  			// The load failed, so we need to reset the cached modified time
  			// of the timezone file
  			last_default_tzload_mtimespec = (const struct timespec){0};
-@@ -1613,8 +1646,14 @@
+@@ -1613,8 +1662,16 @@
  		notify_register_tz(fullname, &lcl_notify);
  	}
  #else /* ! NOTIFY_TZ */
@@ -206,10 +222,12 @@
 +		last_tzload_valid = 1;
 +	}
 +	last_tzload_path[0] = '\0';
++	/* Also after a failed load: a missing default file is retried at the same pace. */
++	__atomic_store_n(&tzfile_checked, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
  #endif /* NOTIFY_TZ */
  	settzname();
  	_RWLOCK_UNLOCK(&lcl_rwlock);
-@@ -1648,7 +1687,11 @@
+@@ -1648,7 +1705,11 @@
  #endif /* NOTIFY_TZ */
  	if (!rdlocked)
  		_RWLOCK_RDLOCK(&lcl_rwlock);
@@ -222,18 +240,19 @@
  		if (!rdlocked)
  			_RWLOCK_UNLOCK(&lcl_rwlock);
  #ifdef NOTIFY_TZ_DEBUG
-@@ -1675,6 +1718,10 @@
+@@ -1675,6 +1736,11 @@
  		}
  	}
  #endif /* defined ALL_STATE */
 +#ifndef NOTIFY_TZ
 +	last_tzload_valid = 0;
 +	last_tzload_path[0] = '\0';
++	__atomic_store_n(&tzfile_checked, 0, __ATOMIC_RELAXED);
 +#endif
  	if (*name == '\0') {
  		/*
  		** User wants it fast rather than right.
-@@ -1700,7 +1747,7 @@
+@@ -1700,7 +1766,7 @@
  		 * notifications.
  		 */
  		int		parsedOK = FALSE;
@@ -242,7 +261,7 @@
  			if (name[0] == ':' || !(parsedOK = tzparse(name, lclptr, FALSE) == 0)) {
  				/*
  				 * If fullname is empty (an error occurred) then
-@@ -1712,9 +1759,20 @@
+@@ -1712,9 +1778,20 @@
  		notify_register_tz(parsedOK ? NULL : fullname, &lcl_notify);
  	}
  #else /* ! NOTIFY_TZ */

@@ -56,7 +56,7 @@ with subprocess.Popen(launcher, env=env, stdout=subprocess.PIPE, stderr=subproce
         (stage / 'check.log').write_text(output)
         raise SystemExit(f'Timezone check timed out; see {stage}/check.log')
 (stage / 'check.log').write_text(output)
-passed = proc.returncode == 0 and output.count('PASS ') == 4
+passed = proc.returncode == 0 and output.count('PASS ') == 5
 (stage / 'receipt.json').write_text(json.dumps({
     'library': str(library), 'sha256': digest, 'exit_code': proc.returncode, 'passed': passed,
     'copied_library_unchanged': hashlib.sha256((stage / 'lib/libsystem_c.dylib').read_bytes()).hexdigest() == digest,

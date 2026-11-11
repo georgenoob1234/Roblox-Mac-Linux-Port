@@ -4,16 +4,26 @@
 // transport) and abandons the connection when the call fails, so no game can
 // be joined.
 //
-// IP_DONTFRAG (xnu ip_output): DF is set on every datagram, and a datagram
-// larger than the outgoing interface's MTU fails with EMSGSIZE; the route's
-// cached path MTU is not consulted. Linux has no boolean for this. The same
-// behaviour is IP_MTU_DISCOVER = IP_PMTUDISC_PROBE (IP_PMTUDISC_DO would also
-// refuse sends above the kernel's cached path MTU, which Darwin does not).
-// Clearing the option maps to IP_PMTUDISC_DONT: DF never set, fragmentation
-// allowed, as on Darwin.
+// What xnu does (bsd/netinet/ip_output.c, udp_usrreq.c, raw_ip.c and
+// bsd/netinet6/ip6_output.c):
+// - IP_DONTFRAG: UDP and raw sockets set DF on every datagram, and a datagram
+//   larger than the outgoing interface's MTU fails with EMSGSIZE. The route's
+//   cached path MTU is not consulted. TCP never reads the flag.
+// - IPV6_DONTFRAG: a datagram larger than the link MTU fails with EMSGSIZE and
+//   anything smaller is sent unfragmented, again without consulting the path
+//   MTU. The option is ignored for TCP. The value must be exactly an int.
 //
-// IPV6_DONTFRAG is the RFC 3542 option on both systems, with the same number
-// and the same int boolean, so it goes to the host unchanged.
+// On Linux "never fragment, limited by the device MTU only" is the PROBE mode
+// of IP_MTU_DISCOVER / IPV6_MTU_DISCOVER; the DO mode, and IPV6_DONTFRAG on its
+// own, also refuse sends above the kernel's cached path MTU. IPv6 additionally
+// needs Linux's own IPV6_DONTFRAG, or oversized datagrams are fragmented at
+// the source. Clearing an option restores "fragmentation allowed": the DONT
+// mode for IPv4 (DF never set, as on Darwin) and Linux's default WANT mode for
+// IPv6, where routers never fragment anyway.
+//
+// Stream sockets are left alone: the PROBE mode would make Linux TCP ignore
+// the path MTU, which xnu's flag never does. Reading the option back on a
+// stream socket therefore reports 0.
 //
 // Every other option keeps Darling's implementation.
 #define __APPLE_USE_RFC_3542 1  // IPV6_DONTFRAG
@@ -23,9 +33,10 @@
 #include <errno.h>
 
 enum { linux_setsockopt = 54, linux_getsockopt = 55,
-       linux_ipproto_ip = 0, linux_ipproto_ipv6 = 41,
-       linux_ip_mtu_discover = 10, linux_ipv6_dontfrag = 62,
-       linux_pmtudisc_dont = 0, linux_pmtudisc_do = 2, linux_pmtudisc_probe = 3 };
+       linux_sol_socket = 1, linux_so_type = 3, linux_sock_stream = 1,
+       linux_ipproto_ip = 0, linux_ip_mtu_discover = 10,
+       linux_ipproto_ipv6 = 41, linux_ipv6_mtu_discover = 23, linux_ipv6_dontfrag = 62,
+       linux_pmtudisc_dont = 0, linux_pmtudisc_want = 1, linux_pmtudisc_do = 2, linux_pmtudisc_probe = 3 };
 
 // Guest descriptors are the host's descriptors.
 static long linux_sockopt(long number, int fd, int level, int name, const void *value, long length) {
@@ -37,9 +48,16 @@ static long linux_sockopt(long number, int fd, int level, int name, const void *
         : "rcx", "r11", "memory", "cc");
     return result;
 }
+static long host_set(int fd, int level, int name, int value) {
+    return linux_sockopt(linux_setsockopt, fd, level, name, &value, sizeof value);
+}
+static long host_get(int fd, int level, int name, int *value) {
+    unsigned size = sizeof *value;
+    return linux_sockopt(linux_getsockopt, fd, level, name, value, (long)&size);
+}
 
-// Sets errno from a negative Linux result. Only the errors these two host
-// calls produce need translating; the rest of 1..34 is numbered alike.
+// Sets errno from a negative Linux result. Only the errors these host calls
+// produce need translating.
 static int finish(long result) {
     if (result >= 0) return 0;
     switch (-result) {
@@ -58,32 +76,38 @@ static int finish(long result) {
     if (!call) { call = (__typeof__(type))dlsym(RTLD_NEXT, name); __atomic_store_n(&original, call, __ATOMIC_RELEASE); }
 
 int setsockopt(int fd, int level, int name, const void *value, socklen_t length) {
-    if (level == IPPROTO_IP && name == IP_DONTFRAG) {
+    int ipv4 = level == IPPROTO_IP && name == IP_DONTFRAG;
+    if (ipv4 || (level == IPPROTO_IPV6 && name == IPV6_DONTFRAG)) {
         if (!value) { errno = EFAULT; return -1; }
-        if (length < sizeof(int)) { errno = EINVAL; return -1; }
-        int mode = *(const int *)value ? linux_pmtudisc_probe : linux_pmtudisc_dont;
-        return finish(linux_sockopt(linux_setsockopt, fd, linux_ipproto_ip, linux_ip_mtu_discover, &mode, sizeof mode));
+        if (ipv4 ? length < sizeof(int) : length != sizeof(int)) { errno = EINVAL; return -1; }
+        int on = *(const int *)value != 0, type = 0;
+        long result = host_get(fd, linux_sol_socket, linux_so_type, &type);
+        if (result < 0) return finish(result);
+        if (type == linux_sock_stream) return 0;
+        if (ipv4)
+            return finish(host_set(fd, linux_ipproto_ip, linux_ip_mtu_discover, on ? linux_pmtudisc_probe : linux_pmtudisc_dont));
+        result = host_set(fd, linux_ipproto_ipv6, linux_ipv6_mtu_discover, on ? linux_pmtudisc_probe : linux_pmtudisc_want);
+        if (result < 0) return finish(result);
+        return finish(host_set(fd, linux_ipproto_ipv6, linux_ipv6_dontfrag, on));
     }
-    if (level == IPPROTO_IPV6 && name == IPV6_DONTFRAG)
-        return finish(linux_sockopt(linux_setsockopt, fd, linux_ipproto_ipv6, linux_ipv6_dontfrag, value, length));
     ORIGINAL("setsockopt", int (*)(int, int, int, const void *, socklen_t))
     return call(fd, level, name, value, length);
 }
 
 int getsockopt(int fd, int level, int name, void *restrict value, socklen_t *restrict length) {
-    if (level == IPPROTO_IP && name == IP_DONTFRAG) {
-        // The host reports the mode; Darwin callers expect a boolean int.
+    int ipv4 = level == IPPROTO_IP && name == IP_DONTFRAG;
+    if (ipv4 || (level == IPPROTO_IPV6 && name == IPV6_DONTFRAG)) {
         if (!value || !length) { errno = EFAULT; return -1; }
         if (*length < sizeof(int)) { errno = EINVAL; return -1; }
-        int mode = 0;
-        socklen_t size = sizeof mode;
-        if (finish(linux_sockopt(linux_getsockopt, fd, linux_ipproto_ip, linux_ip_mtu_discover, &mode, (long)&size))) return -1;
-        *(int *)value = mode == linux_pmtudisc_do || mode == linux_pmtudisc_probe;
+        int state = 0;
+        long result = ipv4 ? host_get(fd, linux_ipproto_ip, linux_ip_mtu_discover, &state)
+                           : host_get(fd, linux_ipproto_ipv6, linux_ipv6_dontfrag, &state);
+        if (result < 0) return finish(result);
+        // IPv4: the host reports the mode; Darwin callers expect a boolean.
+        *(int *)value = ipv4 ? state == linux_pmtudisc_do || state == linux_pmtudisc_probe : state != 0;
         *length = sizeof(int);
         return 0;
     }
-    if (level == IPPROTO_IPV6 && name == IPV6_DONTFRAG)
-        return finish(linux_sockopt(linux_getsockopt, fd, linux_ipproto_ipv6, linux_ipv6_dontfrag, value, (long)length));
     ORIGINAL("getsockopt", int (*)(int, int, int, void *, socklen_t *))
     return call(fd, level, name, value, length);
 }

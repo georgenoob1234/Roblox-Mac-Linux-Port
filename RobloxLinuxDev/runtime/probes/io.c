@@ -1,4 +1,5 @@
 // Check file/pipe I/O cancellation and WebRTC's wakeup-pipe pattern.
+// Modes 8-15 cover the socket, fcntl and close entry points the same way.
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -9,10 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
-static int channel[2], ready, release, cleaned, mode, disabled, file;
+static int channel[2], pair[2], spare, ready, release, cleaned, mode, disabled, file;
 static char path[] = "/tmp/rbx-io.XXXXXX", created[sizeof(path) + 4];
 static void cleanup(void *unused) { (void)unused; cleaned = 1; }
 static void *worker(void *unused) {
@@ -31,6 +34,19 @@ static void *worker(void *unused) {
     }
     else if (mode == 6) assert(pread(file, &byte, 1, 0) == 1);
     else if (mode == 7) assert(pwrite(file, &byte, 1, 0) == 1);
+    else if (mode >= 8 && mode <= 13) {
+        struct iovec part = {&byte, 1};
+        struct msghdr message = {0};
+        message.msg_iov = &part; message.msg_iovlen = 1;
+        if (mode == 8) assert(recv(pair[0], &byte, 1, 0) == 1);
+        else if (mode == 9) assert(send(pair[1], &byte, 1, 0) == 1);
+        else if (mode == 10) assert(recvmsg(pair[0], &message, 0) == 1);
+        else if (mode == 11) assert(sendmsg(pair[1], &message, 0) == 1);
+        else if (mode == 12) assert(recvfrom(pair[0], &byte, 1, 0, NULL, NULL) == 1);
+        else assert(sendto(pair[1], &byte, 1, 0, NULL, 0) == 1);
+    }
+    else if (mode == 14) assert(fcntl(channel[0], F_GETFL) >= 0);
+    else if (mode == 15) assert(!close(spare));
     else assert(read(channel[0], &byte, 1) == 1);
     assert(disabled); // Enabled cancellation must happen inside the I/O call.
     assert(!pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL));
@@ -89,9 +105,12 @@ int main(void) {
     assert(poll(&polled, 1, 0) == 1 && (polled.revents & POLLHUP));
     close(channel[0]);
     assert(poll(&polled, 1, 0) == 1 && (polled.revents & POLLNVAL));
-    for (mode = 1; mode <= 7; ++mode) for (disabled = 0; disabled <= 1; ++disabled) {
+    for (mode = 1; mode <= 15; ++mode) for (disabled = 0; disabled <= 1; ++disabled) {
         assert(!pipe(channel));
         if (mode == 1) assert(write(channel[1], buffer, 1) == 1);
+        assert(!socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
+        if (mode == 8 || mode == 10 || mode == 12) assert(send(pair[1], buffer, 1, 0) == 1);
+        assert((spare = dup(channel[0])) >= 0);
         ready = release = cleaned = 0;
         pthread_t thread;
         assert(!pthread_create(&thread, NULL, worker, NULL));
@@ -107,7 +126,10 @@ int main(void) {
                 assert(!unlink(created));
             } else assert(stat(created, &st) == -1 && errno == ENOENT);
         }
-        close(channel[0]); close(channel[1]);
+        // A cancelled close must not have released the descriptor; a completed one must have.
+        if (mode == 15 && disabled) assert(fcntl(spare, F_GETFD) == -1 && errno == EBADF);
+        else assert(fcntl(spare, F_GETFD) != -1 && !close(spare));
+        close(channel[0]); close(channel[1]); close(pair[0]); close(pair[1]);
     }
     assert(!close(file) && !unlink(path));
     umask(old_mask);
@@ -124,6 +146,6 @@ int main(void) {
     }
     double ms = (mach_absolute_time() - start) / 1e6;
     close(channel[0]); close(channel[1]);
-    printf("PASS file modes, positioned I/O, errors, EOF, partial I/O, poll readiness/timeout, pending and disabled open/pread/pwrite/read/write/poll cancellation; 512 pipe cycles %.3f ms\n", ms);
+    printf("PASS file modes, positioned I/O, errors, EOF, partial I/O, poll readiness/timeout, pending and disabled open/pread/pwrite/read/write/poll/recv/send/recvmsg/sendmsg/recvfrom/sendto/fcntl/close cancellation; 512 pipe cycles %.3f ms\n", ms);
     return 0;
 }

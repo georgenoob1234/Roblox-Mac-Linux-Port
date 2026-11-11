@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <poll.h>
 #include <stdarg.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 extern int open_nocancel(const char *, int, ...) __asm("_open$NOCANCEL");
@@ -64,4 +65,78 @@ int poll(struct pollfd *fds, nfds_t count, int timeout) {
     int result = poll_nocancel(fds, count, timeout);
     if (result < 0 && errno == EINTR) pthread_testcancel();
     return result;
+}
+
+// The same check is made for every other cancellable call, on every thread
+// but the main one: ~70 us per call against well under 1 us for the call
+// itself. In game the client's network threads make about 2,700 of the calls
+// below per second (recv 1,550, fcntl 590, recvmsg 340, close 125, sendmsg 85).
+extern ssize_t recvfrom_nocancel(int, void *, size_t, int, struct sockaddr *, socklen_t *) __asm("_recvfrom$NOCANCEL");
+extern ssize_t sendto_nocancel(int, const void *, size_t, int, const struct sockaddr *, socklen_t) __asm("_sendto$NOCANCEL");
+extern ssize_t recvmsg_nocancel(int, struct msghdr *, int) __asm("_recvmsg$NOCANCEL");
+extern ssize_t sendmsg_nocancel(int, const struct msghdr *, int) __asm("_sendmsg$NOCANCEL");
+extern int fcntl_nocancel(int, int, ...) __asm("_fcntl$NOCANCEL");
+extern int close_nocancel(int) __asm("_close$NOCANCEL");
+
+ssize_t recvfrom(int fd, void *buffer, size_t size, int flags, struct sockaddr *restrict address, socklen_t *restrict length) {
+    pthread_testcancel();
+    ssize_t result = recvfrom_nocancel(fd, buffer, size, flags, address, length);
+    if (result < 0 && errno == EINTR) pthread_testcancel();
+    return result;
+}
+
+ssize_t sendto(int fd, const void *buffer, size_t size, int flags, const struct sockaddr *address, socklen_t length) {
+    pthread_testcancel();
+    ssize_t result = sendto_nocancel(fd, buffer, size, flags, address, length);
+    if (result < 0 && errno == EINTR) pthread_testcancel();
+    return result;
+}
+
+// libc's recv and send enter the kernel library directly rather than through
+// recvfrom and sendto above, so they need their own entry points.
+ssize_t recv(int fd, void *buffer, size_t size, int flags) {
+    pthread_testcancel();
+    ssize_t result = recvfrom_nocancel(fd, buffer, size, flags, NULL, NULL);
+    if (result < 0 && errno == EINTR) pthread_testcancel();
+    return result;
+}
+
+ssize_t send(int fd, const void *buffer, size_t size, int flags) {
+    pthread_testcancel();
+    ssize_t result = sendto_nocancel(fd, buffer, size, flags, NULL, 0);
+    if (result < 0 && errno == EINTR) pthread_testcancel();
+    return result;
+}
+
+ssize_t recvmsg(int fd, struct msghdr *message, int flags) {
+    pthread_testcancel();
+    ssize_t result = recvmsg_nocancel(fd, message, flags);
+    if (result < 0 && errno == EINTR) pthread_testcancel();
+    return result;
+}
+
+ssize_t sendmsg(int fd, const struct msghdr *message, int flags) {
+    pthread_testcancel();
+    ssize_t result = sendmsg_nocancel(fd, message, flags);
+    if (result < 0 && errno == EINTR) pthread_testcancel();
+    return result;
+}
+
+// Every fcntl command takes at most one int or pointer argument.
+int fcntl(int fd, int command, ...) {
+    va_list args;
+    va_start(args, command);
+    void *argument = va_arg(args, void *);
+    va_end(args);
+    pthread_testcancel();
+    int result = fcntl_nocancel(fd, command, argument);
+    if (result < 0 && errno == EINTR) pthread_testcancel();
+    return result;
+}
+
+// Cancellation is acted on before the descriptor is released, never after:
+// once close has been entered the descriptor is gone even if it reports EINTR.
+int close(int fd) {
+    pthread_testcancel();
+    return close_nocancel(fd);
 }

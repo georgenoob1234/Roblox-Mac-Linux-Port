@@ -6,6 +6,7 @@ extern u64 clock_gettime_nsec_np(unsigned);
 extern int usleep(unsigned);
 struct timeval {long seconds; int microseconds;};
 extern int gettimeofday(struct timeval*,void*);
+extern long time(long*);
 extern int puts(const char*);
 extern void *dlopen(const char*,int);
 extern void *dlsym(void*,const char*);
@@ -49,6 +50,11 @@ int main(void) {
         u64 at=(u64)tv.seconds*1000000000+(u64)tv.microseconds*1000,after=read_time(0);
         if(at+1000<before || at>after)return 8;
     }
+    // time() (vDSO in the native adapter) is the realtime clock in whole seconds.
+    for(unsigned i=0;i<1000;++i) {
+        long stored=-1,before=(long)(read_time(0)/1000000000),value=time(&stored),after=(long)(read_time(0)/1000000000);
+        if(value<before || value>after || stored!=value || time((void*)0)<value)return 15;
+    }
     void *kernel=dlopen("/usr/lib/system/libsystem_kernel.dylib",1);
     if(!kernel)return 9;
     // On Darling the continuous base is 0 and approximate time is not published,
@@ -62,6 +68,6 @@ int main(void) {
         u64 before=mach_continuous_time(),raw_ns=clock_gettime_nsec_np(4),after=mach_continuous_time();
         if(raw_ns<before || raw_ns>after)return 14;
     }
-    puts("PASS: Darwin monotonic clocks agree, never reverse across second boundaries, preserve other clock IDs, gettimeofday matches realtime, and the mach clock family stays on the original time line");
+    puts("PASS: Darwin monotonic clocks agree, never reverse across second boundaries, preserve other clock IDs, gettimeofday and time match realtime, and the mach clock family stays on the original time line");
     return 0;
 }

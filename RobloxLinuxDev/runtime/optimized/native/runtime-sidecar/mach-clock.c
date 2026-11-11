@@ -91,3 +91,18 @@ int gettimeofday(struct timeval *restrict value, void *restrict zone) {
     }
     return call(value, zone);
 }
+
+// libc's time() calls libc's own gettimeofday directly, so the override above
+// never sees it and each call was a real system call (~870 ns instead of
+// ~25 ns). Same value: whole seconds of the realtime clock. The original also
+// saves and restores the floating-point environment around its system call;
+// the vDSO read does not touch it.
+time_t time(time_t *result) {
+    struct timespec now;
+    struct timeval fallback;
+    time_t seconds;
+    if (!tracka_linux_clock_gettime(0, &now)) seconds = now.tv_sec;
+    else seconds = gettimeofday(&fallback, 0) ? -1 : fallback.tv_sec;
+    if (result) *result = seconds;
+    return seconds;
+}

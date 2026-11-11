@@ -356,14 +356,21 @@ static void progress_event(ProgressState *state, const char *line) {
 }
 static gboolean progress_input(GIOChannel *channel, GIOCondition condition, gpointer data) {
     ProgressState *state = data;
-    if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
-        if (state->done) return G_SOURCE_REMOVE;
-        progress_close(state, state->cancelled ? 4 : state->result);
-        return G_SOURCE_REMOVE;
+    /* Read before honouring a hang-up. A producer that writes its final event
+     * and closes the pipe at once makes poll() report the data and the hang-up
+     * together, and the outcome is in that data. */
+    if (!(condition & (G_IO_ERR | G_IO_NVAL))) {
+        GIOStatus result;
+        do {
+            gchar *line = NULL; gsize length = 0; GError *error = NULL;
+            result = g_io_channel_read_line(channel, &line, &length, NULL, &error); g_clear_error(&error);
+            if (result == G_IO_STATUS_NORMAL) progress_event(state, line);
+            g_free(line);
+            if (state->closed) return G_SOURCE_REMOVE;
+        } while (result == G_IO_STATUS_NORMAL);
+        /* No complete line yet and the producer is still there: keep waiting. */
+        if (result == G_IO_STATUS_AGAIN && !(condition & G_IO_HUP)) return G_SOURCE_CONTINUE;
     }
-    gchar *line = NULL; gsize length = 0; GError *error = NULL; GIOStatus result = g_io_channel_read_line(channel, &line, &length, NULL, &error); g_clear_error(&error);
-    if (result == G_IO_STATUS_NORMAL) { progress_event(state, line); g_free(line); return state->closed ? G_SOURCE_REMOVE : G_SOURCE_CONTINUE; }
-    g_free(line);
     if (state->done) return G_SOURCE_REMOVE;
     progress_close(state, state->cancelled ? 4 : state->result);
     return G_SOURCE_REMOVE;

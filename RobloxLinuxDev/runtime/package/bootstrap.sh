@@ -181,13 +181,23 @@ start_progress() {
 }
 finish_progress() {
     [ "$UI_FD" = 1 ] || return 0
-    exec 8>&- 2>/dev/null || true
-    exec 8<&- 2>/dev/null || true
+    # The redirection is scoped to the group. On a bare `exec` it is permanent:
+    # it sent this script's stderr, and the launched game's, to /dev/null for
+    # the rest of the run.
+    { exec 8>&-; } 2>/dev/null || true
     if [ -n "$UI_PID" ]; then
         wait "$UI_PID" 2>/dev/null; ui_result=$?
         UI_RESULT=$ui_result
         [ -e "${ROBLOX_MAC_CANCEL_FILE:-}" ] && UI_CANCELLED=1
-        [ "$ui_result" -eq 0 ] || [ "$ui_result" -eq 4 ] || notify 'Bootstrapper UI unavailable; launching without updating.' 'Roblox'
+        # 0 done, 4 cancelled, 1 the producer reported a failure or ended
+        # without an outcome (its caller reports that). Only 3 means the
+        # window could not be created. By now the update decision has been
+        # made either way, so none of these says anything about updating.
+        case "$ui_result" in
+            0|1|4) ;;
+            3) notify 'The progress window could not be shown; Roblox continues without it.' 'Roblox';;
+            *) say "progress window exited with status $ui_result";;
+        esac
     fi
     rm -f -- "${ROBLOX_MAC_CANCEL_FILE:-}" 2>/dev/null || true
     UI_FD=0; UI_PID=; UI_FIFO=

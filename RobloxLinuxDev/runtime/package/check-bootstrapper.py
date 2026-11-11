@@ -22,6 +22,10 @@ assert "update-header" in ui_source and "Check for updates" in ui_source and "se
 assert 'gtk_style_context_add_class(gtk_widget_get_style_context(state->update), "accent")' in ui_source
 assert "window_decoration" in ui_source and "cursor_appearance" in ui_source
 assert "Restore appearance defaults" in ui_source
+# The progress reader must drain the pipe before it honours a hang-up: the
+# producer's final event and its close can arrive in the same poll().
+progress_input = ui_source.split("static gboolean progress_input", 1)[1].split("static int run_progress", 1)[0]
+assert progress_input.index("g_io_channel_read_line") < progress_input.index("progress_close")
 fetch_source = (ROOT / "scripts/fetch-client.sh").read_text()
 assert "Content-Length" in fetch_source or "content-length" in fetch_source
 assert "ROBLOX_MAC_CANCEL_FILE" in fetch_source and "exit 125" in fetch_source
@@ -340,4 +344,82 @@ exit 2
     assert uri not in second.stdout and uri not in second.stderr
     assert calls.read_text().splitlines()[:4] == ["gdbus", "notify-send", "kdialog", "zenity"]
     assert uri not in calls.read_text()
+
+    # The progress window's exit status. Only 3 (the window could not be
+    # created) is reported to the user, and nothing claims updating was skipped.
+    quiet_bin = Path(tmp) / "quiet-notify-bin"
+    quiet_bin.mkdir()
+    for name in ("gdbus", "notify-send", "kdialog", "zenity"):
+        (quiet_bin / name).write_text("#!/bin/sh\nexit 1\n")
+        (quiet_bin / name).chmod(0o755)
+    status_ui = Path(tmp) / "status-ui"
+    status_ui.write_text('#!/bin/sh\ncase "${2:-}" in --progress) cat > /dev/null; exit "$UI_STATUS";; esac\nexit 3\n')
+    status_ui.chmod(0o755)
+    for code, expected in ((0, ""), (1, ""), (4, ""), (3, "The progress window could not be shown"),
+                           (7, "progress window exited with status 7")):
+        launch = subprocess.run([bootstrap], env={**env, "PATH": str(quiet_bin) + ":" + env["PATH"],
+                                                  "ROBLOX_MAC_UI_APP": str(status_ui), "UI_STATUS": str(code)},
+                                capture_output=True, text=True)
+        assert launch.returncode == 0, (code, launch.stderr)
+        assert "without updating" not in launch.stderr, (code, launch.stderr)
+        assert ("progress window" in launch.stderr) == bool(expected) and expected in launch.stderr, (code, launch.stderr)
+
+    # The real progress window, driven the way bootstrap.sh drives it: a FIFO
+    # held read/write by the producer and closed right after the final event.
+    ui_binary = Path(tmp) / "bootstrapper-ui"
+    flags = subprocess.run(["pkg-config", "--cflags", "--libs", "gtk+-3.0", "json-glib-1.0"], capture_output=True, text=True)
+    built = flags.returncode == 0 and subprocess.run(
+        ["gcc", "-std=c11", "-O2", "-w", ROOT / "package/bootstrapper-ui.c", "-o", ui_binary, *flags.stdout.split()]).returncode == 0
+
+    def progress_exit(chunks, pause=0.0):
+        with tempfile.TemporaryDirectory(prefix="progress ") as state:
+            fifo = Path(state) / "fifo"
+            os.mkfifo(fifo)
+            writer = os.open(fifo, os.O_RDWR)
+            reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+            ui = subprocess.Popen([ui_binary, "--progress", state], stdin=reader,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.close(reader)
+            for chunk in chunks:
+                os.write(writer, chunk)
+                time.sleep(pause)
+            os.close(writer)
+            return ui.wait(timeout=20)
+
+    def progress_line(phase):
+        return (json.dumps({"phase": phase, "percent": 100, "message": phase, "bytes_done": 0, "bytes_total": 0,
+                            "cancellable": False}, separators=(",", ":")) + "\n").encode()
+
+    if not built:
+        print("SKIP progress window exit status: GTK 3 / json-glib development files are not available")
+    elif progress_exit([]) == 3:
+        print("SKIP progress window exit status: no display for GTK")
+    else:
+        launching = progress_line("launching")
+        assert progress_exit([launching]) == 0
+        assert progress_exit([progress_line("checking"), launching]) == 0
+        assert progress_exit([progress_line("cancelled")]) == 4
+        assert progress_exit([progress_line("failed")]) == 1
+        assert progress_exit([progress_line("checking")]) == 1
+        assert progress_exit([]) == 1
+        # An event split across two writes is one event, not the end of the stream.
+        assert progress_exit([launching[:20], launching[20:]], pause=0.2) == 0
+        # End to end: a launch with nothing to update writes "launching" and
+        # closes the pipe at once. That must not produce any notification.
+        real_ui = Path(tmp) / "real-ui"
+        real_ui.write_text(f'#!/bin/sh\n[ "${{2:-}}" = --progress ] || exit 3\nexec \'{ui_binary}\' --progress "$3"\n')
+        real_ui.chmod(0o755)
+        record_bin = Path(tmp) / "record-notify-bin"
+        record_bin.mkdir()
+        notified = Path(tmp) / "progress-notifications"
+        for name in ("gdbus", "notify-send", "kdialog", "zenity"):
+            (record_bin / name).write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{notified}'\nexit 0\n")
+            (record_bin / name).chmod(0o755)
+        for _ in range(3):
+            launch = subprocess.run([bootstrap], env={**env, "PATH": str(record_bin) + ":" + env["PATH"],
+                                                      "DBUS_SESSION_BUS_ADDRESS": "unix:fake", "ROBLOX_MAC_UI_APP": str(real_ui)},
+                                    capture_output=True, text=True)
+            assert launch.returncode == 0, launch.stderr
+            assert not notified.exists(), notified.read_text()
+            assert "progress window" not in launch.stderr, launch.stderr
 print("PASS bootstrap settings/defaults/fake-clock scheduling, first-run marker, decision flow, rollback and one-lock launch")

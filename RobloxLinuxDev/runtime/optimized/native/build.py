@@ -58,7 +58,7 @@ library('libtracka-memory.dylib', [here / 'memory.c', b / 'native-memory/fill.c'
      '-I', str(platform / 'private'), '-I', str(platform / 'include'),
      '-I', str(platform / 'src/string/generic')])
 library('librbxkqueue.dylib', [a / 'shims/kqueue' / name for name in
-        ('kqueue.c', 'ulock.c', 'io.c', 'semaphore.c', 'thread-switch.c', 'workq.c', 'workq-stack.S')], ['-DPLATFORM_MacOSX'])
+        ('kqueue.c', 'ulock.c', 'io.c', 'semaphore.c', 'thread-switch.c', 'workq.c', 'workq-stack.S', 'sockopt.c')], ['-DPLATFORM_MacOSX'])
 # This adapter overrides no libc string functions; allow their normal compiler
 # optimizations in the mapping scanner (unlike the memory/clock interposers).
 library('libtracka-taskinfo.dylib', [here / 'task-info.c'], ['-fbuiltin'])
@@ -92,7 +92,7 @@ checks = [('cpu-check', b / 'cpu-query-check.m', ['-framework', 'Foundation']),
           ('task-info-check', here / 'task-info-check.c', []),
           ('host-memory-check', a / 'shims/identity/memory-check.c', []),
           *[(name + '-check', a / 'probes' / (name + '.c'), [])
-            for name in ('kqueue', 'cond-wakeup', 'workq', 'semaphore', 'semaphore-destroy', 'thread-switch', 'io')]]
+            for name in ('kqueue', 'cond-wakeup', 'workq', 'semaphore', 'semaphore-destroy', 'thread-switch', 'io', 'sockopt')]]
 for name, source, extra in checks:
     run(flags + extra + [source, '-o', out / name], name)
 run(['cc', '-O2', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
@@ -127,7 +127,7 @@ sources = [a / 'profiler/memory.h', *here.glob('*.c'), *here.glob('*.m'), here /
            b / 'cpu-query.h', b / 'cpu-topology.h', b / 'native-clock/clock.c',
            b / 'native-memory/memory.c', b / 'native-memory/fill.c',
            a / 'src/darling/src/external/libc/gen/clock_gettime.c',
-           *[a / 'shims/kqueue' / name for name in ('kqueue.c', 'ulock.c', 'io.c', 'semaphore.c', 'thread-switch.c', 'workq.c', 'workq-stack.S')],
+           *[a / 'shims/kqueue' / name for name in ('kqueue.c', 'ulock.c', 'io.c', 'semaphore.c', 'thread-switch.c', 'workq.c', 'workq-stack.S', 'sockopt.c')],
            *[p for p in (a / 'src/darling/src/external/objc4/runtime').rglob('*')
              if p.is_file() and p.suffix in ('.h', '.mm', '.S')]]
 receipt = {'target': 'x86_64-apple-macos11',

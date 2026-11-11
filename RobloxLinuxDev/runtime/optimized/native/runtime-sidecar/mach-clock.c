@@ -41,6 +41,35 @@ uint64_t mach_absolute_time(void) {
     return (uint64_t)value.tv_sec * UINT64_C(1000000000) + value.tv_nsec;
 }
 
+// The rest of the mach clock family (libsyscall/wrappers/mach_continuous_time.c
+// and mach_approximate_time.c). libsystem_kernel's own versions call its
+// mach_absolute_time directly, so the override above never sees them and each
+// call was a real clock_gettime system call (~380 ns instead of ~20 ns);
+// clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) lands here. Same commpage fields
+// and arithmetic as the originals, so the values and the epoch are unchanged.
+#include <i386/cpu_capabilities.h>
+
+uint64_t mach_continuous_time(void) {
+    volatile uint64_t *base = (volatile uint64_t *)_COMM_PAGE_CONT_TIMEBASE;
+    uint64_t before, absolute;
+    do {
+        before = *base;
+        absolute = mach_absolute_time();
+    } while (__builtin_expect(before != *base, 0));
+    return absolute + before;
+}
+
+uint64_t mach_approximate_time(void) {
+    if (*(volatile uint8_t *)_COMM_PAGE_APPROX_TIME_SUPPORTED) return *(volatile uint64_t *)_COMM_PAGE_APPROX_TIME;
+    return mach_absolute_time();
+}
+
+uint64_t mach_continuous_approximate_time(void) {
+    // No retry, as in the original: a slightly old base is within "approximate".
+    uint64_t base = *(volatile uint64_t *)_COMM_PAGE_CONT_TIMEBASE;
+    return base + mach_approximate_time();
+}
+
 // Darling's gettimeofday is a raw syscall behind its -O0 syscall glue
 // (~650 ns); Linux answers it from the vDSO. Darwin's timeval has a 32-bit
 // tv_usec, so convert rather than pass the Linux structure through.

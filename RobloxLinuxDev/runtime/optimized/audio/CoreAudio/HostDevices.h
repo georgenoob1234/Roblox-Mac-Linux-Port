@@ -22,37 +22,80 @@ struct HostSnapshot {
 };
 // No host thread calls Darwin code: this private native mainloop is pumped on
 // the caller's Darwin thread. Never creates a playback or recording stream.
-static bool hostSnapshot(HostSnapshot& s) {
- pa_mainloop* loop=pa_mainloop_new(); if(!loop)return false;
- pa_context* c=pa_context_new(pa_mainloop_get_api(loop),"CoreAudio device inventory");
- bool ok=c && pa_context_connect(c,nullptr,PA_CONTEXT_NOAUTOSPAWN,nullptr)>=0;
+//
+// The connection is kept open and subscribed to sink, source and server
+// events. Reconnecting for every poll cost one ~23 ms round of connection
+// setup per second (and one libpulse cookie warning each time); now an
+// unchanged server costs one non-blocking mainloop pass per poll, and the
+// inventory is only read again after the server reports a change.
+// All of this state is guarded by g_inventoryMutex.
+struct HostInventory {
+ pa_mainloop* loop=nullptr;
+ pa_context* context=nullptr;
+ bool dirty=true;
+};
+static HostInventory g_inventory;
+static void hostInventoryClose() {
+ auto& v=g_inventory;
+ if(v.context){pa_context_set_subscribe_callback(v.context,nullptr,nullptr);pa_context_disconnect(v.context);pa_context_unref(v.context);}
+ if(v.loop)pa_mainloop_free(v.loop);
+ v=HostInventory();
+}
+enum class HostRefresh {Failed,Unchanged,Fresh};
+static HostRefresh hostSnapshot(HostSnapshot& s) {
+ auto& v=g_inventory;
  const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
  auto pump=[&] {
-  if(std::chrono::steady_clock::now()>=deadline || !PA_CONTEXT_IS_GOOD(pa_context_get_state(c)))return false;
-  if(pa_mainloop_iterate(loop,0,nullptr)<0)return false;
+  if(std::chrono::steady_clock::now()>=deadline || !PA_CONTEXT_IS_GOOD(pa_context_get_state(v.context)))return false;
+  if(pa_mainloop_iterate(v.loop,0,nullptr)<0)return false;
   usleep(1000); return true;
  };
- if(ok)while(pa_context_get_state(c)!=PA_CONTEXT_READY)if(!pump()){ok=false;break;}
  auto finish=[&](pa_operation* op) {
   if(!op)return false;
   bool done=true;
   while(pa_operation_get_state(op)==PA_OPERATION_RUNNING)if(!pump()){done=false;pa_operation_cancel(op);break;}
   pa_operation_unref(op); return done&&!s.failed;
  };
- if(ok)ok=finish(pa_context_get_server_info(c,[](pa_context*,const pa_server_info* i,void* p){
+ if(v.context) {
+  // Deliver queued change events without blocking. The bound only stops a
+  // server that never goes quiet from holding the caller here.
+  int dispatched=1;
+  for(int pass=0;pass<64&&dispatched>0;++pass)dispatched=pa_mainloop_iterate(v.loop,0,nullptr);
+  if(dispatched<0||!PA_CONTEXT_IS_GOOD(pa_context_get_state(v.context)))hostInventoryClose(); // server went away: reconnect below
+ }
+ if(!v.context) {
+  v.loop=pa_mainloop_new(); if(!v.loop)return HostRefresh::Failed;
+  v.context=pa_context_new(pa_mainloop_get_api(v.loop),"CoreAudio device inventory");
+  bool ok=v.context && pa_context_connect(v.context,nullptr,PA_CONTEXT_NOAUTOSPAWN,nullptr)>=0;
+  if(ok)while(pa_context_get_state(v.context)!=PA_CONTEXT_READY)if(!pump()){ok=false;break;}
+  if(ok) {
+   pa_context_set_subscribe_callback(v.context,[](pa_context*,pa_subscription_event_type_t,uint32_t,void* p){*(bool*)p=true;},&v.dirty);
+   ok=finish(pa_context_subscribe(v.context,pa_subscription_mask_t(PA_SUBSCRIPTION_MASK_SINK|PA_SUBSCRIPTION_MASK_SOURCE|PA_SUBSCRIPTION_MASK_SERVER),nullptr,nullptr));
+  }
+  if(!ok){hostInventoryClose();return HostRefresh::Failed;}
+  v.dirty=true;
+ }
+ if(!v.dirty)return HostRefresh::Unchanged;
+ // Cleared before the queries: an event that arrives while they run marks the
+ // inventory dirty again and is picked up by the next poll.
+ v.dirty=false;
+ bool ok=finish(pa_context_get_server_info(v.context,[](pa_context*,const pa_server_info* i,void* p){
   auto& s=*(HostSnapshot*)p;if(!i){s.failed=true;return;}
   s.input=i->default_source_name?i->default_source_name:"";s.output=i->default_sink_name?i->default_sink_name:"";
  },&s));
- if(ok)ok=finish(pa_context_get_sink_info_list(c,[](pa_context*,const pa_sink_info* i,int end,void* p){
+ if(ok)ok=finish(pa_context_get_sink_info_list(v.context,[](pa_context*,const pa_sink_info* i,int end,void* p){
   auto& s=*(HostSnapshot*)p;if(end<0)s.failed=true;if(end||!i)return;
   s.devices.push_back({i->name,i->description?i->description:i->name,false,i->sample_spec.channels,i->sample_spec.rate,uint32_t(std::min(4294967295.0,double(i->latency)*i->sample_spec.rate/1000000.0+0.999999)),i->channel_map});
  },&s));
- if(ok)ok=finish(pa_context_get_source_info_list(c,[](pa_context*,const pa_source_info* i,int end,void* p){
+ if(ok)ok=finish(pa_context_get_source_info_list(v.context,[](pa_context*,const pa_source_info* i,int end,void* p){
   auto& s=*(HostSnapshot*)p;if(end<0)s.failed=true;if(end||!i)return;
   // Include monitor sources as real, explicitly labelled host input endpoints.
   s.devices.push_back({i->name,i->description?i->description:i->name,true,i->sample_spec.channels,i->sample_spec.rate,uint32_t(std::min(4294967295.0,double(i->latency)*i->sample_spec.rate/1000000.0+0.999999)),i->channel_map});
  },&s));
- if(c){pa_context_disconnect(c);pa_context_unref(c);}pa_mainloop_free(loop);return ok;
+ // A failed read leaves no trustworthy state behind; the next poll reconnects
+ // and reads everything again.
+ if(!ok){hostInventoryClose();return HostRefresh::Failed;}
+ return HostRefresh::Fresh;
 }
 static OSStatus hostCopy(UInt32* size,void* out,const void* value,UInt32 required) {
  if(!size)return kAudioHardwareIllegalOperationError;
@@ -162,13 +205,26 @@ static std::vector<HostListener> g_listeners;
 static bool sameAddress(const AudioObjectPropertyAddress& a,const AudioObjectPropertyAddress& b) {
  return a.mSelector==b.mSelector&&a.mScope==b.mScope&&a.mElement==b.mElement;
 }
+// Serializes the inventory connection and g_refresh. Taken before
+// g_objectsMutex, never while holding it. Recursive because device
+// construction below may re-enter through the public CoreAudio entry points.
+static std::recursive_mutex g_inventoryMutex;
+static std::atomic<bool> g_inventoryLoaded{false};
 static void refreshHostDevices() {
  std::vector<std::pair<AudioObjectID,AudioObjectPropertySelector>> changes;
  {
-  std::lock_guard<std::recursive_mutex> lock(g_objectsMutex);
+  // The sound server is queried without g_objectsMutex, so property reads on
+  // other threads no longer wait behind it. Until the first inventory has been
+  // applied every caller waits for it, because an empty device list would be
+  // wrong; afterwards a caller that finds a refresh already running skips it
+  // and reads the registry as it is.
+  std::unique_lock<std::recursive_mutex> inventory(g_inventoryMutex,std::defer_lock);
+  if(!g_inventoryLoaded.load(std::memory_order_acquire))inventory.lock();
+  else if(!inventory.try_lock())return;
   auto now=std::chrono::steady_clock::now();if(now<g_refresh)return;
   g_refresh=now+std::chrono::seconds(1);
-  HostSnapshot snapshot;if(!hostSnapshot(snapshot))return; // preserve last good snapshot on temporary server failure
+  HostSnapshot snapshot;if(hostSnapshot(snapshot)!=HostRefresh::Fresh)return; // unchanged, or preserve last good snapshot on temporary server failure
+  std::lock_guard<std::recursive_mutex> lock(g_objectsMutex);
   std::vector<AudioDeviceID> ids;AudioDeviceID input=0,output=0;
   for(const auto& e:snapshot.devices) {
    HostDevice* device=nullptr;
@@ -188,6 +244,7 @@ static void refreshHostDevices() {
   if(input!=g_defaultInput)changes.push_back({1,kAudioHardwarePropertyDefaultInputDevice});
   if(output!=g_defaultOutput){changes.push_back({1,kAudioHardwarePropertyDefaultOutputDevice});changes.push_back({1,kAudioHardwarePropertyDefaultSystemOutputDevice});}
   g_hostIDs=std::move(ids);g_defaultInput=input;g_defaultOutput=output;
+  g_inventoryLoaded.store(true,std::memory_order_release);
  }
  // Serialize removal with callback execution, without holding the registry lock.
  std::lock_guard<std::recursive_mutex> lock(g_listenerMutex);

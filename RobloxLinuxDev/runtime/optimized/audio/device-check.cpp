@@ -160,6 +160,10 @@ int main(int argc,char** argv) {
   for(auto& reader:readers)reader.join();
   auto other=lookup("PulseAudio:sink:tracka_test_A");
   for(int j=0;j<32;j++){AudioDeviceIOProcID proc=nullptr;assert(!AudioDeviceCreateIOProcID(other,audio,nullptr,&proc));assert(!AudioDeviceStart(other,proc));assert(!AudioDeviceStop(other,proc));assert(!AudioDeviceDestroyIOProcID(other,proc));}
+  // Only the default-output listener is registered so far: the driver moved
+  // the default sink at routing-ready, and that alone must have been reported.
+  for(int j=0;j<50&&!changes;j++)usleep(100000);
+  assert(changes);printf("PASS default output change notification before hotplug (%u)\n",changes.load());
   assert(!AudioObjectAddPropertyListener(1,&devices,changed,nullptr));
   signalFile("hotplug-ready");waitFile("hotplug-added");usleep(1200000);
   auto added=lookup("PulseAudio:sink:tracka_test_C");signalFile("hotplug-seen");waitFile("hotplug-removed");usleep(1200000);

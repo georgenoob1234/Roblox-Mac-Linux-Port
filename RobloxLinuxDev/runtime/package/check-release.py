@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for release paths, flags, update rollback and unsafe downloads."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -219,4 +220,15 @@ esac
     result = subprocess.run([sys.executable, root / 'metal/prepare-cache.py', '--app', pack.parents[3],
         '--source', folder / 'missing-shaders', '--output', folder / 'empty-cache'], capture_output=True)
     assert result.returncode and not (folder / 'empty-cache/report.json').exists()
-print('PASS release paths, FFlags validation/reset, update rollback/success/no-op/lock, session preservation, ZIP traversal rejection')
+
+    # The launcher's stale-cache warning and build.sh both rely on this comparison.
+    current = ['sh', root / 'metal/cache-current.sh', pack.parents[3], folder / 'cache']
+    assert subprocess.run(current).returncode == 1, 'a missing cache must not count as current'
+    (folder / 'cache').mkdir()
+    pack.write_bytes(b'first client')
+    (folder / 'cache/report.json').write_text(json.dumps({'prepared': 1, 'total': 1,
+        'pack_sha256': hashlib.sha256(b'first client').hexdigest(), 'failures': []}, indent=2))
+    assert subprocess.run(current).returncode == 0, 'a cache prepared from this pack is current'
+    pack.write_bytes(b'second client')
+    assert subprocess.run(current).returncode == 1, 'a cache prepared from another pack is stale'
+print('PASS release paths, FFlags validation/reset, update rollback/success/no-op/lock, session preservation, ZIP traversal rejection, stale shader cache detection')

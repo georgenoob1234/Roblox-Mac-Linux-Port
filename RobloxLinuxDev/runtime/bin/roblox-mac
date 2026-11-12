@@ -211,6 +211,13 @@ if [ "${1:-}" != --inside ] && [ "${1:-}" != --shell ] && [ "${ROBLOX_MAC_RENDER
     echo "roblox-mac: prepare the Metal shader cache first: $0 --prepare-shaders" >&2
     exit 1
 fi
+# A cache prepared for another client still starts the game, but every shader that changed
+# since is missing and the client draws its default particle instead. Say so; do not block.
+if [ "${1:-}" != --inside ] && [ "${1:-}" != --shell ] && [ "${ROBLOX_MAC_RENDERER:-}" = metal ] &&
+   ! sh "$ROOT/metal/cache-current.sh" "$APP" "$CACHE"; then
+    if [ "${RELEASE:-0}" = 1 ]; then _prepare=$STATE/update-roblox.sh; else _prepare="$0 --prepare-shaders"; fi
+    echo "roblox-mac: the shader cache was prepared for another client; some effects will be drawn as default particles until you run: $_prepare" >&2
+fi
 
 # --- outside the namespace ------------------------------------------------------------------
 if [ "${1:-}" != "--inside" ]; then

@@ -20,6 +20,14 @@ done
 cp third_party/metal2vulkan-Cargo.lock metal2vulkan/Cargo.lock
 (cd metal2vulkan && cargo build --locked --release --features serde)
 sh runtime/browser/build.sh
+# fetch-client.sh above may have replaced the client. A shader cache prepared for another
+# client lacks every shader that changed, and the client then draws its default particle
+# for those effects, so prepare again whenever the shader pack differs from the cached one.
+# A failure here must not stop the build: the launcher repeats the warning at every start.
+if ! sh runtime/metal/cache-current.sh "$ROBLOX_MAC_APP" "$ROBLOX_MAC_DATA/spv-cache-v1"; then
+    runtime/bin/roblox-mac --prepare-shaders ||
+        echo 'build.sh: shader preparation failed; effects may be drawn with default particles' >&2
+fi
 sh runtime/optimized/audio/build.sh
 cp runtime/optimized/audio/build/CoreAudio.framework/Versions/A/CoreAudio runtime/darling-root/System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
 cp runtime/optimized/audio/build/CoreAudio.component/Contents/MacOS/CoreAudio runtime/darling-root/System/Library/Components/CoreAudio.component/Contents/MacOS/CoreAudio

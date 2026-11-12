@@ -169,8 +169,22 @@ int main(int argc,char** argv) {
   auto added=lookup("PulseAudio:sink:tracka_test_C");signalFile("hotplug-seen");waitFile("hotplug-removed");usleep(1200000);
   AudioObjectPropertyAddress alive={kAudioDevicePropertyDeviceIsAlive,kAudioObjectPropertyScopeGlobal,0};UInt32 live=1,size=4;
   assert(!AudioObjectGetPropertyData(added,&alive,0,nullptr,&size,&live));assert(!live);
+  // The driver restarts the sound server at this step. Streams that are running
+  // across the restart must play and record again without being started anew.
+  outputCalls=0;signalCalls=0;AudioDeviceIOProcID keptOutput=nullptr,keptInput=nullptr;
+  assert(!AudioDeviceCreateIOProcID(output,audio,nullptr,&keptOutput));assert(!AudioDeviceCreateIOProcID(input,audio,nullptr,&keptInput));
+  assert(!AudioDeviceStart(output,keptOutput));assert(!AudioDeviceStart(input,keptInput));
+  for(int j=0;j<50&&(!outputCalls||!signalCalls);j++)usleep(100000);
+  assert(outputCalls&&signalCalls);
   signalFile("hotplug-gone");waitFile("hotplug-restored");usleep(1200000);
   assert(lookup("PulseAudio:sink:tracka_test_C")==added);
+  outputCalls=0;signalCalls=0;
+  for(int j=0;j<150&&(!outputCalls||!signalCalls);j++)usleep(100000);
+  printf("AUDIO after restart output=%u signal=%u\n",outputCalls.load(),signalCalls.load());
+  assert(outputCalls&&signalCalls);
+  assert(!AudioDeviceStop(input,keptInput));assert(!AudioDeviceStop(output,keptOutput));
+  assert(!AudioDeviceDestroyIOProcID(input,keptInput));assert(!AudioDeviceDestroyIOProcID(output,keptOutput));
+  printf("PASS playback and capture resume after a sound server restart\n");
   assert(!AudioObjectRemovePropertyListener(1,&devices,changed,nullptr));
   printf("PASS short-buffer protection, 8 concurrent readers, 32 immediate stop cycles, hotplug and stable UID\n");
   assert(changes);assert(!AudioObjectRemovePropertyListener(1,&listener,changed,nullptr));

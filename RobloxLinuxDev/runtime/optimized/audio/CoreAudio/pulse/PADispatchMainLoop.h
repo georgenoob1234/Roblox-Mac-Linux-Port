@@ -33,6 +33,7 @@ public:
 	
 	pa_mainloop_api* getAPI();
  void perform(void (^cb)(), bool sync=false);
+ void performAfter(double seconds, void (^cb)());
 private:
 	static pa_io_event* io_new(pa_mainloop_api *a, int fd, pa_io_event_flags_t events, pa_io_event_cb_t cb, void *userdata);
 	static void io_enable(pa_io_event *e, pa_io_event_flags_t events);

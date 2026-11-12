@@ -36,9 +36,35 @@ void AudioHardwareStreamPA::connect() {
  auto spec=AudioHardwareImplPA::paSampleSpecForASBD(m_format,&m_convertSignedUnsigned);
  hw->getPAContext(^(pa_context* context) {
   // Stop invalidates the pending owner on this same queue before destruction.
-  if(!*pending || !context || !pa_sample_spec_valid(&spec))return;
-  m_stream=pa_stream_new(context,"CoreAudio",&spec,nullptr);
-  if(m_stream)start();
+  if(!*pending || !pa_sample_spec_valid(&spec))return;
+  if(context)m_stream=pa_stream_new(context,"CoreAudio",&spec,nullptr);
+  if(!m_stream){if(m_wasReady)recoverLater();return;}
+  pa_stream_set_state_callback(m_stream,paStreamStateCB,this);
+  start();
+ });
+}
+// The server ends every stream when it stops (a PipeWire or pipewire-pulse
+// restart). Nothing told the client, so its unit kept "running" in silence
+// until the game was restarted. A stream that has worked before now connects
+// again by itself, once a second, until it succeeds or the client stops it.
+void AudioHardwareStreamPA::paStreamStateCB(pa_stream* s, void* self) {
+ auto* This=static_cast<AudioHardwareStreamPA*>(self);
+ auto state=pa_stream_get_state(s);
+ if(state==PA_STREAM_READY)This->m_wasReady=true;
+ else if(state==PA_STREAM_FAILED&&This->m_wasReady)This->recoverLater();
+}
+void AudioHardwareStreamPA::recoverLater() {
+ if(m_recovering)return;
+ m_recovering=true;
+ auto pending=m_pending;
+ // Never from inside the state callback: libpulse is still walking the stream.
+ static_cast<AudioHardwareImplPA*>(m_hw)->performAfter(1.0,^{
+  if(!*pending)return;
+  m_recovering=false;
+  if(m_stream){pa_stream_set_state_callback(m_stream,nullptr,nullptr);pa_stream_set_read_callback(m_stream,nullptr,nullptr);pa_stream_set_write_callback(m_stream,nullptr,nullptr);pa_stream_disconnect(m_stream);pa_stream_unref(m_stream);m_stream=nullptr;}
+  // Sample time keeps counting; host time restarts from now, not from the gap.
+  if(m_startHostTime)m_startHostTime=AudioGetCurrentHostTime()-AudioConvertNanosToHostTime(UInt64(m_sampleTime*1e9/m_format.mSampleRate));
+  connect();
  });
 }
 AudioHardwareStreamPA::~AudioHardwareStreamPA() {stop();}
@@ -61,7 +87,7 @@ void AudioHardwareStreamPA::start()
 void AudioHardwareStreamPA::stop() {
  static_cast<AudioHardwareImplPA*>(m_hw)->perform(^{
   *m_pending=nullptr;m_running=false;
-  if(m_stream){pa_stream_set_read_callback(m_stream,nullptr,nullptr);pa_stream_set_write_callback(m_stream,nullptr,nullptr);pa_stream_disconnect(m_stream);pa_stream_unref(m_stream);m_stream=nullptr;}
+  if(m_stream){pa_stream_set_state_callback(m_stream,nullptr,nullptr);pa_stream_set_read_callback(m_stream,nullptr,nullptr);pa_stream_set_write_callback(m_stream,nullptr,nullptr);pa_stream_disconnect(m_stream);pa_stream_unref(m_stream);m_stream=nullptr;}
  },true);
 }
 

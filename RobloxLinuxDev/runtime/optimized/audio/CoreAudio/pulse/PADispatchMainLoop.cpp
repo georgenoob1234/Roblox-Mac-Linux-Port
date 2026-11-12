@@ -393,3 +393,6 @@ void PADispatchMainLoop::perform(void (^cb)(), bool sync) {
  else if(sync)dispatch_sync(m_queue,cb);
  else dispatch_async(m_queue,cb);
 }
+void PADispatchMainLoop::performAfter(double seconds, void (^cb)()) {
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,int64_t(seconds*1e9)),m_queue,cb);
+}

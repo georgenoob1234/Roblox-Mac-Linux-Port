@@ -158,8 +158,12 @@ void AudioHardwareImplPA::getPAContext(void (^cb)(pa_context*))
   if(m_context) {
    auto state=pa_context_get_state(m_context);
    if(state==PA_CONTEXT_READY){cb(m_context);return;}
-   if(!PA_CONTEXT_IS_GOOD(state)){cb(nullptr);return;}
-   m_pending.push_back(Block_copy(cb));return;
+   if(PA_CONTEXT_IS_GOOD(state)){m_pending.push_back(Block_copy(cb));return;}
+   // A failed or terminated context never becomes usable again. Keeping it
+   // made every later stream on this device silent once the sound server had
+   // been restarted; connect again instead.
+   pa_context_set_state_callback(m_context,nullptr,nullptr);
+   pa_context_unref(m_context);m_context=nullptr;
   }
   m_pending.push_back(Block_copy(cb));
   m_context=pa_context_new(m_loop->getAPI(),appNameFromExecutable());

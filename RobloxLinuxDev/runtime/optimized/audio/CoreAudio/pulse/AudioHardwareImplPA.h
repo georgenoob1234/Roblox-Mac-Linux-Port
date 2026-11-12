@@ -40,6 +40,7 @@ public:
 	
 	void getPAContext(void (^cb)(pa_context*));
  void perform(void (^cb)(),bool sync=false){m_loop->perform(cb,sync);}
+ void performAfter(double seconds,void (^cb)()){m_loop->performAfter(seconds,cb);}
  virtual const char* deviceName() const {return nullptr;}
 	static pa_sample_spec paSampleSpecForASBD(const AudioStreamBasicDescription& asbd, bool* convertSignedUnsigned = nullptr);
 protected:

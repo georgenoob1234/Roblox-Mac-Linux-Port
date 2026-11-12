@@ -36,6 +36,8 @@ public:
  void connect();
 protected:
 	virtual void start();
+ static void paStreamStateCB(pa_stream* s, void* self);
+ void recoverLater();
 	void transformSignedUnsigned(AudioBufferList* abl) const;
 	AudioTimeStamp timeStamp();
 protected:
@@ -50,6 +52,8 @@ protected:
 	UInt64 m_startHostTime = 0;
 
 	bool m_running = false;
+ // Loop queue only: the stream has played or recorded once, and a reconnect is queued.
+ bool m_wasReady = false, m_recovering = false;
 	std::mutex m_stopMutex;
 };
 

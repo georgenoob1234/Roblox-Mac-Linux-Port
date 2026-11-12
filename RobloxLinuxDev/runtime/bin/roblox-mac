@@ -183,7 +183,9 @@ fi
 if [ "${1:-}" = --place-id ]; then
     case "${2:-}" in ''|*[!0-9]*|0) echo 'Usage: roblox-mac --place-id POSITIVE_PLACE_ID' >&2; exit 2;; esac
     [ "$#" = 2 ] && [ "$2" -gt 0 ] 2>/dev/null || { echo 'Usage: roblox-mac --place-id POSITIVE_PLACE_ID' >&2; exit 2; }
-    set -- --place "$2"
+    # Join through an ordinary deep link. RobloxPlayer's own --place argument is a test
+    # launch: a session started with it joins nothing else from the main menu afterwards.
+    LAUNCH_URI="roblox://experiences/start?placeId=$2"; shift 2
 fi
 case " $* " in *" --shell "*) ;; *)      # a guest shell needs no client
     # AppImage: the client is not bundled; fetch it on first run (and keep it current).
@@ -542,9 +544,14 @@ if os.environ.get('DYLD_FRAMEWORK_PATH'): args.append('DYLD_FRAMEWORK_PATH='+os.
 client=sys.argv[2:]
 if '-channel' not in client[1:]: client[1:1]=['-channel','production']
 launch_uri=os.environ.get('ROBLOX_MAC_LAUNCH_URI')
-if launch_uri:
+if launch_uri and launch_uri.startswith('roblox-player:'):
     client[1:1]=['-protocolString', launch_uri]
     args.append('ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1')
+elif launch_uri:
+    # RobloxPlayer reads only roblox-player: values from -protocolString and ignores any
+    # other. macOS hands a roblox: link to a starting application as an open-URL event;
+    # the AppKit shim delivers this value the same way.
+    args.append('ROBLOX_MAC_OPEN_URL='+launch_uri)
 sys.stdout.buffer.write(os.fsencode(shlex.join(args+client)) + b'\n')
 PYTHON
 )

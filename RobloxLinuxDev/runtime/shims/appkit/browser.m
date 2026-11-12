@@ -164,6 +164,25 @@ static BOOL deliverClientURL(id value) {
     if(![delegate respondsToSelector:@selector(application:openURLs:)])return NO;
     [delegate application:NSApp openURLs:[NSArray arrayWithObject:url]];return YES;
 }
+// macOS hands a roblox: link that starts the application to its delegate as an open-URL
+// event, after applicationWillFinishLaunching: and before applicationDidFinishLaunching:.
+// Cocotron opens launch documents at that point, so the launcher's link is delivered there.
+// (roblox-player: values travel in -protocolString instead; see bin/roblox-mac.)
+@interface NSApplication (RbxLaunchURLOriginal) - (BOOL)openFiles; @end
+@implementation NSApplication (RbxLaunchURL)
++ (void)load {
+    if(getenv("ROBLOX_MAC_OPEN_URL"))method_exchangeImplementations(class_getInstanceMethod(self,@selector(openFiles)),class_getInstanceMethod(self,@selector(rbxOpenFilesAndLaunchURL)));
+}
+- (BOOL)rbxOpenFilesAndLaunchURL {
+    BOOL opened=[self rbxOpenFilesAndLaunchURL];
+    static BOOL delivered=NO;if(delivered)return opened;delivered=YES;
+    const char *value=getenv("ROBLOX_MAC_OPEN_URL");if(!rbx_client_url(value))return opened;
+    NSString *string=[NSString stringWithUTF8String:value];NSURL *url=string?[NSURL URLWithString:string]:nil;
+    id delegate=[self delegate];
+    if(url && [delegate respondsToSelector:@selector(application:openURLs:)])[delegate application:self openURLs:[NSArray arrayWithObject:url]];
+    return opened;
+}
+@end
 @interface MacWorkspace:NSWorkspace @end
 @implementation MacWorkspace (RbxEmbeddedLinks)
 - (BOOL)openURL:(NSURL *)url {

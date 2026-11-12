@@ -72,14 +72,25 @@ done
 exec "$@"
 """,
         "mount": "#!/bin/sh\nexit 0\n",
+        "mountpoint": "#!/bin/sh\nexit 0\n",
         "darling": """#!/usr/bin/env python3
 import os, shlex, sys
+if sys.argv[1:] == ['shell', 'true']:  # first boot of a prefix the fake mount did not bind
+    sys.exit(0)
 assert sys.argv[1:4] == ['shell', 'bash', '-c']
 args = shlex.split(sys.argv[4])
 expected = os.environ['TEST_EXPECTED_URI']
-assert args.count('-protocolString') == 1
-assert os.fsencode(args[args.index('-protocolString') + 1]) == os.fsencode(expected)
-assert 'ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1' in args
+events = [arg for arg in args if arg.startswith('ROBLOX_MAC_OPEN_URL=')]
+if expected.startswith('roblox-player:'):
+    # The client reads these from its arguments.
+    assert args.count('-protocolString') == 1 and not events
+    assert os.fsencode(args[args.index('-protocolString') + 1]) == os.fsencode(expected)
+    assert 'ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1' in args
+else:
+    # Every other link reaches the client as an open-URL event from the AppKit shim.
+    assert '-protocolString' not in args and 'ROBLOX_MAC_PROTOCOL_STRING_PRESENT=1' not in args
+    assert [os.fsencode(event) for event in events] == [b'ROBLOX_MAC_OPEN_URL=' + os.fsencode(expected)]
+    assert '--place' not in args
 print('PASS guest command received opaque URI')
 """,
     }
@@ -100,9 +111,14 @@ print('PASS guest command received opaque URI')
         transport_env.pop("ROBLOX_MAC_LOCK_HELD", None)
         result = subprocess.run([launcher, "--uri", uri], env=transport_env,
                                 capture_output=True)
-        assert result.returncode == 0, 'outer/inner URI handoff failed'
+        assert result.returncode == 0, ('outer/inner URI handoff failed', result.stderr[-600:])
         assert b'PASS guest command received opaque URI' in result.stdout
         assert os.fsencode(uri) not in result.stdout + result.stderr
+
+    # --place-id joins through a deep link, not through the client's test-launch argument.
+    result = subprocess.run([launcher, "--place-id", "2248408710"], capture_output=True,
+        env={**transport_env, "TEST_EXPECTED_URI": "roblox://experiences/start?placeId=2248408710"})
+    assert result.returncode == 0 and b'PASS guest command received opaque URI' in result.stdout, result.stderr[-400:]
 
     # Prove this check detects the exact regression, rather than just accepting
     # an outer receipt event. The fake Darling never prints the supplied value.

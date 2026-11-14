@@ -71,6 +71,15 @@ python3 -B runtime/optimized/audio/check-component-lifecycle.py
 sh runtime/optimized/build.sh
 python3 -B runtime/probes/check-sockopt.py
 python3 -B runtime/probes/check-madvise.py
+python3 -B runtime/probes/check-clock.py
+# The device inventory check starts a private PipeWire server; a build machine
+# without one says so and goes on.
+if command -v pipewire >/dev/null && command -v pipewire-pulse >/dev/null &&
+   command -v wireplumber >/dev/null && command -v pactl >/dev/null; then
+    python3 -B runtime/optimized/audio/check-device-inventory.py
+else
+    echo 'SKIP check-device-inventory.py: pipewire, pipewire-pulse, wireplumber or pactl is not installed'
+fi
 python3 -B runtime/optimized/native/timezone-sidecar/check.py --library runtime/optimized/native/lib/libsystem_c.dylib
 python3 -B runtime/package/check-release.py
 python3 -B runtime/package/check-update-recovery.py

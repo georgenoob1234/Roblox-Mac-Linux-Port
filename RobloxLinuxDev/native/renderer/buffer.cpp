@@ -5,6 +5,8 @@
 
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include "memory-type.h"
 #include "../../runtime/profiler/renderer.h"
 
@@ -19,6 +21,8 @@ struct BufferMemoryBlock {
 	VkDeviceSize slotSize;
 	std::vector<uint32_t> freeSlots;
 	size_t capacity;
+	// Single-slot blocks: when the block last became idle. Guarded by bufferMemoryMutex.
+	std::chrono::steady_clock::time_point idleSince;
 	BufferMemoryBlock(VkDevice device, uint32_t type, VkDeviceSize slotSize, bool visible):
 		device(device), type(type), slotSize(slotSize),
 		capacity(slotSize > 1024*1024 ? 1 : std::clamp<VkDeviceSize>(4*1024*1024/slotSize, 4, 256)) {
@@ -45,6 +49,35 @@ struct BufferMemoryBlock {
 		DynamicVK::vkFreeMemory(device, memory, nullptr);
 	}
 };
+}
+
+// Idle single-slot blocks are mapped driver memory: resident host RAM for as long as
+// they are kept. One place change can fill the cache to its limit (a game was seen asking
+// for about a thousand 12 MiB buffers within two frames) and nothing shrank it again, so
+// 1.5 GiB stayed resident for the rest of the session. Keep a block only while it is
+// likely to be reused: those idle for more than a minute are freed, four per quarter
+// second. Called from the completion thread's poll, which runs whenever frames are
+// drawn; the driver calls happen outside the pool lock, so buffer creation never waits
+// for them.
+void Indium::trimIdleBufferMemory(PrivateDevice& device) {
+	using clock = std::chrono::steady_clock;
+	static std::atomic<clock::rep> due{0};
+	const auto now = clock::now();
+	if (now.time_since_epoch().count() < due.load(std::memory_order_relaxed)) return;
+	due.store((now + std::chrono::milliseconds(250)).time_since_epoch().count(), std::memory_order_relaxed);
+	std::shared_ptr<BufferMemoryBlock> stale[4];
+	size_t count = 0;
+	{
+		std::unique_lock lock(device.bufferMemoryMutex, std::try_to_lock);
+		if (!lock) return;
+		auto& blocks = device.bufferMemoryBlocks;
+		for (auto block = blocks.begin(); block != blocks.end() && count < 4;) {
+			if ((*block)->capacity == 1 && !(*block)->freeSlots.empty() && now - (*block)->idleSince > std::chrono::seconds(60)) {
+				stale[count++] = std::move(*block);
+				block = blocks.erase(block);
+			} else ++block;
+		}
+	}
 }
 
 Indium::Buffer::~Buffer() {};
@@ -202,6 +235,7 @@ Indium::PrivateBuffer::~PrivateBuffer() {
 		if (_memoryBlock->freeSlots.size() == _memoryBlock->capacity) {
 			auto& blocks = _privateDevice->bufferMemoryBlocks;
 			if (_memoryBlock->capacity == 1) {
+				_memoryBlock->idleSince = std::chrono::steady_clock::now();
 				// ponytail: scan the bounded idle cache; add a byte counter only if
 				// scanning becomes measurable. Evict old idle sizes as streaming changes.
 				const auto& memory = _privateDevice->memoryProperties();

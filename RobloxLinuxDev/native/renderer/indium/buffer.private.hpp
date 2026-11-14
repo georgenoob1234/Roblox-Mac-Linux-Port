@@ -37,4 +37,7 @@ namespace Indium {
 		std::shared_ptr<BufferMemoryBlock> _memoryBlock;
 		VkDeviceSize _memoryOffset = 0;
 	};
+
+	// Frees single-slot buffer blocks that have been idle for a while (buffer.cpp).
+	void trimIdleBufferMemory(PrivateDevice& device);
 };

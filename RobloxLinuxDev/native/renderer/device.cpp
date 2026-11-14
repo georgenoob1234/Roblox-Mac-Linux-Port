@@ -607,6 +607,7 @@ std::shared_ptr<Indium::Device> Indium::createSystemDefaultDevice() {
 };
 
 void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
+	trimIdleBufferMemory(*this);
 	// This runs once per commit. Taking the queue lock and polling four upload
 	// fences every time contended with commit for no benefit; commit flushes the
 	// upload queue itself, so servicing it here only matters when work is staged.

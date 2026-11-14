@@ -83,6 +83,7 @@ else
     echo 'SKIP check-device-inventory.py: pipewire, pipewire-pulse, wireplumber or pactl is not installed'
 fi
 python3 -B runtime/optimized/native/timezone-sidecar/check.py --library runtime/optimized/native/lib/libsystem_c.dylib
+python3 -B runtime/package/check-diagnostics.py
 python3 -B runtime/package/check-release.py
 python3 -B runtime/package/check-update-recovery.py
 sh runtime/package/build-appimage.sh

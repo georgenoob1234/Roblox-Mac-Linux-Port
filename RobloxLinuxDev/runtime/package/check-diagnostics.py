@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.dont_write_bytecode = True
 root = Path(__file__).resolve().parents[1]
@@ -109,8 +110,42 @@ with tempfile.TemporaryDirectory(prefix='roblox diagnostics é ') as tmp:
     running.terminate()
     _, error = running.communicate(timeout=5)
     assert running.returncode == 128 + signal.SIGTERM and 'SIGTERM' in error
+    # GPU driver faults the kernel logged during a debug run are kept next to its log.
+    tools = folder / 'tools'
+    tools.mkdir()
+    journal = tools / 'journalctl'
+    kernel_log = folder / 'kernel.log'
+    kernel_log.write_text(
+        '2026-11-14T21:20:49+0300 kernel: [UFW BLOCK] IN=eth0 OUT= SRC=192.0.2.1 DST=224.0.0.251 LEN=32\n'
+        '2026-11-14T21:21:13+0300 kernel: NVRM: Xid (PCI:0000:2b:00): 32, pid=358557, name=mldr, channel 0x00000035 intr 00800000\n'
+        '2026-11-14T21:21:14+0300 kernel: amdgpu 0000:03:00.0: amdgpu: GPU reset begin!\n'
+        '2026-11-14T21:21:15+0300 kernel: [drm:amdgpu_job_timedout [amdgpu]] *ERROR* ring gfx_0.0.0 timeout, signaled seq=1, emitted seq=3\n'
+        '2026-11-14T21:21:16+0300 kernel: i915 0000:00:02.0: [drm] GPU HANG: ecode 9:1:85dffffb, in mldr [1234]\n'
+        '2026-11-14T21:21:17+0300 kernel: usb 1-2: new high-speed USB device number 5 using xhci_hcd\n')
+    journal.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$@" > "{folder}/journal-args"\nexec cat "{kernel_log}"\n')
+    journal.chmod(0o755)
+    child.write_text('#!/bin/sh\nkill -ABRT $$\n')
+    before = time.time()
+    result = subprocess.run([sys.executable, script, '--debug', runtime, data, child],
+                            env={**env, 'PATH': f'{tools}:{env["PATH"]}'}, capture_output=True, text=True)
+    assert result.returncode == 128 + signal.SIGABRT, result.stderr
+    assert 'GPU driver faults in the kernel log during this run: 4 (gpu-faults.txt)' in result.stderr, result.stderr
+    newest = max((data / 'diagnostics').glob('*/runtime.log'), key=lambda path: path.stat().st_mtime).parent
+    faults = (newest / 'gpu-faults.txt').read_text().splitlines()
+    assert len(faults) == 4 and 'Xid' in faults[0] and 'GPU HANG' in faults[3] and not any('UFW' in line or 'usb' in line for line in faults)
+    assert (newest / 'gpu-faults.txt').stat().st_mode & 0o777 == 0o600
+    arguments = (folder / 'journal-args').read_text().split()
+    since = [value for value in arguments if value.startswith('--since=@')]
+    assert '-k' in arguments and '--no-hostname' in arguments and len(since) == 1 and before - 2 <= int(since[0][9:]) <= time.time()
+    # A kernel log that cannot be read, or one without faults, leaves no file and no line.
+    for script_text in ('#!/bin/sh\nexit 1\n', '#!/bin/sh\necho "2026-11-14T21:21:17+0300 kernel: usb 1-2: new device"\n'):
+        journal.write_text(script_text)
+        result = subprocess.run([sys.executable, script, '--debug', runtime, data, child],
+                                env={**env, 'PATH': f'{tools}:{env["PATH"]}'}, capture_output=True, text=True)
+        assert result.returncode == 128 + signal.SIGABRT and 'GPU driver faults' not in result.stderr
+    assert len(list((data / 'diagnostics').glob('*/gpu-faults.txt'))) == 1
     (data / 'config.env').unlink()
     # Explicit diagnostic arguments are forwarded directly to the AppImage.
     actual = subprocess.check_output(['sh', release / 'run.sh', '--debug', '--show-config'], env=env, text=True).splitlines()
     assert any(line.startswith('CONFIG=') for line in actual) and any(line.startswith('SHADER_CACHE=') for line in actual)
-print('PASS diagnostics: signals, namespace/tool checks, no-launch mode, private logs, exit status, shader log retention, arguments')
+print('PASS diagnostics: signals, namespace/tool checks, no-launch mode, private logs, exit status, shader log retention, GPU faults, arguments')

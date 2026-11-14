@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import resource
 import shutil
 import signal
@@ -40,6 +41,23 @@ def probe(label, command, *, env=None, shader=False):
         return f'{label}: timed out after 20 seconds'
     except OSError as error:
         return f'{label}: unavailable ({error.strerror})'
+
+
+# What the kernel logs when a GPU driver gives up on a client: NVIDIA's "Xid" reports, amdgpu's
+# resets and ring timeouts, i915's hangs. The client then loses its Vulkan device and aborts.
+GPU_FAULT = re.compile(r'NVRM: Xid|amdgpu.*GPU reset|\*ERROR\* ring \S+ timeout|GPU HANG')
+
+
+def gpu_faults(since):
+    """Kernel log lines about GPU driver faults since `since` (epoch seconds); None if the log cannot be read."""
+    try:
+        result = subprocess.run(['journalctl', '-k', '--no-pager', '--no-hostname', '-o', 'short-iso', f'--since=@{int(since)}'],
+                                capture_output=True, text=True, errors='replace', timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    return [line for line in result.stdout.splitlines() if GPU_FAULT.search(line)]
 
 
 def report(root):
@@ -112,7 +130,7 @@ def main():
     if mode == '--diagnose':
         print(summary, end='')
         return 0
-    start = time.monotonic()
+    start, started = time.monotonic(), time.time()
     env = dict(os.environ)
     env.setdefault('VK_LOADER_DEBUG', 'error,warn')
     with (folder / 'runtime.log').open('wb') as log:
@@ -137,6 +155,10 @@ def main():
                 pass  # Keep the private log even if the terminal consumer closes.
         code = process.wait()
         result = f'\nRuntime result: {status(code)}; elapsed {time.monotonic() - start:.2f}s\n'
+        # A lost GPU device ends the client with an abort and little else; the reason is in the kernel log.
+        if faults := gpu_faults(started):
+            (folder / 'gpu-faults.txt').write_text('\n'.join(faults) + '\n')
+            result += f'GPU driver faults in the kernel log during this run: {len(faults)} (gpu-faults.txt)\n'
         log.write(result.encode())
     if args == ['--prepare-shaders'] and os.environ.get('ROBLOX_MAC_DATA'):
         # The updater deletes its staging tree. Retain text diagnostics, never AIR/SPIR-V or repro binaries.

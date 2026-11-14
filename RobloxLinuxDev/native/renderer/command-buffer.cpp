@@ -10,6 +10,7 @@
 #include <indium/uploads.hpp>
 #include <indium/tracked-blit.hpp>
 #include <indium/gpu-timing.hpp>
+#include <indium/fatal.hpp>
 #include "presentation-semaphore.hpp"
 
 #include <condition_variable>
@@ -100,10 +101,8 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
 		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 		allocInfo.commandBufferCount = 1;
 
-		if (DynamicVK::vkAllocateCommandBuffers(_privateDevice->device(), &allocInfo, &_commandBuffer) != VK_SUCCESS) {
-			// TODO: handle this in a more C++-friendly way
-			abort();
-		}
+		if (auto failure = DynamicVK::vkAllocateCommandBuffers(_privateDevice->device(), &allocInfo, &_commandBuffer); failure != VK_SUCCESS)
+			INDIUM_VULKAN_FATAL("vkAllocateCommandBuffers", failure);
 
 	}
 
@@ -111,10 +110,8 @@ Indium::PrivateCommandBuffer::PrivateCommandBuffer(std::shared_ptr<PrivateComman
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	RbxProfiler::DiagnosticScope begin(RBX_DIAG_COMMAND_BEGIN,0,this);
-	if (DynamicVK::vkBeginCommandBuffer(_commandBuffer, &beginInfo) != VK_SUCCESS) {
-		// TODO: same
-		abort();
-	}
+	if (auto failure = DynamicVK::vkBeginCommandBuffer(_commandBuffer, &beginInfo); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkBeginCommandBuffer", failure);
 	begin.finish();
 	synchronizeGraphicsQueue(_commandBuffer);
 	RbxProfiler::DiagnosticScope queries(RBX_DIAG_QUERY_SETUP,0,this);
@@ -257,10 +254,8 @@ void Indium::PrivateCommandBuffer::commit() {
 	const auto uploadsFinished = timingStart();
  phase.change(RBX_PROF_END_COMMAND);
 	endGpuTiming(_commandBuffer, _timestampPool);
-	if (DynamicVK::vkEndCommandBuffer(_commandBuffer) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkEndCommandBuffer(_commandBuffer); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkEndCommandBuffer", failure);
 	const auto encodingFinished = timingStart();
  phase.change(RBX_PROF_SYNC);
 	RbxProfiler::DiagnosticScope sync(RBX_DIAG_COMMAND_SYNC,diagnostic.bytes,this,diagnostic.detail);
@@ -408,10 +403,8 @@ void Indium::PrivateCommandBuffer::commit() {
 #endif
 	{ RbxProfiler::CpuScope cpuSubmit(RBX_PROF_SUBMIT);
 	RbxProfiler::DiagnosticScope submit(RBX_DIAG_QUEUE_SUBMIT,diagnostic.bytes,this,diagnostic.detail);
-	if (DynamicVK::vkQueueSubmit2(_privateDevice->graphicsQueue(), 1, &info, VK_NULL_HANDLE) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkQueueSubmit2(_privateDevice->graphicsQueue(), 1, &info, VK_NULL_HANDLE); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkQueueSubmit2", failure);
 	}
 	const auto submitFinished = timingStart();
  phase.change(RBX_PROF_POST_SUBMIT);
@@ -473,10 +466,8 @@ void Indium::PrivateCommandBuffer::commit() {
 
 void Indium::PrivateCommandBuffer::presentDrawable(std::shared_ptr<Drawable> drawable) {
 	std::scoped_lock lock(_mutex);
-	if (_committed) {
-		// TODO
-		abort();
-	}
+	if (_committed)
+		INDIUM_FATAL("presentDrawable called on a command buffer that is already committed");
 	_drawablesToPresent.push_back(drawable);
 };
 
@@ -490,19 +481,15 @@ void Indium::PrivateCommandBuffer::addCompletedHandlerLocked(std::function<void(
 
 void Indium::PrivateCommandBuffer::addScheduledHandler(std::function<void(std::shared_ptr<CommandBuffer>)> handler) {
 	std::scoped_lock lock(_mutex);
-	if (_committed) {
-		// TODO
-		abort();
-	}
+	if (_committed)
+		INDIUM_FATAL("addScheduledHandler called on a command buffer that is already committed");
 	addScheduledHandlerLocked(handler);
 };
 
 void Indium::PrivateCommandBuffer::addCompletedHandler(std::function<void(std::shared_ptr<CommandBuffer>)> handler) {
 	std::scoped_lock lock(_mutex);
-	if (_committed) {
-		// TODO
-		abort();
-	}
+	if (_committed)
+		INDIUM_FATAL("addCompletedHandler called on a command buffer that is already committed");
 	addCompletedHandlerLocked(handler);
 };
 

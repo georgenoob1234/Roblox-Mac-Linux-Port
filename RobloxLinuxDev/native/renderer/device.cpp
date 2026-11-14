@@ -13,6 +13,7 @@
 #include <indium/compute-pipeline.private.hpp>
 #include <indium/dynamic-vk.hpp>
 #include <indium/graphics-libraries.hpp>
+#include <indium/fatal.hpp>
 
 #include <iridium/iridium.hpp>
 
@@ -107,7 +108,7 @@ void synchronizeSubmissionEntryPoints() {
 	std::call_once(once, [] {
 		auto& submit = Indium::DynamicVK::vkQueueSubmit;
 		auto& submit2 = Indium::DynamicVK::vkQueueSubmit2;
-		if (!submit.resolve() || !submit2.resolve()) std::abort();
+		if (!submit.resolve() || !submit2.resolve()) INDIUM_FATAL("vkQueueSubmit or vkQueueSubmit2 is not available");
 		originalSubmit = reinterpret_cast<PFN_vkQueueSubmit>(submit.pointer);
 		originalSubmit2 = reinterpret_cast<PFN_vkQueueSubmit2>(submit2.pointer);
 		submit.pointer = reinterpret_cast<void*>(&synchronizedSubmit);
@@ -382,10 +383,8 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
 	deviceCreateInfo.enabledExtensionCount = extensions.size();
 	deviceCreateInfo.ppEnabledExtensionNames = extensions.data();
 	auto deviceResult = DynamicVK::vkCreateDevice(_physicalDevice, &deviceCreateInfo, nullptr, &_device);
-	if (deviceResult != VK_SUCCESS) {
-		fprintf(stderr, "Indium: vkCreateDevice failed (%d)\n", int(deviceResult));
-		abort();
-	}
+	if (deviceResult != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkCreateDevice", deviceResult);
 
 	_features = indiumFeatures;
 
@@ -439,10 +438,8 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
 	semaphoreCreateInfo.pNext = &semaphoreTypeInfo;
 
 	VkSemaphore wakeupSemaphore;
-	if (DynamicVK::vkCreateSemaphore(_device, &semaphoreCreateInfo, nullptr, &wakeupSemaphore) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkCreateSemaphore(_device, &semaphoreCreateInfo, nullptr, &wakeupSemaphore); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkCreateSemaphore", failure);
 
 	_eventLoopSemaphores.push_back(wakeupSemaphore);
 	_eventLoopWaitValues.push_back(1);
@@ -453,8 +450,8 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
 	recycledCompletionSemaphores.reserve(completionSemaphoreCapacity);
 	for (size_t i = 0; i < completionSemaphoreCapacity; ++i) {
 		VkSemaphore semaphore;
-		if (DynamicVK::vkCreateSemaphore(_device, &semaphoreCreateInfo, nullptr, &semaphore) != VK_SUCCESS)
-			abort();
+		if (auto failure = DynamicVK::vkCreateSemaphore(_device, &semaphoreCreateInfo, nullptr, &semaphore); failure != VK_SUCCESS)
+			INDIUM_VULKAN_FATAL("vkCreateSemaphore", failure);
 		recycledCompletionSemaphores.emplace_back(semaphore, 0);
 		semaphoreLifetimeDiagnostic(false, true);
 	}
@@ -464,10 +461,8 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
 		createInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 		createInfo.queueFamilyIndex = _graphicsQueueFamilyIndex ? *_graphicsQueueFamilyIndex : *_computeQueueFamilyIndex;
 
-		if (DynamicVK::vkCreateCommandPool(_device, &createInfo, nullptr, &_oneshotCommandPool) != VK_SUCCESS) {
-			// TODO
-			abort();
-		}
+		if (auto failure = DynamicVK::vkCreateCommandPool(_device, &createInfo, nullptr, &_oneshotCommandPool); failure != VK_SUCCESS)
+			INDIUM_VULKAN_FATAL("vkCreateCommandPool", failure);
 	}
 	if (_graphicsQueueFamilyIndex) graphicsTimestampBits = queueFamilies[*_graphicsQueueFamilyIndex].timestampValidBits;
 	synchronizeSubmissionEntryPoints();
@@ -679,7 +674,7 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
 		return;
 	}
 
-	if (result != VK_SUCCESS) abort();
+	if (result != VK_SUCCESS) INDIUM_VULKAN_FATAL("vkWaitSemaphores", result);
 
 	std::vector<size_t> readyIndices;
 
@@ -688,10 +683,8 @@ void Indium::PrivateDevice::pollEvents(uint64_t timeoutNanoseconds) {
 	for (size_t i = 1; i < semaphores.size(); ++i) {
 		uint64_t count;
 
-		if (DynamicVK::vkGetSemaphoreCounterValue(_device, semaphores[i], &count) != VK_SUCCESS) {
-			// TODO
-			abort();
-		}
+		if (auto failure = DynamicVK::vkGetSemaphoreCounterValue(_device, semaphores[i], &count); failure != VK_SUCCESS)
+			INDIUM_VULKAN_FATAL("vkGetSemaphoreCounterValue", failure);
 
 		if (count >= values[i]) {
 			readyIndices.push_back(i);
@@ -745,7 +738,8 @@ void Indium::PrivateDevice::wakeupEventLoop() {
 	info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
 	info.semaphore = _eventLoopSemaphores[0];
 	info.value = oldVal;
-	if (DynamicVK::vkSignalSemaphore(_device, &info) != VK_SUCCESS) abort();
+	if (auto failure = DynamicVK::vkSignalSemaphore(_device, &info); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkSignalSemaphore", failure);
 };
 
 void Indium::PrivateDevice::waitForSemaphore(VkSemaphore semaphore, uint64_t targetValue, std::function<void()> callback) {
@@ -784,10 +778,8 @@ Indium::TimelineSemaphore Indium::PrivateDevice::getTimelineSemaphore() {
 
 	VkSemaphore semaphore;
 	RbxProfiler::DiagnosticScope create(RBX_DIAG_SEMAPHORE_CREATE,0,this);
-	if (DynamicVK::vkCreateSemaphore(_device, &createInfo, nullptr, &semaphore) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkCreateSemaphore(_device, &createInfo, nullptr, &semaphore); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkCreateSemaphore", failure);
 
 	create.finish();
 	semaphoreLifetimeDiagnostic(false, true);
@@ -863,10 +855,8 @@ Indium::BinarySemaphore Indium::PrivateDevice::getBinarySemaphore(bool exportabl
 	}
 
 	VkSemaphore semaphore;
-	if (DynamicVK::vkCreateSemaphore(_device, &createInfo, nullptr, &semaphore) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkCreateSemaphore(_device, &createInfo, nullptr, &semaphore); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkCreateSemaphore", failure);
 
 	semaphoreLifetimeDiagnostic(true, true, exportable);
 	return BinarySemaphore { shared_from_this(), semaphore };

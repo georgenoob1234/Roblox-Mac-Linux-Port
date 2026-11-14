@@ -1,6 +1,7 @@
 #include <indium/uploads.hpp>
 #include <indium/dynamic-vk.hpp>
 #include <indium/gpu-timing.hpp>
+#include <indium/fatal.hpp>
 #include <cstring>
 #include <stdexcept>
 #include <cstdio>
@@ -9,8 +10,8 @@
 
 using namespace Indium;
 namespace {
-void checked(VkResult result) {
-    if (result != VK_SUCCESS) throw std::runtime_error("Vulkan texture upload failed: " + std::to_string(result));
+void checked(const char* call, VkResult result) {
+    if (result != VK_SUCCESS) throw std::runtime_error(std::string("Vulkan texture upload failed: ") + call + " returned " + vulkanResultName(result) + " (" + std::to_string(result) + ")");
 }
 }
 struct UploadQueue::Batch {
@@ -58,12 +59,12 @@ UploadQueue::Batch& UploadQueue::begin(size_t bytes) {
         slot = std::make_shared<Batch>(device.device());
         VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pool.queueFamilyIndex = *device.graphicsQueueFamilyIndex();
-        checked(DynamicVK::vkCreateCommandPool(device.device(), &pool, nullptr, &slot->pool));
+        checked("vkCreateCommandPool", DynamicVK::vkCreateCommandPool(device.device(), &pool, nullptr, &slot->pool));
         VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         alloc.commandPool = slot->pool; alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; alloc.commandBufferCount = 1;
-        checked(DynamicVK::vkAllocateCommandBuffers(device.device(), &alloc, &slot->command));
+        checked("vkAllocateCommandBuffers", DynamicVK::vkAllocateCommandBuffers(device.device(), &alloc, &slot->command));
         VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        checked(DynamicVK::vkCreateFence(device.device(), &fence, nullptr, &slot->fence));
+        checked("vkCreateFence", DynamicVK::vkCreateFence(device.device(), &fence, nullptr, &slot->fence));
     }
     auto& batch = *slot;
     if (batch.pending) {
@@ -74,8 +75,8 @@ UploadQueue::Batch& UploadQueue::begin(size_t bytes) {
             // backpressure. Increase the ring only if measured stalls justify it.
             ++waits;
             UploadProfileScope timing(RBX_PROF_UPLOAD_FENCE_WAIT);
-            checked(DynamicVK::vkWaitForFences(device.device(), 1, &batch.fence, VK_TRUE, UINT64_MAX));
-        } else checked(result);
+            checked("vkWaitForFences", DynamicVK::vkWaitForFences(device.device(), 1, &batch.fence, VK_TRUE, UINT64_MAX));
+        } else checked("vkGetFenceStatus", result);
         batch.pending = false;
         batch.resources.clear();
     }
@@ -85,23 +86,23 @@ UploadQueue::Batch& UploadQueue::begin(size_t bytes) {
         const size_t capacity = std::max<size_t>(4 * 1024 * 1024, bytes);
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = capacity; info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        checked(DynamicVK::vkCreateBuffer(device.device(), &info, nullptr, &batch.staging));
+        checked("vkCreateBuffer", DynamicVK::vkCreateBuffer(device.device(), &info, nullptr, &batch.staging));
         VkMemoryRequirements req{};
         DynamicVK::vkGetBufferMemoryRequirements(device.device(), batch.staging, &req);
         auto index = buffer_memory_type(device.memoryProperties(), req.memoryTypeBits, true, false, false);
         if (index == UINT32_MAX) throw std::runtime_error("No coherent texture staging memory");
         VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         alloc.allocationSize = req.size; alloc.memoryTypeIndex = index;
-        checked(DynamicVK::vkAllocateMemory(device.device(), &alloc, nullptr, &batch.memory));
-        checked(DynamicVK::vkBindBufferMemory(device.device(), batch.staging, batch.memory, 0));
-        checked(DynamicVK::vkMapMemory(device.device(), batch.memory, 0, VK_WHOLE_SIZE, 0, &batch.mapped));
+        checked("vkAllocateMemory", DynamicVK::vkAllocateMemory(device.device(), &alloc, nullptr, &batch.memory));
+        checked("vkBindBufferMemory", DynamicVK::vkBindBufferMemory(device.device(), batch.staging, batch.memory, 0));
+        checked("vkMapMemory", DynamicVK::vkMapMemory(device.device(), batch.memory, 0, VK_WHOLE_SIZE, 0, &batch.mapped));
         batch.capacity = capacity;
         ++stagingAllocations;
     }
-    checked(DynamicVK::vkResetCommandPool(device.device(), batch.pool, 0));
+    checked("vkResetCommandPool", DynamicVK::vkResetCommandPool(device.device(), batch.pool, 0));
     VkCommandBufferBeginInfo info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    checked(DynamicVK::vkBeginCommandBuffer(batch.command, &info));
+    checked("vkBeginCommandBuffer", DynamicVK::vkBeginCommandBuffer(batch.command, &info));
     batch.used = batch.operations = 0;
     current = &batch;
     return batch;
@@ -153,14 +154,14 @@ void UploadQueue::copy(VkImage image, VkImageAspectFlags aspect, VkBufferImageCo
 
 void UploadQueue::flush() {
     if (!current) return;
-    checked(DynamicVK::vkEndCommandBuffer(current->command));
+    checked("vkEndCommandBuffer", DynamicVK::vkEndCommandBuffer(current->command));
     static DynamicVK::DynamicFunction<PFN_vkResetFences> reset("vkResetFences");
-    checked(reset(device.device(), 1, &current->fence));
+    checked("vkResetFences", reset(device.device(), 1, &current->fence));
     VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     info.commandBufferCount = 1; info.pCommandBuffers = &current->command;
     {
         UploadProfileScope timing(RBX_PROF_UPLOAD_SUBMIT);
-        checked(DynamicVK::vkQueueSubmit(device.graphicsQueue(), 1, &info, current->fence));
+        checked("vkQueueSubmit", DynamicVK::vkQueueSubmit(device.graphicsQueue(), 1, &info, current->fence));
     }
     current->pending = true; current = nullptr; ++submissions;
     needsService.store(true, std::memory_order_relaxed);
@@ -171,7 +172,7 @@ void UploadQueue::collect() {
     for (auto& batch : batches) if (batch && batch->pending) {
         auto result = status(device.device(), batch->fence);
         if (result == VK_NOT_READY) continue;
-        checked(result);
+        checked("vkGetFenceStatus", result);
         batch->pending = false; batch->resources.clear();
         if (batch->capacity > 4 * 1024 * 1024) batch->freeStaging();
     }
@@ -186,11 +187,10 @@ UploadQueue::~UploadQueue() noexcept {
     try {
         for (auto& batch : batches) if (batch && batch->pending) {
             UploadProfileScope timing(RBX_PROF_UPLOAD_FENCE_WAIT);
-            if (DynamicVK::vkWaitForFences(device.device(), 1, &batch->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-                std::abort();
+            if (auto failure = DynamicVK::vkWaitForFences(device.device(), 1, &batch->fence, VK_TRUE, UINT64_MAX); failure != VK_SUCCESS)
+                INDIUM_VULKAN_FATAL("vkWaitForFences", failure);
         }
     } catch (...) {
-        std::fputs("Texture upload teardown failed\n", stderr);
-        std::abort();
+        INDIUM_FATAL("texture upload teardown failed");
     }
 }

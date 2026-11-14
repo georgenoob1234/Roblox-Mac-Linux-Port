@@ -5,6 +5,7 @@
 #include <indium/dynamic-vk.hpp>
 #include <indium/pipeline.private.hpp>
 #include <indium/graphics-libraries.hpp>
+#include <indium/fatal.hpp>
 #include <cstring>
 #include <unordered_map>
 
@@ -96,10 +97,8 @@ Indium::PrivateLibrary::PrivateLibrary(std::shared_ptr<PrivateDevice> device, co
 	createInfo.codeSize = code.size() * sizeof(uint32_t);
 	createInfo.pCode = code.data();
 
-	if (DynamicVK::vkCreateShaderModule(_privateDevice->device(), &createInfo, hostAllocator, &_shaderModule) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkCreateShaderModule(_privateDevice->device(), &createInfo, hostAllocator, &_shaderModule); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkCreateShaderModule", failure);
 	// Build its pipeline library in the background, before any pipeline asks.
 	if (graphics && _privateDevice->pipelineLibraries) _privateDevice->graphicsLibraries->prepare(_shaderModule, *graphics);
 

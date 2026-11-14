@@ -34,6 +34,7 @@ fixture = r'''
 #include <mutex>
 #include <utility>
 #include <vulkan/vulkan.h>
+#include <indium/fatal.hpp>
 #include "presentation-route.hpp"
 namespace Indium {
 struct BinarySemaphore {};
@@ -410,7 +411,7 @@ with tempfile.TemporaryDirectory(prefix="presentation-route-") as temporary:
     path = pathlib.Path(temporary)
     source = path / "check.cpp"
     source.write_text(fixture)
-    subprocess.run(["c++", "-std=c++17", "-O2", "-pthread", "-I", str(here / "../../runtime/src/Vulkan-Headers-1.3.290/include"), str(source), "-o", str(path / "check")], check=True)
+    subprocess.run(["c++", "-std=c++17", "-O2", "-pthread", "-I", str(here), "-I", str(here / "../../runtime/src/Vulkan-Headers-1.3.290/include"), str(source), "-o", str(path / "check")], check=True)
     subprocess.run([str(path / "check")], check=True)
 
     # Exercise the actual guest presentation hook, including older helper ABIs.

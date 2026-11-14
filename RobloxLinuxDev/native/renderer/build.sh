@@ -16,6 +16,9 @@ python3 "$HERE/command-sync-check.py"
 python3 "$HERE/completion-poll-check.py"
 c++ -std=c++17 -O2 -pthread "$HERE/pipeline-workers-check.cpp" -o "$OUT/pipeline-workers-check"
 "$OUT/pipeline-workers-check"
+c++ -std=c++17 -O2 -I "$HERE" -I "$A/src/Vulkan-Headers-1.3.290/include" "$HERE/fatal-check.cpp" -o "$OUT/fatal-check"
+"$OUT/fatal-check"
+python3 "$HERE/fatal-check.py"
 set --
 for source in "$A"/src/indium/src/indium/*.cpp; do
     case "$(basename "$source")" in buffer.cpp|command-buffer.cpp|device.cpp|render-command-encoder.cpp|render-pipeline.cpp|compute-pipeline.cpp|library.cpp) ;; *) set -- "$@" "$source" ;; esac

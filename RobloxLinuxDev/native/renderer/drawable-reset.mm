@@ -21,6 +21,7 @@
 #include "presentation-semaphore.hpp"
 #include "presentation-route.hpp"
 #include "swapchain.hpp"
+#include <indium/fatal.hpp>
 
 struct PresentationImport {
     std::shared_ptr<PresentationSemaphores::Entry> entry;
@@ -36,7 +37,7 @@ struct PresentationImport {
 @implementation TrackAImportedSemaphores
 - (void)dealloc {
     CGLContextObj previous = CGLGetCurrentContext();
-    if (CGLSetCurrentContext(context) != kCGLNoError) std::abort();
+    if (CGLSetCurrentContext(context) != kCGLNoError) INDIUM_FATAL("cannot make the GL context of the imported semaphores current");
     for (auto& imported : imports) {
         glDeleteSemaphoresEXT(1, &imported.name);
         if (imported.fence) glDeleteSync(imported.fence);
@@ -149,7 +150,7 @@ void traceStalePresentation(const char* route, uint64_t serial) {
 
 template<class T> T quartzFunction(const char* name) {
     auto result = reinterpret_cast<T>(dlsym(RTLD_DEFAULT, name));
-    if (!result) std::abort();
+    if (!result) { std::fprintf(stderr, "Indium: QuartzCore function %s not found\n", name); INDIUM_FATAL("a QuartzCore function is missing"); }
     return result;
 }
 void drawableDidPresent(CAMetalDrawableActual* drawable) {
@@ -345,7 +346,7 @@ namespace {
 template<class T> T glFunction(const char* name) {
     static void* library = dlopen("/System/Library/Frameworks/OpenGL.framework/Libraries/libGL.dylib", RTLD_LAZY);
     auto result = reinterpret_cast<T>(dlsym(library, name));
-    if (!result) std::abort();
+    if (!result) { std::fprintf(stderr, "Indium: OpenGL function %s not found\n", name); INDIUM_FATAL("an OpenGL function is missing"); }
     return result;
 }
 void semaphoreDiagnostic(int operation, GLsizei count, const GLuint* objects) {
@@ -375,7 +376,7 @@ extern "C" void glGenSemaphoresEXT(GLsizei count, GLuint* semaphores) {
 extern "C" void glImportSemaphoreFdEXT(GLuint semaphore, GLenum type, GLint fd) {
     static auto original = glFunction<decltype(&glImportSemaphoreFdEXT)>("glImportSemaphoreFdEXT");
     // Isolate errors from this import before deciding who owns the exported FD.
-    for (unsigned i = 0; glGetError() != GL_NO_ERROR; ++i) if (i == 31) std::abort();
+    for (unsigned i = 0; glGetError() != GL_NO_ERROR; ++i) if (i == 31) INDIUM_FATAL("glGetError keeps reporting errors before a semaphore import");
     original(semaphore, type, fd);
     auto error = glGetError();
     if (error != GL_NO_ERROR) {
@@ -383,7 +384,7 @@ extern "C" void glImportSemaphoreFdEXT(GLuint semaphore, GLenum type, GLint fd) 
         // Never inspect/close fd after a successful import (GL owns it).
         if (fd >= 0) close(fd);
         std::fprintf(stderr, "PRESENT semaphore import failed GLerror=0x%x\n", error);
-        std::abort();
+        INDIUM_FATAL("glImportSemaphoreFdEXT failed");
     }
     semaphoreDiagnostic(1, 1, &semaphore);
 }
@@ -402,7 +403,7 @@ void trackb_prepare_render(id self, SEL) {
         Class cls = objc_getClass("CAMetalLayerInternal");
         for (size_t i=0;i<result.size();++i) {
             Ivar ivar = class_getInstanceVariable(cls,names[i]);
-            if (!ivar) std::abort();
+            if (!ivar) { std::fprintf(stderr, "Indium: CAMetalLayerInternal has no instance variable %s\n", names[i]); INDIUM_FATAL("CAMetalLayerInternal does not have the expected layout"); }
             result[i] = ivar_getOffset(ivar);
         }
         return result;
@@ -421,7 +422,7 @@ void trackb_prepare_render(id self, SEL) {
     for (;;) {
         [condition lock];
         if (count) {
-            if (count>queued.size() || queued[0]>=drawables.size()) std::abort();
+            if (count>queued.size() || queued[0]>=drawables.size()) INDIUM_FATAL("the layer's queue of drawables is inconsistent");
             drawable = drawables[queued[0]];
             --count;
             for (size_t i=0;i<count;++i) queued[i]=queued[i+1];
@@ -439,7 +440,7 @@ void trackb_prepare_render(id self, SEL) {
             if (!imported.fence) continue;
             auto status = glClientWaitSync(imported.fence, 0, 0);
             if (status == GL_TIMEOUT_EXPIRED) continue;
-            if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) std::abort();
+            if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) { std::fprintf(stderr, "Indium: glClientWaitSync returned 0x%x, GL error 0x%x\n", unsigned(status), unsigned(glGetError())); INDIUM_FATAL("waiting for a presentation fence failed"); }
             glDeleteSync(imported.fence);
             imported.fence = nullptr;
             PresentationSemaphores::consumed(imported.entry);
@@ -456,14 +457,14 @@ void trackb_prepare_render(id self, SEL) {
         }
         using TextureName = GLuint (*)(const CAMetalDrawableTexture*);
         static auto textureName = reinterpret_cast<TextureName>(dlsym(RTLD_DEFAULT,"_ZNK22CAMetalDrawableTexture9glTextureEv"));
-        if (!textureName) std::abort();
+        if (!textureName) INDIUM_FATAL("CAMetalDrawableTexture::glTexture() is missing");
         GLuint texture = textureName(drawable->_texture.get());
         PresentationImport* imported = nullptr;
         for (auto& candidate : cache->imports) {
             if (candidate.entry->semaphore == drawable->_semaphore) {
                 imported = &candidate;
                 drawable->_glSemaphore = candidate.name;
-                if (candidate.fence) std::abort();
+                if (candidate.fence) INDIUM_FATAL("a drawable semaphore is reused while its previous fence is still pending");
                 break;
             }
         }
@@ -471,14 +472,14 @@ void trackb_prepare_render(id self, SEL) {
             // A nonzero generated name proves this thread has a usable GL
             // context before we export a descriptor that GL must consume.
             glGenSemaphoresEXT(1,&drawable->_glSemaphore);
-            if (!drawable->_glSemaphore) std::abort();
+            if (!drawable->_glSemaphore) INDIUM_FATAL("glGenSemaphoresEXT returned no name (no usable GL context on this thread)");
             static Indium::DynamicVK::DynamicFunction<PFN_vkGetSemaphoreFdKHR> getFd("vkGetSemaphoreFdKHR");
             VkSemaphoreGetFdInfoKHR info{};
             info.sType=VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
             info.semaphore=drawable->_semaphore->semaphore;
             info.handleType=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
             int fd=-1;
-            if (getFd(drawable->_semaphore->device->device(),&info,&fd)!=VK_SUCCESS) std::abort();
+            if (auto failure=getFd(drawable->_semaphore->device->device(),&info,&fd); failure!=VK_SUCCESS) INDIUM_VULKAN_FATAL("vkGetSemaphoreFdKHR", failure);
             glImportSemaphoreFdEXT(drawable->_glSemaphore,GL_HANDLE_TYPE_OPAQUE_FD_EXT,fd);
             // Successful import transfers FD ownership to GL. Never close it.
             // ponytail: retain at most 32 imports per layer; exceptional backlog
@@ -499,7 +500,7 @@ void trackb_prepare_render(id self, SEL) {
         if (drawable->_glSemaphore) {
             if (imported) {
                 imported->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                if (!imported->fence) std::abort();
+                if (!imported->fence) INDIUM_FATAL("glFenceSync returned no fence");
             } else {
                 glDeleteSemaphoresEXT(1, &drawable->_glSemaphore);
             }
@@ -541,7 +542,7 @@ void CAMetalDrawableActual::reset() {
     }
     // Imported names belong to prepareRender's context cache. A queued
     // drawable that is dropped before rendering never exports a descriptor.
-    if (_glSemaphore) std::abort();
+    if (_glSemaphore) INDIUM_FATAL("a drawable is destroyed while it still owns a GL semaphore name");
     // An abandoned drawable may have rendered without being presented. Its
     // prior export must not make a later Vulkan-only frame look GL-ready.
     _texture->synchronizePresentation();

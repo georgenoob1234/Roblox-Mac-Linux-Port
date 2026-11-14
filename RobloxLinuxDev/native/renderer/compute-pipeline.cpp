@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <indium/dynamic-vk.hpp>
+#include <indium/fatal.hpp>
 
 Indium::ComputePipelineState::~ComputePipelineState() {};
 
@@ -34,10 +35,8 @@ Indium::PrivateComputePipelineState::PrivateComputePipelineState(std::shared_ptr
 	layoutInfo.pushConstantRangeCount = 1;
 	layoutInfo.pPushConstantRanges = &dispatchRange;
 
-	if (DynamicVK::vkCreatePipelineLayout(_privateDevice->device(), &layoutInfo, _hostAllocator, &_layout) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkCreatePipelineLayout(_privateDevice->device(), &layoutInfo, _hostAllocator, &_layout); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkCreatePipelineLayout", failure);
 
 	// determine device properties
 	VkPhysicalDeviceVulkan13Properties vk13Props {};

@@ -2,6 +2,7 @@
 #include <indium/buffer.private.hpp>
 #include <indium/device.private.hpp>
 #include <indium/dynamic-vk.hpp>
+#include <indium/fatal.hpp>
 
 #include <cstring>
 #include <algorithm>
@@ -111,10 +112,8 @@ Indium::PrivateBuffer::PrivateBuffer(std::shared_ptr<PrivateDevice> device, size
 
 	{
 	RbxProfiler::DiagnosticScope vkCreate(RBX_DIAG_BUFFER_VK_CREATE,length,this);
-	if (DynamicVK::vkCreateBuffer(_privateDevice->device(), &info, nullptr, &_buffer) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkCreateBuffer(_privateDevice->device(), &info, nullptr, &_buffer); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkCreateBuffer", failure);
 	}
 
 	try {
@@ -180,13 +179,13 @@ Indium::PrivateBuffer::PrivateBuffer(std::shared_ptr<PrivateDevice> device, size
 			}
 
 			RbxProfiler::DiagnosticScope allocate(RBX_DIAG_BUFFER_ALLOCATE,allocateInfo.allocationSize,this,0);
-			if (DynamicVK::vkAllocateMemory(_privateDevice->device(), &allocateInfo, nullptr, &_memory) != VK_SUCCESS)
-				abort();
+			if (auto failure = DynamicVK::vkAllocateMemory(_privateDevice->device(), &allocateInfo, nullptr, &_memory); failure != VK_SUCCESS)
+				INDIUM_VULKAN_FATAL("vkAllocateMemory", failure);
 		}
 
 		RbxProfiler::DiagnosticScope bind(RBX_DIAG_BUFFER_BIND,length,this);
-		if (DynamicVK::vkBindBufferMemory(_privateDevice->device(), _buffer, _memory, _memoryOffset) != VK_SUCCESS)
-			abort();
+		if (auto failure = DynamicVK::vkBindBufferMemory(_privateDevice->device(), _buffer, _memory, _memoryOffset); failure != VK_SUCCESS)
+			INDIUM_VULKAN_FATAL("vkBindBufferMemory", failure);
 	} catch (...) {
 		DynamicVK::vkDestroyBuffer(_privateDevice->device(), _buffer, nullptr);
 		throw;
@@ -198,10 +197,8 @@ Indium::PrivateBuffer::PrivateBuffer(std::shared_ptr<PrivateDevice> device, cons
 {
 	auto ptr = contents();
 
-	if (!ptr) {
-		// TODO: support non-host-visible memory
-		abort();
-	}
+	if (!ptr)
+		INDIUM_FATAL("a buffer created from data has no host-visible memory"); // TODO: support non-host-visible memory
 
 	{
 		RbxProfiler::DiagnosticScope copy(RBX_DIAG_BUFFER_COPY,length,this);
@@ -215,10 +212,8 @@ Indium::PrivateBuffer::PrivateBuffer(std::shared_ptr<PrivateDevice> device, cons
 		range.memory = _memory;
 		range.size = VK_WHOLE_SIZE;
 		range.offset = 0;
-		if (DynamicVK::vkFlushMappedMemoryRanges(_privateDevice->device(), 1, &range) != VK_SUCCESS) {
-			// TODO
-			abort();
-		}
+		if (auto failure = DynamicVK::vkFlushMappedMemoryRanges(_privateDevice->device(), 1, &range); failure != VK_SUCCESS)
+			INDIUM_VULKAN_FATAL("vkFlushMappedMemoryRanges", failure);
 	}
 };
 
@@ -283,10 +278,8 @@ void* Indium::PrivateBuffer::contents() {
 			return _mapped;
 		}
 		RbxProfiler::DiagnosticScope map(RBX_DIAG_BUFFER_MAP,_allocationSize,this);
-		if (DynamicVK::vkMapMemory(_privateDevice->device(), _memory, 0, VK_WHOLE_SIZE, 0, &_mapped) != VK_SUCCESS) {
-			// TODO
-			abort();
-		}
+		if (auto failure = DynamicVK::vkMapMemory(_privateDevice->device(), _memory, 0, VK_WHOLE_SIZE, 0, &_mapped); failure != VK_SUCCESS)
+			INDIUM_VULKAN_FATAL("vkMapMemory", failure);
 	}
 
 	return _mapped;
@@ -309,10 +302,8 @@ void Indium::PrivateBuffer::didModifyRange(Range<size_t> range) {
 	vulkanRange.memory = _memory;
 	vulkanRange.size = end + std::min<VkDeviceSize>(padding, _allocationSize - end) - start;
 	vulkanRange.offset = start;
-	if (DynamicVK::vkFlushMappedMemoryRanges(_privateDevice->device(), 1, &vulkanRange) != VK_SUCCESS) {
-		// TODO
-		abort();
-	}
+	if (auto failure = DynamicVK::vkFlushMappedMemoryRanges(_privateDevice->device(), 1, &vulkanRange); failure != VK_SUCCESS)
+		INDIUM_VULKAN_FATAL("vkFlushMappedMemoryRanges", failure);
 };
 
 uint64_t Indium::PrivateBuffer::gpuAddress() {

@@ -75,6 +75,11 @@ kern_return_t host_statistics64(host_t host,host_flavor_t flavor,host_info64_t i
     natural_t pages[4];if(!memory_pages(pages))return KERN_FAILURE;
     vm_statistics64_data_t stats={0};
     stats.free_count=pages[0];stats.active_count=pages[1];stats.inactive_count=pages[2];stats.wire_count=pages[3];
+    // The reclaimable pages are the file cache, which Darwin also counts as
+    // external (file-backed) pages. Some clients estimate available memory as
+    // free - speculative + purgeable + external; Roblox sizes its memory
+    // budget that way and would otherwise see only MemFree.
+    stats.external_page_count=pages[2];
     unsigned size=*count>=HOST_VM_INFO64_COUNT?HOST_VM_INFO64_COUNT:HOST_VM_INFO64_REV0_COUNT;
     memcpy(info,&stats,size*sizeof(integer_t));*count=size;return KERN_SUCCESS;
 }

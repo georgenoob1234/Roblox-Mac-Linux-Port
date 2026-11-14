@@ -30,7 +30,9 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--build-dir', type=Path, default=here / 'build')
 args = parser.parse_args()
 build = args.build_dir.resolve(strict=True)
-stage = Path(tempfile.mkdtemp(prefix='device-inventory-check-'))
+# The private server's sockets live in the stage, and a Unix socket path is limited to 107
+# bytes: build.sh's TMPDIR (inside the checkout) is too long for them, so use /tmp.
+stage = Path(tempfile.mkdtemp(prefix='device-inventory-check-', dir='/tmp'))
 for name in ('CoreAudio.framework', 'CoreAudio.component'):
     shutil.copytree(build / name, stage / name, symlinks=True)
 shutil.copy2(build / 'device-check', stage / 'device-check')

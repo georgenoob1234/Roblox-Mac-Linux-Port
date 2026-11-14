@@ -195,20 +195,21 @@ public:
 protected:
  AudioHardwareStream* createStream(AudioDeviceIOProc,void*) override {return nullptr;}
 };
-static std::recursive_mutex g_objectsMutex;
-static std::vector<AudioDeviceID> g_hostIDs;
+// Never destroyed, like g_objects: see the note there.
+static auto& g_objectsMutex=*new std::recursive_mutex;
+static auto& g_hostIDs=*new std::vector<AudioDeviceID>;
 static AudioDeviceID g_defaultInput=0,g_defaultOutput=0;
 static std::chrono::steady_clock::time_point g_refresh;
 struct HostListener {AudioObjectID id;AudioObjectPropertyAddress address;AudioObjectPropertyListenerProc proc;void* data;};
-static std::recursive_mutex g_listenerMutex;
-static std::vector<HostListener> g_listeners;
+static auto& g_listenerMutex=*new std::recursive_mutex;
+static auto& g_listeners=*new std::vector<HostListener>;
 static bool sameAddress(const AudioObjectPropertyAddress& a,const AudioObjectPropertyAddress& b) {
  return a.mSelector==b.mSelector&&a.mScope==b.mScope&&a.mElement==b.mElement;
 }
 // Serializes the inventory connection and g_refresh. Taken before
 // g_objectsMutex, never while holding it. Recursive because device
 // construction below may re-enter through the public CoreAudio entry points.
-static std::recursive_mutex g_inventoryMutex;
+static auto& g_inventoryMutex=*new std::recursive_mutex;
 static std::atomic<bool> g_inventoryLoaded{false};
 static void refreshHostDevices() {
  std::vector<std::pair<AudioObjectID,AudioObjectPropertySelector>> changes;

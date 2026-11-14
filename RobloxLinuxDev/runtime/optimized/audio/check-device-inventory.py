@@ -12,6 +12,11 @@ therefore runs on the library set the game is launched
 with: Darling's stock libSystem lacks the deferred knote delete of
 native/runtime-sidecar/kqueue-delete, and without it libdispatch crashes
 (_dispatch_kevent_merge on a freed source) when the server goes away.
+
+Afterwards exit-check leaves the process through exit() with its streams
+still running, with other threads still reading device properties, and with
+the streams just stopped. Every such exit must be clean: status 0 and not a
+word from libpulse or the C++ runtime.
 """
 import argparse
 import json
@@ -35,7 +40,8 @@ build = args.build_dir.resolve(strict=True)
 stage = Path(tempfile.mkdtemp(prefix='device-inventory-check-', dir='/tmp'))
 for name in ('CoreAudio.framework', 'CoreAudio.component'):
     shutil.copytree(build / name, stage / name, symlinks=True)
-shutil.copy2(build / 'device-check', stage / 'device-check')
+for name in ('device-check', 'exit-check'):
+    shutil.copy2(build / name, stage / name)
 env = {key: value for key, value in os.environ.items()
        if not key.startswith(('DYLD_', 'TRACKA_', 'TRACKB_', 'ROBLOX_MAC_', 'RBX_', 'PIPEWIRE_', 'PULSE_'))
        and key not in ('APPDIR', 'APPIMAGE', 'LD_PRELOAD')}
@@ -58,6 +64,18 @@ def pactl(*arguments):
 
 def null_sink(name):
     return pactl('load-module', 'module-null-sink', 'sink_name=' + name, 'rate=48000', 'channels=2').strip()
+
+
+def default_sink(name):
+    """The session manager may still be starting; until it is, the server refuses the call."""
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            return pactl('set-default-sink', name)
+        except subprocess.CalledProcessError as error:
+            if time.monotonic() > deadline:
+                raise SystemExit(f'set-default-sink {name} kept failing: {error.stderr.strip()}; see {stage}')
+            time.sleep(0.1)
 
 
 def inventory_clients():
@@ -115,23 +133,29 @@ try:
     pulse = start_pulse()
     null_sink('tracka_test_A')
     null_sink('tracka_test_B')
-    pactl('set-default-sink', 'tracka_test_A')
+    default_sink('tracka_test_A')
     guest = '/Volumes/SystemRoot/mnt'
     native = '/Volumes/SystemRoot' + str(runtime / 'optimized/native/lib')
-    command = shlex.join(['env', 'DYLD_FORCE_FLAT_NAMESPACE=1', 'DYLD_LIBRARY_PATH=' + native,
-                          'DYLD_INSERT_LIBRARIES=' + native + '/libtracka-clock.dylib:' + native + '/librbxkqueue.dylib',
-                          'DYLD_FRAMEWORK_PATH=' + guest,
-                          'AUDIO_COMPONENT=' + guest + '/CoreAudio.component/Contents/MacOS/CoreAudio',
-                          'PULSE_SERVER=' + env['PULSE_SERVER'],
-                          guest + '/device-check', '--synthetic', guest + '/handshake'])
-    launcher = ['unshare', '-Urm', '--propagation', 'private', 'sh', '-c',
-                'set -eu; ulimit -c 0; mount --bind "$1" /mnt; exec "$2" --shell "$3"',
-                'device-inventory-check', str(stage), str(runtime / 'bin/roblox-mac'), command]
-    check_log = (stage / 'check.log').open('w')
-    logs.append(check_log)
-    proc = subprocess.Popen(launcher, env=env, stdout=check_log, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-    processes.append(proc)
+    probe_env = shlex.join(['env', 'DYLD_FORCE_FLAT_NAMESPACE=1', 'DYLD_LIBRARY_PATH=' + native,
+                            'DYLD_INSERT_LIBRARIES=' + native + '/libtracka-clock.dylib:' + native + '/librbxkqueue.dylib',
+                            'DYLD_FRAMEWORK_PATH=' + guest,
+                            'AUDIO_COMPONENT=' + guest + '/CoreAudio.component/Contents/MacOS/CoreAudio',
+                            'PULSE_SERVER=' + env['PULSE_SERVER']])
+
+    def guest_shell(command, log_name):
+        """Run a shell command in the guest with the stage mounted at /mnt; output goes to the log."""
+        launcher = ['unshare', '-Urm', '--propagation', 'private', 'sh', '-c',
+                    'set -eu; ulimit -c 0; mount --bind "$1" /mnt; exec "$2" --shell "$3"',
+                    'device-inventory-check', str(stage), str(runtime / 'bin/roblox-mac'), command]
+        log = (stage / log_name).open('w')
+        logs.append(log)
+        guest_process = subprocess.Popen(launcher, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
+        processes.append(guest_process)
+        return guest_process
+
+    proc = guest_shell(probe_env + ' ' + shlex.join([guest + '/device-check', '--synthetic', guest + '/handshake']),
+                       'check.log')
     module = {}
     seen = []
 
@@ -144,7 +168,7 @@ try:
         pulse = start_pulse()
         for name in ('tracka_test_A', 'tracka_test_B', 'tracka_test_C'):
             null_sink(name)
-        pactl('set-default-sink', 'tracka_test_B')
+        default_sink('tracka_test_B')
         deadline = time.monotonic() + 10
         while not inventory_clients():
             assert time.monotonic() < deadline, 'Inventory did not reconnect after the server restart'
@@ -152,7 +176,7 @@ try:
 
     # The probe is playing into B and recording its monitor. Moving the default
     # sink now must reach its default-output listener through a change event.
-    step(proc, 'routing-ready', 'routing-checked', lambda: pactl('set-default-sink', 'tracka_test_B'))
+    step(proc, 'routing-ready', 'routing-checked', lambda: default_sink('tracka_test_B'))
     step(proc, 'unit-input-ready', 'unit-input-checked', lambda: time.sleep(0.5))
     step(proc, 'unit-default-ready', 'unit-default-checked', lambda: time.sleep(0.5))
     step(proc, 'hotplug-ready', 'hotplug-added',
@@ -165,14 +189,40 @@ try:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
         raise SystemExit(f'Device inventory check timed out; see {stage}/check.log')
-    check_log.flush()
     output = (stage / 'check.log').read_text()
     print('\n'.join(line for line in output.splitlines() if line.startswith(('PASS ', 'AUDIO SIGNAL', 'Assertion'))))
     assert proc.returncode == 0 and output.count('PASS ') == 8, f'Device inventory failed; see {stage}/check.log'
+    assert 'Assertion' not in output, f'libpulse reported a failed assertion; see {stage}/check.log'
     # The inventory must be one long-lived connection that learns of changes
     # through events. Reconnecting for every poll (the old behaviour, ~23 ms of
     # stalled CoreAudio calls per second) gives a new client id each time.
     assert len(seen[0]) == 1 and seen[0] == seen[1], f'Inventory connection was not kept open: {seen}'
+    # A guest process that dies of a signal ends the whole guest shell, so a crash at exit
+    # shows as missing status lines.
+    modes, rounds = ('running', 'polling', 'stopped'), 5
+    exits = guest_shell(' '.join(f'for i in $(seq {rounds}); do {probe_env} {guest}/exit-check {mode}; echo "EXIT {mode} status=$?"; done;'
+                                 for mode in modes), 'exit.log')
+    try:
+        exits.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        os.killpg(exits.pid, signal.SIGKILL)
+        exits.wait()
+        raise SystemExit(f'A process did not exit while its audio was in use; see {stage}/exit.log')
+    output = (stage / 'exit.log').read_text().splitlines()
+    for mode in modes:
+        clean = output.count(f'EXIT {mode} status=0')
+        assert clean == rounds, f'{clean} of {rounds} clean exits with audio {mode}; see {stage}/exit.log'
+    # Whatever a process prints after its last line of its own is the teardown talking.
+    noise, leaving = [], False
+    for line in output:
+        if line.startswith('AUDIO exit '):
+            leaving = True
+        elif line.startswith('EXIT '):
+            leaving = False
+        elif leaving and line.strip():
+            noise.append(line)
+    assert not noise, f'Output during exit: {noise[:3]}; see {stage}/exit.log'
+    print(f'PASS exit with audio running, with device polling and just stopped ({rounds} each)')
     print(f'PASS private device inventory, default change, hotplug and sound-server restart; logs: {stage}')
 finally:
     for proc in reversed(processes):

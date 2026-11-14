@@ -32,7 +32,15 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #include "pulse/AudioHardwareStreamPAInput.h"
 #include "pulse/AudioHardwareStreamPAOutput.h"
 
-static std::unordered_map<AudioObjectID, std::unique_ptr<AudioHardwareImpl>> g_objects;
+// The registry and its locks are created once and never destroyed. As ordinary statics they
+// were destroyed by exit() on the exiting thread while the PulseAudio queue and the client's
+// audio threads were still using them. Seen with exit-check: a process that exits with a
+// stream running dies of SIGSEGV (a stream is destroyed, and stopped, after its device's
+// loop); a thread that reads a device property during exit ends in "recursive_mutex lock
+// failed"; and now and then libpulse reports "Assertion 'pa_atomic_load(&(c)->_ref) >= 1'
+// failed" at the end of the device check (the contexts were released by the exiting thread,
+// not on their queue). The connections end with the process.
+static auto& g_objects = *new std::unordered_map<AudioObjectID, std::unique_ptr<AudioHardwareImpl>>;
 
 #include "HostDevices.h"
 

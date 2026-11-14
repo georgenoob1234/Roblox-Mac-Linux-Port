@@ -73,6 +73,7 @@ python3 -B runtime/probes/check-sockopt.py
 python3 -B runtime/probes/check-madvise.py
 python3 -B runtime/probes/check-clock.py
 python3 -B runtime/probes/check-host-memory.py
+python3 -B runtime/shims/appkit/check-open-url.py
 # The device inventory check starts a private PipeWire server; a build machine
 # without one says so and goes on.
 if command -v pipewire >/dev/null && command -v pipewire-pulse >/dev/null &&

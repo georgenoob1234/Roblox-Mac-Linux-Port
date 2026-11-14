@@ -11,6 +11,7 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 subprocess.run(['sh', '-n', root/'bin/roblox-mac'], check=True)
 subprocess.run([sys.executable, root/'probes/check-place-id.py'], check=True)
+subprocess.run([sys.executable, root/'probes/check-shader-hint.py'], check=True)
 # Exercise the real guest argument builder without starting Darling or a GUI.
 source = (root/'bin/roblox-mac').read_text()
 builder = source.split('COMMAND=$(python3 ', 1)[1].split("<<'PYTHON'\n", 1)[1].split('\nPYTHON', 1)[0]

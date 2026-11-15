@@ -661,7 +661,7 @@ start_port_lookup() {
     lookup_deadline >/dev/null
     (
         exec 8>&- 9>&-
-        found=$(python3 "$HERE/installer.py" release-status --prefix "$HERE" 2>/dev/null |
+        found=$(python3 "$HERE/installer.py" release-status --prefix "$HERE" 2>"$PORT_LOOKUP_FILE.err" |
             python3 -c 'import json, sys
 try:
     print(json.load(sys.stdin).get("latest_version") or "")
@@ -672,13 +672,30 @@ except Exception:
             settings_set port_last_check "$(date +%s)" >/dev/null 2>&1 || true
             printf 'ok %s\n' "$found" > "$PORT_LOOKUP_FILE.tmp"
         else
+            # Why, for the log (the client check logs its reason the same way).
+            why=$(reason_from "$PORT_LOOKUP_FILE.err" | sed 's/^Could not query the latest GitHub release: //')
+            log_line "Could not check for port updates: ${why:-the installer gave no reason}"
             printf 'failed\n' > "$PORT_LOOKUP_FILE.tmp"
         fi
+        rm -f -- "$PORT_LOOKUP_FILE.err"
         mv -f -- "$PORT_LOOKUP_FILE.tmp" "$PORT_LOOKUP_FILE"
         [ -e "$PORT_LOOKUP_FILE.abandoned" ] && rm -f -- "$PORT_LOOKUP_FILE" "$PORT_LOOKUP_FILE.abandoned"
         exit 0
     ) </dev/null >/dev/null 2>&1 &
     PORT_LOOKUP_PID=$!
+}
+# port_is_newer INSTALLED LATEST: true when both are release versions (v1.2.3)
+# and LATEST is newer. A custom or development build (a commit id, "dev")
+# is never offered a release at launch: that could be a downgrade.
+port_is_newer() {
+    python3 - "$1" "$2" <<'PY'
+import re, sys
+def parse(value):
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", value.strip())
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+installed, latest = parse(sys.argv[1]), parse(sys.argv[2])
+sys.exit(0 if installed and latest and latest > installed else 1)
+PY
 }
 finish_port_lookup() {
     if [ -n "$PORT_LOOKUP_PID" ]; then
@@ -897,7 +914,7 @@ if [ -n "$latest" ] && [ "$latest" != "$installed" ] && [ "$(settings_get skippe
 fi
 if [ "$restarted" != 1 ] && [ -f "$HERE/installer.py" ] && [ -n "$port_latest" ]; then
     port_installed=$(python3 "$HELPER" port-version "$HERE" 2>/dev/null || true)
-    if [ -n "$port_installed" ] && [ "$port_latest" != "$port_installed" ] &&
+    if [ -n "$port_installed" ] && port_is_newer "$port_installed" "$port_latest" &&
        [ "$(settings_get skipped_port_version 2>/dev/null || true)" != "$port_latest" ]; then
         port_offer=$port_latest
     fi

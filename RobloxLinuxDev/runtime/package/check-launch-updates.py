@@ -98,7 +98,7 @@ def make_release(tmp, settings):
         (release / name).write_text(text)
         (release / name).chmod(0o755)
     (release / "installer.py").write_text(INSTALLER)
-    (release / ".roblox-mac-port-version").write_text("v-old\n")
+    (release / ".roblox-mac-port-version").write_text("v1.1.1\n")
     (release / "RobloxVersion").mkdir()
     (release / "RobloxVersion/.version").write_text("version-0000aa\n")
     private = release / "DO_NOT_SHARE"
@@ -153,64 +153,82 @@ def check_updates_end_in_the_requested_game(tmp):
     for target in ("place", "link"):
         # Client update only.
         release = make_release(tmp, {"auto_update": "ask"})
-        result, trace, games = launch(release, target, PORT_LATEST="v-old")
+        result, trace, games = launch(release, target, PORT_LATEST="v1.1.1")
         assert result.returncode == 0, result.stderr
         prompts = [l for l in trace if l.startswith("prompt")]
         # The latest client is shown by its readable version once known, else by its id.
         assert len(prompts) == 1 and prompts[0].split()[1] in ("client=version-0000aa/0.748.0.7480000", "client=version-0000aa/version-0000bb") \
             and prompts[0].endswith(" port=/"), trace
-        expect_game(games, target, "v-old", "version-0000bb")
+        expect_game(games, target, "v1.1.1", "version-0000bb")
         # Port update only: the launch restarts through the new run.sh.
         release = make_release(tmp, {"auto_update": "ask"})
-        result, trace, games = launch(release, target, CLIENT_LATEST="version-0000aa", PORT_LATEST="v-new")
+        result, trace, games = launch(release, target, CLIENT_LATEST="version-0000aa", PORT_LATEST="v1.2.0")
         assert result.returncode == 0, result.stderr
         prompts = [l for l in trace if l.startswith("prompt")]
-        assert prompts == ["prompt client=/ port=v-old/v-new"], trace
-        assert "port-update" in trace and [l for l in trace if l.startswith("run.sh")][-1].startswith("run.sh port=v-new"), trace
-        expect_game(games, target, "v-new", "version-0000aa")
+        assert prompts == ["prompt client=/ port=v1.1.1/v1.2.0"], trace
+        assert "port-update" in trace and [l for l in trace if l.startswith("run.sh")][-1].startswith("run.sh port=v1.2.0"), trace
+        expect_game(games, target, "v1.2.0", "version-0000aa")
         # Both: one prompt, both updates, one game.
         release = make_release(tmp, {"auto_update": "ask"})
-        result, trace, games = launch(release, target, PORT_LATEST="v-new")
+        result, trace, games = launch(release, target, PORT_LATEST="v1.2.0")
         assert result.returncode == 0, result.stderr
         prompts = [l for l in trace if l.startswith("prompt")]
-        assert len(prompts) == 1 and prompts[0].endswith("port=v-old/v-new") and "client=/" not in prompts[0], trace
+        assert len(prompts) == 1 and prompts[0].endswith("port=v1.1.1/v1.2.0") and "client=/" not in prompts[0], trace
         assert "client-update" in trace and "port-update" in trace, trace
-        expect_game(games, target, "v-new", "version-0000bb")
+        expect_game(games, target, "v1.2.0", "version-0000bb")
 
 
 def check_skip_failed_auto_and_off(tmp):
     # Skip this version skips both listed updates; the next launch does not ask.
     release = make_release(tmp, {"auto_update": "ask"})
-    result, trace, games = launch(release, "place", PORT_LATEST="v-new", PROMPT_ANSWER="2")
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.2.0", PROMPT_ANSWER="2")
     assert result.returncode == 0 and "port-update" not in trace and "client-update" not in trace, trace
-    expect_game(games, "place", "v-old", "version-0000aa")
+    expect_game(games, "place", "v1.1.1", "version-0000aa")
     settings = json.loads((release / "DO_NOT_SHARE/bootstrapper.json").read_text())
-    assert settings["skipped_version"] == "version-0000bb" and settings["skipped_port_version"] == "v-new", settings
+    assert settings["skipped_version"] == "version-0000bb" and settings["skipped_port_version"] == "v1.2.0", settings
     (release / "trace").write_text("")
-    result, trace, games = launch(release, "place", PORT_LATEST="v-new")
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.2.0")
     assert not [l for l in trace if l.startswith("prompt")], trace
-    expect_game(games, "place", "v-old", "version-0000aa")
+    expect_game(games, "place", "v1.1.1", "version-0000aa")
     # A failed port update is reported and the game still starts on the old port.
     release = make_release(tmp, {"auto_update": "ask"})
-    result, trace, games = launch(release, "link", CLIENT_LATEST="version-0000aa", PORT_LATEST="v-new", PORT_UPDATE_RESULT="1")
+    result, trace, games = launch(release, "link", CLIENT_LATEST="version-0000aa", PORT_LATEST="v1.2.0", PORT_UPDATE_RESULT="1")
     assert result.returncode == 0 and "port-update" in trace, (trace, result.stderr)
     assert "Port update failed" in result.stderr, result.stderr
-    expect_game(games, "link", "v-old", "version-0000aa")
+    expect_game(games, "link", "v1.1.1", "version-0000aa")
     # Auto updates both without asking.
     release = make_release(tmp, {"auto_update": "auto"})
-    result, trace, games = launch(release, "place", PORT_LATEST="v-new")
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.2.0")
     assert not [l for l in trace if l.startswith("prompt")] and "port-update" in trace and "client-update" in trace, trace
-    expect_game(games, "place", "v-new", "version-0000bb")
+    expect_game(games, "place", "v1.2.0", "version-0000bb")
     # Off neither asks nor updates.
     release = make_release(tmp, {"auto_update": "off"})
-    result, trace, games = launch(release, "place", PORT_LATEST="v-new")
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.2.0")
     assert not [l for l in trace if l.startswith("prompt")] and "port-update" not in trace and "client-update" not in trace, trace
-    expect_game(games, "place", "v-old", "version-0000aa")
-    # A port check that fails does not stop the launch.
+    expect_game(games, "place", "v1.1.1", "version-0000aa")
+    # A port check that fails does not stop the launch, and says why in the log.
     release = make_release(tmp, {"auto_update": "ask"})
     result, trace, games = launch(release, "place", CLIENT_LATEST="version-0000aa", PORT_LATEST="")
     assert not [l for l in trace if l.startswith("prompt")], trace
-    expect_game(games, "place", "v-old", "version-0000aa")
+    expect_game(games, "place", "v1.1.1", "version-0000aa")
+    log = (release / "DO_NOT_SHARE/launcher.log").read_text()
+    assert "Could not check for port updates: could not reach GitHub (test)" in log, log
+
+
+def check_port_offer_only_when_newer(tmp):
+    """A port update is offered at launch only when the latest release is newer
+    than a release-style installed version. A custom or development build (a
+    commit id, "dev") is never offered a release, which could be a downgrade;
+    an older latest release is not offered either."""
+    cases = [("v1.1.1", "v1.2.0", True), ("v1.2.0", "v1.2.0", False), ("v1.10.0", "v1.9.9", False),
+             ("v1.9.9", "v1.10.0", True), ("fc2ec72", "v1.2.0", False), ("dev", "v9.9.9", False)]
+    for installed, latest, offered in cases:
+        release = make_release(tmp, {"auto_update": "ask"})
+        (release / ".roblox-mac-port-version").write_text(installed + "\n")
+        result, trace, games = launch(release, "place", CLIENT_LATEST="version-0000aa", PORT_LATEST=latest)
+        prompts = [l for l in trace if l.startswith("prompt")]
+        assert bool(prompts) == offered, (installed, latest, prompts)
+        assert len(games) == 1, (installed, latest, games)
 
 
 def notifications(release):
@@ -230,10 +248,10 @@ def check_failures_say_what_why_and_where(tmp):
         assert log.exists() and parts[1] in log.read_text(), (parts[1], log.read_text() if log.exists() else "no log")
     # A failed client update: the updater's own last error line is the reason.
     release = make_release(tmp, {"auto_update": "auto"})
-    result, trace, games = launch(release, "place", PORT_LATEST="v-old",
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1",
                                   CLIENT_UPDATE_ERROR="curl: (6) Could not resolve host: setup.rbxcdn.com")
     expect(release, "Roblox update failed", "Could not resolve host: setup.rbxcdn.com", "installed client was kept")
-    expect_game(games, "place", "v-old", "version-0000aa")
+    expect_game(games, "place", "v1.1.1", "version-0000aa")
     # A failed first-run setup.
     release = make_release(tmp, {"auto_update": "off"})
     (release / "DO_NOT_SHARE/first-run.initialized").unlink()
@@ -242,10 +260,10 @@ def check_failures_say_what_why_and_where(tmp):
     expect(release, "first-run setup failed", "darling: could not set up the prefix (test)", "Start Roblox again")
     # A failed port update: the installer's "! " line is the reason.
     release = make_release(tmp, {"auto_update": "auto"})
-    result, trace, games = launch(release, "place", CLIENT_LATEST="version-0000aa", PORT_LATEST="v-new",
+    result, trace, games = launch(release, "place", CLIENT_LATEST="version-0000aa", PORT_LATEST="v1.2.0",
                                   PORT_UPDATE_RESULT="1", PORT_UPDATE_ERROR="Could not download the release: test reason.")
     expect(release, "Port update failed", "Could not download the release: test reason", "current release was kept")
-    expect_game(games, "place", "v-old", "version-0000aa")
+    expect_game(games, "place", "v1.1.1", "version-0000aa")
     # A failed update check keeps its reason for the Settings page.
     release = make_release(tmp, {"auto_update": "ask"})
     env = {**os.environ, "PATH": f"{quiet_tools(release)}:{os.environ['PATH']}", "DBUS_SESSION_BUS_ADDRESS": "",
@@ -260,7 +278,8 @@ def check_failures_say_what_why_and_where(tmp):
     assert checked.returncode == 0 and json.loads(checked.stdout)["settings"]["last_check_error"] == "", checked.stdout
 
 
-CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off, check_failures_say_what_why_and_where]
+CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off, check_failures_say_what_why_and_where,
+          check_port_offer_only_when_newer]
 
 
 def main():

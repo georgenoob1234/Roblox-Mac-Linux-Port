@@ -48,6 +48,8 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
   --shell) test ! -e /proc/$$/fd/9; mkdir -p "$HERE/DO_NOT_SHARE/prefix"; exit 0;;
   --client-version) [ "${FAIL_CHECK:-0}" = 1 ] && exit 1; echo version-abcd; exit 0;;
+  # Without this, the display-version query fell through to "launched" below.
+  --client-version-display) exit 1;;
   --uri) printf '%s\n' launched-with-uri > "$HERE/uri-launch"; exit 0;;
   *) printf '%s %s %s\n' launched "${ROBLOX_MAC_DECORATIONS:-}" "${ROBLOX_MAC_CURSOR_APPEARANCE:-}" > "$HERE/launched"; sleep "${FAKE_LAUNCH_SLEEP:-0}"; exit 0;;
 esac
@@ -203,6 +205,68 @@ exit 3
     assert "dialog" in order, order
     before = [json.loads(line.split(" ", 1)[1]) for line in order[:order.index("dialog")] if line.startswith("progress ")]
     assert before and before[-1].get("hidden") is True, f"the progress window was not hidden before the prompt: {order}"
+
+    # B10 flow 7 and 8: the prompt can cancel the launch (exit 4 from the GTK
+    # prompt; Cancel or closing in kdialog/zenity). Nothing is updated, no
+    # game starts, the progress window is told the launch was cancelled, and
+    # the instance lock is free again. No answer is ever given by a timer.
+    assert "DIALOG_TIMEOUT_SECONDS" not in ui_source and "30 seconds" not in ui_source
+    bootstrap_source = (ROOT / "package/bootstrap.sh").read_text()
+    ask_source = bootstrap_source.split("ask_update() {", 1)[1].split("\n}\n", 1)[0]
+    assert "timeout" not in ask_source, "the update prompt still has a timer"
+    cancel_ui = Path(tmp) / "prompt-cancel-ui"
+    cancel_ui.write_text("""#!/bin/sh
+case "${2:-}" in
+  --progress) cat > "$PROMPT_LOG"; exit 0;;
+  --dialog) exit 4;;
+esac
+exit 3
+""")
+    cancel_ui.chmod(0o755)
+    def cancel_case(extra_env):
+        (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "ask", "check_interval_hours": 0}))
+        (release / "RobloxVersion/.version").write_text("version-old\n")
+        (release / "launched").unlink(missing_ok=True)
+        prompt_log.write_text("")
+        result = subprocess.run([bootstrap], env={**env, "PROMPT_LOG": str(prompt_log), **extra_env},
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 125, (result.returncode, result.stderr)
+        assert not (release / "launched").exists(), "a game was started after cancelling at the prompt"
+        assert (release / "RobloxVersion/.version").read_text().strip() == "version-old"
+        assert json.loads((private / "bootstrapper.json").read_text()).get("skipped_version", "") == ""
+        lock = subprocess.run(["flock", "-n", str(private / "instance.lock"), "true"])
+        assert lock.returncode == 0, "the instance lock is still held"
+        return result
+    cancel_case({"ROBLOX_MAC_UI_APP": str(cancel_ui)})
+    phases = [json.loads(line)["phase"] for line in prompt_log.read_text().splitlines()]
+    assert phases[-1] == "cancelled", phases
+    # The fallbacks must never reach the desktop's real dialog or notification
+    # tools: the PATH holds links to every other tool plus the fakes only.
+    fallback_bin = tmp / "prompt-fallback-bin"
+    fallback_bin.mkdir()
+    for directory in env["PATH"].split(":"):
+        if not directory or not Path(directory).is_dir():
+            continue
+        for tool in Path(directory).iterdir():
+            if tool.name in ("kdialog", "zenity", "notify-send", "gdbus") or (fallback_bin / tool.name).exists():
+                continue
+            if tool.is_file() and os.access(tool, os.X_OK):
+                (fallback_bin / tool.name).symlink_to(tool)
+    for name, script in (("kdialog", "exit 2"), ("zenity", "exit 1")):
+        for other in ("kdialog", "zenity"):
+            (fallback_bin / other).unlink(missing_ok=True)
+        (fallback_bin / name).write_text(f"#!/bin/sh\n{script}\n")
+        (fallback_bin / name).chmod(0o755)
+        cancel_case({"PATH": str(fallback_bin), "ROBLOX_MAC_UI_APP": "",
+                     "DBUS_SESSION_BUS_ADDRESS": ""})
+    # zenity's extra button (Launch without updating) still launches.
+    (fallback_bin / "zenity").write_text("#!/bin/sh\necho 'Launch without updating'\nexit 1\n")
+    (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "ask", "check_interval_hours": 0}))
+    (release / "launched").unlink(missing_ok=True)
+    launched = subprocess.run([bootstrap], env={**env, "PATH": str(fallback_bin), "ROBLOX_MAC_UI_APP": "",
+                                                 "DBUS_SESSION_BUS_ADDRESS": ""}, capture_output=True, text=True, timeout=60)
+    assert launched.returncode == 0 and (release / "launched").exists(), launched.stderr
+    assert (release / "RobloxVersion/.version").read_text().strip() == "version-old"
 
     subprocess.run([bootstrap, "set", "auto_update", "auto"], env=env, check=True)
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "auto", "check_interval_hours": 0}))

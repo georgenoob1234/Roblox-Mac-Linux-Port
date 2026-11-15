@@ -240,10 +240,27 @@ def check_failed_port_check_says_why(display, binary, tmp):
         assert str(state / "roblox-mac-linux-port" / "installer.log") in message, message
 
 
+def check_prompt_close_and_cancel_mean_cancel(display, binary, tmp):
+    """B10 flow 7: closing the update prompt, or its Cancel button, cancels the
+    launch (exit 4) at once. Before, closing hid the window and the prompt
+    answered "launch without updating" after its 30 s timer."""
+    with display.open(binary, "--dialog", "0.748.0.7480000", "0.747.0.7471481") as ui:
+        ui.wait(lambda w: Window.button(w, "Update now") is not None)
+        assert ui.send("close") == {"ok": True}
+        assert ui.exited(3) == 4, "closing the prompt did not cancel"
+    with display.open(binary, "--dialog", "0.748.0.7480000", "0.747.0.7471481") as ui:
+        windows = ui.wait(lambda w: Window.button(w, "Update now") is not None)
+        assert Window.button(windows, "Cancel"), Window.texts(windows)
+        assert not any("30 seconds" in text for text in Window.texts(windows)), Window.texts(windows)
+        assert ui.send("click Cancel") == {"ok": True}
+        assert ui.exited(3) == 4
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
-          check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why]
+          check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why,
+          check_prompt_close_and_cancel_mean_cancel]
 
 
 def main():

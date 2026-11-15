@@ -396,33 +396,50 @@ launch() {
     exit $_status
 }
 
+# ask_update LATEST INSTALLED: 0 update now, 1 launch without updating,
+# 125 cancel the launch (nothing is updated, no game starts). The prompt has
+# no timer: it waits for an answer (B10 flow 7 and 8).
 ask_update() {
     latest=$1
     installed=$2
     if [ -n "$UI_APP" ]; then
         event prompt 25 'Waiting for an answer to the update prompt' 0 0 false true
-        choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" 9>&- >/dev/null 2>&1; printf '%s' "$?" )
+        "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" 9>&- >/dev/null 2>&1
+        choice=$?
         case "$choice" in
             0) return 0;;
-            2) settings_set skipped_version "$latest" >/dev/null 2>&1 || true;;
+            1) return 1;;
+            2) settings_set skipped_version "$latest" >/dev/null 2>&1 || true; return 1;;
+            4) return 125;;
         esac
-        if [ "$choice" -gt 2 ] 2>/dev/null; then notify 'Update prompt failed; launching without updating.' 'Roblox update'; fi
+        notify "The update prompt failed (status $choice); launching without updating." 'Roblox update'
         return 1
     fi
     if [ -t 0 ] && [ -t 1 ]; then
         say "Roblox $latest is available (installed: ${installed:-none})."
-        say 'Choose: 1) Update now  2) Launch without updating [2 in 30s]'
-        answer=$(timeout 30 sh -c 'IFS= read -r value; printf "%s" "$value"' </dev/tty 2>/dev/null || true)
-        [ "$answer" = 1 ]
-        return
+        say 'Choose: 1) Update now  2) Launch without updating  3) Cancel  [Enter = 2]'
+        if ! IFS= read -r answer </dev/tty 2>/dev/null; then return 125; fi
+        case "$answer" in
+            1) return 0;;
+            ''|2) return 1;;
+            *) return 125;;
+        esac
     fi
     if command -v kdialog >/dev/null 2>&1; then
-        timeout 30 kdialog --title 'Roblox update available' --yesno "Roblox $latest is available. Update now?" >/dev/null 2>&1
-        return
+        kdialog --title 'Roblox update available' \
+            --yes-label 'Update now' --no-label 'Launch without updating' --cancel-label 'Cancel' \
+            --yesnocancel "Roblox $latest is available. Update now?" >/dev/null 2>&1
+        case $? in 0) return 0;; 1) return 1;; *) return 125;; esac
     fi
     if command -v zenity >/dev/null 2>&1; then
-        timeout 30 zenity --question --title='Roblox update available' --text="Roblox $latest is available. Update now?" >/dev/null 2>&1
-        return
+        # The extra button prints its label; Cancel and closing print nothing.
+        zenity_answer=$(zenity --question --title='Roblox update available' \
+            --ok-label='Update now' --cancel-label='Cancel' --extra-button='Launch without updating' \
+            --text="Roblox $latest is available. Update now?" 2>/dev/null)
+        case $? in
+            0) return 0;;
+            *) [ "$zenity_answer" = 'Launch without updating' ] && return 1; return 125;;
+        esac
     fi
     return 1
 }
@@ -661,7 +678,18 @@ mode=$(settings_get auto_update 2>/dev/null || printf 'ask')
 if [ -n "$latest" ] && [ "$latest" != "$installed" ] && [ "$(settings_get skipped_version 2>/dev/null || true)" != "$latest" ]; then
     case "$mode" in
         auto) do_update; result=$?; [ "$result" -eq 125 ] && { finish_progress; notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'; exit 125; };;
-        ask) if ask_update "$latest" "$installed"; then do_update; result=$?; [ "$result" -eq 125 ] && { finish_progress; notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'; exit 125; }; fi;;
+        ask)
+            ask_update "$latest" "$installed"; answer=$?
+            if [ "$answer" -eq 125 ]; then
+                event cancelled 0 'Launch cancelled' 0 0 false
+                finish_progress
+                say 'Launch cancelled at the update prompt; nothing was updated.'
+                exit 125
+            fi
+            if [ "$answer" -eq 0 ]; then
+                do_update; result=$?
+                [ "$result" -eq 125 ] && { finish_progress; notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'; exit 125; }
+            fi;;
         off) :;;
     esac
 fi

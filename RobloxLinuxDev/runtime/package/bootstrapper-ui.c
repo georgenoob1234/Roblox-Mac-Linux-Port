@@ -17,7 +17,6 @@
 #include <time.h>
 
 #define UI_DELAY_MS 450
-#define DIALOG_TIMEOUT_SECONDS 30
 #define CANCEL_POLL_MS 250
 
 static const char *UI_CSS =
@@ -583,14 +582,18 @@ static int run_progress(const char *root) {
     int result = state->authoritative ? state->result : (state->cancelled ? 4 : state->result); g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state->cancel_state); g_free(state->last_phase); g_free(state->last_message); g_free(state->notice_phase); g_free(state); return result;
 }
 
+/* Prompt answers: 0 update now, 1 launch without updating, 2 skip this
+ * version, 4 cancel the launch (also closing the window). There is no
+ * timer: the prompt waits for the user (B10 flow 7 and 8). */
+enum { PROMPT_UPDATE = 0, PROMPT_LAUNCH = 1, PROMPT_SKIP = 2, PROMPT_CANCEL = 4 };
 static void dialog_finish(DialogState *state, int result) { state->result = result; gtk_main_quit(); }
-static gboolean dialog_timeout(gpointer data) { dialog_finish(data, 1); return G_SOURCE_REMOVE; }
+static gboolean dialog_delete(GtkWidget *window, GdkEvent *event, gpointer data) { dialog_finish(data, PROMPT_CANCEL); return TRUE; }
 static void dialog_button(GtkWidget *button, gpointer data) { dialog_finish(data, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "result"))); }
 static int run_dialog(const char *latest, const char *installed) {
     if (!ui_init()) return 3;
-    DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state.window), "Roblox update available"); setup_ui_identity(state.window, NULL); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 26); gtk_container_add(GTK_CONTAINER(state.window), box); gtk_box_pack_start(GTK_BOX(box), label("A Roblox update is ready", "title"), FALSE, FALSE, 0); char *versions = g_strdup_printf("Installed: %s\nNew version: %s", *installed ? installed : "none", *latest ? latest : "available"); gtk_box_pack_start(GTK_BOX(box), label(versions, NULL), FALSE, FALSE, 0); g_free(versions); gtk_box_pack_start(GTK_BOX(box), label("The prompt closes after 30 seconds and launches without updating.", "muted"), FALSE, FALSE, 0);
-    GtkWidget *buttons = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL); gtk_button_box_set_layout(GTK_BUTTON_BOX(buttons), GTK_BUTTONBOX_END); gtk_box_set_spacing(GTK_BOX(buttons), 8); const char *names[] = {"Update now", "Launch without updating", "Skip this version"}; for (int i = 0; i < 3; ++i) { GtkWidget *button = gtk_button_new_with_mnemonic(names[i]); g_object_set_data(G_OBJECT(button), "result", GINT_TO_POINTER(i == 0 ? 0 : (i == 1 ? 1 : 2))); g_signal_connect(button, "clicked", G_CALLBACK(dialog_button), &state); gtk_container_add(GTK_CONTAINER(buttons), button); if (i == 1) gtk_widget_grab_focus(button); } gtk_box_pack_end(GTK_BOX(box), buttons, FALSE, FALSE, 0); gtk_widget_show_all(state.window); g_timeout_add_seconds(DIALOG_TIMEOUT_SECONDS, dialog_timeout, &state); gtk_main(); gtk_widget_destroy(state.window); return state.result;
+    DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state.window), "Roblox update available"); setup_ui_identity(state.window, NULL); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(dialog_delete), &state);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 26); gtk_container_add(GTK_CONTAINER(state.window), box); gtk_box_pack_start(GTK_BOX(box), label("A Roblox update is ready", "title"), FALSE, FALSE, 0); char *versions = g_strdup_printf("Installed: %s\nNew version: %s", *installed ? installed : "none", *latest ? latest : "available"); gtk_box_pack_start(GTK_BOX(box), label(versions, NULL), FALSE, FALSE, 0); g_free(versions); gtk_box_pack_start(GTK_BOX(box), label("Cancel stops here: nothing is updated and Roblox does not start.", "muted"), FALSE, FALSE, 0);
+    GtkWidget *buttons = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL); gtk_button_box_set_layout(GTK_BUTTON_BOX(buttons), GTK_BUTTONBOX_END); gtk_box_set_spacing(GTK_BOX(buttons), 8); const char *names[] = {"Cancel", "Skip this version", "Launch without updating", "Update now"}; const int results[] = {PROMPT_CANCEL, PROMPT_SKIP, PROMPT_LAUNCH, PROMPT_UPDATE}; for (int i = 0; i < 4; ++i) { GtkWidget *button = gtk_button_new_with_mnemonic(names[i]); g_object_set_data(G_OBJECT(button), "result", GINT_TO_POINTER(results[i])); g_signal_connect(button, "clicked", G_CALLBACK(dialog_button), &state); gtk_container_add(GTK_CONTAINER(buttons), button); if (results[i] == PROMPT_LAUNCH) gtk_widget_grab_focus(button); if (results[i] == PROMPT_UPDATE) gtk_style_context_add_class(gtk_widget_get_style_context(button), "accent"); } gtk_box_pack_end(GTK_BOX(box), buttons, FALSE, FALSE, 0); gtk_widget_show_all(state.window); gtk_main(); gtk_widget_destroy(state.window); return state.result;
 }
 
 static JsonObject *settings_status(LauncherState *state) { char *output = NULL; run_release(state->root, "status", NULL, NULL, &output); JsonObject *object = parse_json(output); g_free(output); return object; }

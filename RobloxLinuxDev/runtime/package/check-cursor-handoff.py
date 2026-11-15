@@ -107,7 +107,8 @@ static void wp_viewport_set_destination(wp_viewport *v,int w,int h){v->width=w;v
 static void wl_subsurface_set_position(wl_subsurface *s,int x,int y){s->x=x;s->y=y;}
 static void wl_surface_attach(wl_surface *s,wl_buffer *b,int,int){s->pending=b;}
 static void wl_surface_damage(wl_surface*,int,int,int,int){}
-static wl_surface *gdk_wayland_window_get_wl_surface(int){return &parent;}
+static bool parent_destroyed=false; // GDK-Wayland drops the toplevel's wl_surface while hidden
+static wl_surface *gdk_wayland_window_get_wl_surface(int){return parent_destroyed?nullptr:&parent;}
 static int gtk_widget_get_window(int){return 1;}
 static bool gtk_widget_translate_coordinates(int,int,int,int,int *x,int *y){*x=7;*y=32;return true;}
 static int gdk_display_get_default(){return 1;}
@@ -231,6 +232,18 @@ int main(int argc,char**) {
     assert(!capture_cursor_mapped && native_visible && !child->shown);
     cursor_shm=&shm;cursor_pixels.clear();update_capture_cursor();
     assert(!capture_cursor_mapped && native_visible && !child->shown);
+    // Roblox's "Close game" hides the window while the capture cursor is shown.
+    // GDK destroys the toplevel surface (the compositor unmaps its subsurface),
+    // then the focus loss updates the cursor: no commit may target the missing
+    // parent; that NULL commit crashed the GTK thread.
+    cursor_pixels.resize(cursor_pitch*cursor_height);capture_cursor_dirty=true;update_capture_cursor();
+    assert(capture_cursor_mapped && !native_visible && child->shown);
+    parent_destroyed=true;child->shown=nullptr;
+    pointer_capture.focused=false;update_capture_cursor();
+    assert(!capture_cursor_mapped && native_visible && !child_committed);
+    cursor_visible_requested=false;update_capture_cursor();
+    cursor_visible_requested=true;update_capture_cursor();
+    parent_destroyed=false;
     // Replay Roblox's 64x64 cursor with its nonzero 32,32 hotspot.
     cursor_width=cursor_height=64;cursor_x=cursor_y=32;
     auto transparent=transparent_capture_cursor();
@@ -239,7 +252,7 @@ int main(int argc,char**) {
     assert(transparent_capture_cursor()==transparent && transparent_allocations==2);
     for(auto b:buffers)wl_buffer_destroy(b);
     delete child;delete sub;delete viewport;
-    puts("PASS cursor buffer rows/hotspot, transparent native hotspot/cache, prepare-before-hide, parent commit, fixed anchor, tracking refresh, Shift Lock anchor, intentional hide, release, blur/regain and allocation-failure visibility");
+    puts("PASS cursor buffer rows/hotspot, transparent native hotspot/cache, prepare-before-hide, parent commit, hidden window without a toplevel surface, fixed anchor, tracking refresh, Shift Lock anchor, intentional hide, release, blur/regain and allocation-failure visibility");
 }
 '''
 
@@ -340,6 +353,8 @@ with tempfile.TemporaryDirectory(prefix="cursor-handoff-") as directory:
         ("zero-hotspot cursor flash", handoff.replace("gdk_display_get_default(),image,x,y)", "gdk_display_get_default(),image,0,0)")),
         ("hide before replacement commit", handoff.replace(entry, "").replace(release, entry + release)),
         ("remove before native restore", handoff.replace(release, "").replace(entry, entry + release)),
+        ("commit to a hidden window's missing surface", handoff.replace(
+            "if(capture_cursor_surface && toplevel) {", "if(capture_cursor_surface) {")),
     ]
     for label, mutant in mutations:
         assert mutant != handoff

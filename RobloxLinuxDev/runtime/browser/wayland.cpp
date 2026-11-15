@@ -362,9 +362,14 @@ static void update_capture_cursor(){
     // Publish the replacement first on entry; restore native pixels first on
     // exit. There must be no intermediate state with both cursors absent.
     if(!mapped)gdk_window_set_cursor(target,blank?blank:gtk_cursor);
-    if(capture_cursor_surface) {
+    // GDK destroys the toplevel's wl_surface while it is hidden, and the
+    // compositor unmaps this subsurface with it. Roblox's "Close game" hides
+    // the window, and the focus loss lands here: committing the missing
+    // parent was a NULL proxy (SIGSEGV on the GTK thread, then Darling abort).
+    auto toplevel=gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window));
+    if(capture_cursor_surface && toplevel) {
         wl_surface_commit(capture_cursor_surface);
-        wl_surface_commit(gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window)));
+        wl_surface_commit(toplevel);
     }
     if(mapped)gdk_window_set_cursor(target,blank?blank:gtk_cursor);
     if(mapped){published_cursor_x=cursor_anchor_x;published_cursor_y=cursor_anchor_y;}
@@ -1134,7 +1139,8 @@ extern "C" void rbx_wayland_vulkan_hide() {
         wl_callback_add_listener(gl_handoff_callback,&listener,nullptr);
         wl_subsurface_set_desync(subsurface);
         wl_surface_commit(surface);
-        wl_surface_commit(gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window)));
+        // No toplevel surface while GDK has the window hidden.
+        if(auto toplevel=gdk_wayland_window_get_wl_surface(gtk_widget_get_window(window)))wl_surface_commit(toplevel);
         wl_display_flush(display);
     });
 }

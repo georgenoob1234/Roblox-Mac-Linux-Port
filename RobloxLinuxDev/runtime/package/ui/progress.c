@@ -4,7 +4,8 @@
 
 typedef struct {
     char *root, *cancel_file, *cancel_state;
-    GtkWidget *window, *phase, *body, *status, *size, *progress, *progress_area, *notice, *notice_text;
+    GtkWidget *window, *phase, *status, *size, *progress, *progress_area, *notice, *notice_text;
+    GtkWidget *notice_reveal, *progress_reveal, *error_reveal;
     GtkWidget *error, *error_title, *error_hint, *error_log, *log_button, *cancel;
     /* The latest event, kept so a window that appears after it still shows it. */
     char *last_phase, *last_message, *last_hint, *last_log, *notice_phase;
@@ -27,8 +28,8 @@ typedef struct {
 static void progress_notice(ProgressState *state, const char *text) {
     g_free(state->notice_phase); state->notice_phase = g_strdup(state->last_phase ? state->last_phase : "");
     if (!state->notice) return;
-    label_text(state->notice_text, text);
-    gtk_widget_set_visible(state->notice, text && *text);
+    if (text && *text) label_text(state->notice_text, text);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(state->notice_reveal), text && *text);
 }
 static void progress_close(ProgressState *state, int result) {
     if (state->closed) return;
@@ -201,37 +202,40 @@ static gboolean progress_show(gpointer data) {
     gtk_widget_set_size_request(box, 420, -1);
     gtk_container_add(GTK_CONTAINER(state->window), box);
     state->phase = label("Preparing", "phase"); gtk_box_pack_start(GTK_BOX(box), state->phase, FALSE, FALSE, 0);
-    /* One fixed-height body for every state, so the window never changes
-     * size (George, 2026-11-15): the progress view and the failure view take
-     * turns in it, and long text wraps, or scrolls, inside it. */
-    state->body = gtk_stack_new();
-    gtk_stack_set_homogeneous(GTK_STACK(state->body), TRUE);
-    gtk_stack_set_transition_type(GTK_STACK(state->body), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
-    gtk_stack_set_transition_duration(GTK_STACK(state->body), 120);
-    gtk_widget_set_size_request(state->body, 420, 124);
-    gtk_widget_set_margin_top(state->body, 2);
-    gtk_box_pack_start(GTK_BOX(box), state->body, FALSE, FALSE, 0);
-
-    GtkWidget *progress_page = vbox(0);
+    /* The compact layout of George's placement. The yellow note and the red
+     * failure box slide in and out (GtkRevealer), and the window's height
+     * follows them smoothly; its width never changes (George, 2026-11-15). */
     state->status = label("Setting up Roblox…", "detail");
-    gtk_label_set_lines(GTK_LABEL(state->status), 2); gtk_label_set_ellipsize(GTK_LABEL(state->status), PANGO_ELLIPSIZE_END);
-    gtk_box_pack_start(GTK_BOX(progress_page), state->status, FALSE, FALSE, 0);
-    state->notice = hbox(8); add_class(state->notice, "notice"); gtk_widget_set_margin_top(state->notice, 10);
+    gtk_widget_set_margin_top(state->status, 2);
+    gtk_box_pack_start(GTK_BOX(box), state->status, FALSE, FALSE, 0);
+
+    state->notice_reveal = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(state->notice_reveal), GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(state->notice_reveal), 220);
+    state->notice = hbox(8); add_class(state->notice, "notice"); gtk_widget_set_margin_top(state->notice, 12);
     GtkWidget *notice_icon = icon("warning", 15); gtk_widget_set_valign(notice_icon, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(state->notice), notice_icon, FALSE, FALSE, 0);
     state->notice_text = label(NULL, NULL);
-    gtk_label_set_lines(GTK_LABEL(state->notice_text), 2); gtk_label_set_ellipsize(GTK_LABEL(state->notice_text), PANGO_ELLIPSIZE_END);
     gtk_box_pack_start(GTK_BOX(state->notice), state->notice_text, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(progress_page), state->notice, FALSE, FALSE, 0);
-    state->progress_area = vbox(6); gtk_widget_set_valign(state->progress_area, GTK_ALIGN_END);
+    gtk_container_add(GTK_CONTAINER(state->notice_reveal), state->notice);
+    gtk_box_pack_start(GTK_BOX(box), state->notice_reveal, FALSE, FALSE, 0);
+
+    state->progress_reveal = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(state->progress_reveal), GTK_REVEALER_TRANSITION_TYPE_SLIDE_UP);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(state->progress_reveal), 220);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(state->progress_reveal), TRUE);
+    state->progress_area = vbox(6); gtk_widget_set_margin_top(state->progress_area, 14);
     state->size = gtk_label_new(""); add_class(state->size, "faint"); gtk_widget_set_halign(state->size, GTK_ALIGN_END);
     gtk_box_pack_start(GTK_BOX(state->progress_area), state->size, FALSE, FALSE, 0);
     state->progress = gtk_progress_bar_new(); gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(state->progress), FALSE);
     gtk_box_pack_start(GTK_BOX(state->progress_area), state->progress, FALSE, FALSE, 0);
-    gtk_box_pack_end(GTK_BOX(progress_page), state->progress_area, TRUE, TRUE, 0);
-    gtk_stack_add_named(GTK_STACK(state->body), progress_page, "progress");
+    gtk_container_add(GTK_CONTAINER(state->progress_reveal), state->progress_area);
+    gtk_box_pack_start(GTK_BOX(box), state->progress_reveal, FALSE, FALSE, 0);
 
-    state->error = hbox(10); add_class(state->error, "error-box");
+    state->error_reveal = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(state->error_reveal), GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_revealer_set_transition_duration(GTK_REVEALER(state->error_reveal), 260);
+    state->error = hbox(10); add_class(state->error, "error-box"); gtk_widget_set_margin_top(state->error, 4);
     GtkWidget *error_icon = icon("warning", 18); gtk_widget_set_valign(error_icon, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(state->error), error_icon, FALSE, FALSE, 0);
     GtkWidget *error_text = vbox(3);
@@ -246,11 +250,8 @@ static gboolean progress_show(gpointer data) {
     gtk_box_pack_start(GTK_BOX(error_text), state->error_hint, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(error_text), state->error_log, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(state->error), error_text, TRUE, TRUE, 0);
-    GtkWidget *error_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(error_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(error_scroll), FALSE);
-    gtk_container_add(GTK_CONTAINER(error_scroll), state->error);
-    gtk_stack_add_named(GTK_STACK(state->body), error_scroll, "error");
+    gtk_container_add(GTK_CONTAINER(state->error_reveal), state->error);
+    gtk_box_pack_start(GTK_BOX(box), state->error_reveal, FALSE, FALSE, 0);
 
     GtkWidget *foot = hbox(10); gtk_widget_set_margin_top(foot, 16);
     state->log_button = button("Open _log", "log", "ghost"); g_signal_connect(state->log_button, "clicked", G_CALLBACK(open_log_path), state);
@@ -260,7 +261,6 @@ static gboolean progress_show(gpointer data) {
     gtk_box_pack_start(GTK_BOX(foot), state->cancel, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), foot, FALSE, FALSE, 0);
     gtk_widget_set_sensitive(state->cancel, FALSE); gtk_widget_show_all(state->window);
-    gtk_widget_set_no_show_all(state->notice, TRUE); gtk_widget_hide(state->notice);
     gtk_widget_set_no_show_all(state->log_button, TRUE); gtk_widget_hide(state->log_button);
     if (state->seen_event) progress_apply(state);
     state->cancel_poll_id = g_timeout_add(CANCEL_POLL_MS, progress_poll_cancel, state);
@@ -283,14 +283,19 @@ static void progress_apply(ProgressState *state) {
         gtk_widget_set_tooltip_text(state->error_log, state->last_log);
         gtk_widget_set_visible(state->error_hint, state->last_hint && *state->last_hint);
         gtk_widget_set_visible(state->error_log, state->last_log && *state->last_log);
-        gtk_stack_set_visible_child_name(GTK_STACK(state->body), "error");
+        gtk_widget_hide(state->status);
+        gtk_revealer_set_reveal_child(GTK_REVEALER(state->progress_reveal), FALSE);
+        gtk_revealer_set_reveal_child(GTK_REVEALER(state->error_reveal), TRUE);
         gtk_widget_set_visible(state->log_button, state->last_log && *state->last_log);
         button_set_text(state->cancel, "_Close"); gtk_widget_set_sensitive(state->cancel, TRUE);
         progress_notice(state, NULL);
         g_free(what); g_free(full);
         return;
     }
-    gtk_stack_set_visible_child_name(GTK_STACK(state->body), "progress"); gtk_widget_hide(state->log_button);
+    gtk_widget_show(state->status);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(state->error_reveal), FALSE);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(state->progress_reveal), TRUE);
+    gtk_widget_hide(state->log_button);
     if (!state->cancelled) button_set_text(state->cancel, "_Cancel");
     const char *title = phase_title(phase);
     if (title) label_text(state->phase, title);
@@ -298,7 +303,7 @@ static void progress_apply(ProgressState *state) {
     if (*message) label_text(state->status, message);
     /* A note answers the user's last action and goes when the phase moves on,
      * except a pending cancel: that stays until the launcher ends the run. */
-    if (state->notice && gtk_widget_get_visible(state->notice) && !state->cancelled && g_strcmp0(state->notice_phase, phase)) progress_notice(state, NULL);
+    if (state->notice && gtk_revealer_get_reveal_child(GTK_REVEALER(state->notice_reveal)) && !state->cancelled && g_strcmp0(state->notice_phase, phase)) progress_notice(state, NULL);
     if (!state->cancelled) gtk_widget_set_sensitive(state->cancel, state->cancellable);
     if (percent >= 0) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->progress), percent / 100.0);
     else gtk_progress_bar_pulse(GTK_PROGRESS_BAR(state->progress));

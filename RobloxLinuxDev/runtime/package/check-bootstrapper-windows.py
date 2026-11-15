@@ -307,7 +307,9 @@ def check_progress_failure_stays_until_closed(display, binary, tmp):
             "phase": "failed", "percent": 0, "message": "Roblox update failed: Could not resolve host: setup.rbxcdn.com",
             "bytes_done": 0, "bytes_total": 0, "cancellable": False,
             "hint": "The installed client was kept. Check your internet connection and try again later.", "log": log}) + "\n").encode())
-        windows = progress.ui.wait(lambda w: Window.button(w, "Close") is not None)
+        # The red box slides in: wait for its text, not only for Close.
+        windows = progress.ui.wait(lambda w: Window.button(w, "Close") is not None
+                                   and "Could not resolve host: setup.rbxcdn.com." in Window.texts(w))
         texts = Window.texts(windows)
         for part in ("Roblox update failed", "Could not resolve host: setup.rbxcdn.com.",
                      "The installed client was kept. Check your internet connection and try again later.", log):
@@ -343,28 +345,39 @@ def check_pending_cancel_stays_visible(display, binary, tmp):
 
 
 def check_launch_window_keeps_its_size(display, binary, tmp):
-    """George, 2026-11-15: the window grew when the error appeared. It keeps
-    one size in every state; long text wraps (or scrolls) inside it."""
+    """George, 2026-11-15: keep the compact size of the original window; the
+    yellow note and the red box may grow it vertically (smoothly, they slide
+    in), but the width never changes and the window returns to the compact
+    height when the note goes away."""
+    def size(ui):
+        window = ui.dump()[0]
+        return window["width"], window["height"]
+    def settled(ui, test, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = size(ui)
+            time.sleep(0.4)  # longer than the slide animations
+            if size(ui) == current and test(current):
+                return current
+        raise AssertionError(f"size did not settle as expected: {size(ui)}")
     with Progress(display, binary, tmp, state="committing") as progress:
         progress.ui.wait(lambda w: Window.widgets(w, "progress"))
-        progress.send("downloading", 40, "Downloading Roblox 0.748.0.7480000", 400, 1000)
-        windows = progress.ui.wait(lambda w: "Downloading Roblox 0.748.0.7480000" in Window.texts(w))
-        time.sleep(0.3)
-        size = (progress.ui.dump()[0]["width"], progress.ui.dump()[0]["height"])
-        assert progress.ui.send("close") == {"ok": True}  # the refusal note
-        time.sleep(0.3)
-        windows = progress.ui.dump()
-        assert (windows[0]["width"], windows[0]["height"]) == size, ("the note resized the window", size, windows[0])
-        long_reason = "Could not resolve host: setup.rbxcdn.com " + "(a long explanation that has to wrap) " * 6
+        progress.send("installing", 90, "Replacing the client with the new version")
+        progress.ui.wait(lambda w: "Replacing the client with the new version" in Window.texts(w))
+        width, compact = settled(progress.ui, lambda s: True)
+        assert compact < 200, f"the launch window is not compact any more: {compact} px high"
+        assert progress.ui.send("close") == {"ok": True}  # the refusal note slides in
+        settled(progress.ui, lambda s: s[0] == width and s[1] > compact)
+        progress.send("verifying", 95, "Verifying the installed client")  # the note goes with the phase
+        settled(progress.ui, lambda s: s == (width, compact))
+        long_reason = "Could not resolve host: setup.rbxcdn.com " + "(a long explanation that has to wrap) " * 4
         os.write(progress.write, (json.dumps({
             "phase": "failed", "percent": 0, "message": "Roblox update failed: " + long_reason,
             "bytes_done": 0, "bytes_total": 0, "cancellable": False,
             "hint": "The installed client was kept. Check your internet connection and try again later.",
             "log": "/home/someone/.local/opt/roblox-mac-linux-port/DO_NOT_SHARE/launcher.log"}) + "\n").encode())
         progress.ui.wait(lambda w: Window.button(w, "Close") is not None)
-        time.sleep(0.3)
-        windows = progress.ui.dump()
-        assert (windows[0]["width"], windows[0]["height"]) == size, ("the error resized the window", size, windows[0])
+        settled(progress.ui, lambda s: s[0] == width)
 
 
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,

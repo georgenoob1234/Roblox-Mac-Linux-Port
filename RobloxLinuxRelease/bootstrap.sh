@@ -467,6 +467,13 @@ first_run() {
     event first-run 15 'First-run setup complete' 0 0 false
 }
 
+# check_latest [wait]: print the latest client version known after this call.
+# The lookup runs in the background. With "wait" (Settings' "Check for
+# updates", an explicit update) the answer is awaited; otherwise (a launch)
+# it is awaited for at most ROBLOX_MAC_UPDATE_CHECK_GRACE seconds (default 1)
+# and the launch goes on: the background lookup still records its answer, so
+# the update is offered at the next start (B10 flow 6). Returns 0 with a
+# fresh or not-yet-due answer, 1 when the lookup failed, 125 when cancelled.
 check_latest() {
     if cancelled; then return 125; fi
     now=$(date +%s)
@@ -475,32 +482,66 @@ check_latest() {
         settings_get last_known_latest
         return 0
     fi
-    check_output=$DATA/.check.$$
-    rm -f -- "$check_output"
-    timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version 9>&- >"$check_output" 2>/dev/null &
-    check_pid=$!
-    while kill -0 "$check_pid" 2>/dev/null; do
-        if cancelled; then kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true; rm -f -- "$check_output"; return 125; fi
-        sleep 0.1
-    done
-    wait "$check_pid" 2>/dev/null
-    check_status=$?
-    latest=$(sed -n '/^version-[0-9a-f][0-9a-f]*$/p' "$check_output" 2>/dev/null | tail -n 1 || true)
-    rm -f -- "$check_output"
     settings_set last_check "$now" >/dev/null 2>&1 || true
-    if [ "$check_status" -ne 0 ]; then
-        [ -n "$latest" ] && printf '%s\n' "$latest"
-        return 1
-    fi
-    if [ -n "$latest" ]; then
-        settings_set last_known_latest "$latest" >/dev/null 2>&1 || true
-        display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 9>&- 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
-        [ -z "$display" ] || settings_set last_known_latest_display "$display" >/dev/null 2>&1 || true
-        printf '%s\n' "$latest"
-    else
-        settings_get last_known_latest
-        return 1
-    fi
+    check_result_file=$DATA/.check.$$
+    rm -f -- "$check_result_file" "$check_result_file.tmp" "$check_result_file.abandoned"
+    # The lookup must not keep the instance lock (9) or the progress pipe (8)
+    # open, and must not hold this script's output open after a launch.
+    (
+        exec 8>&- 9>&-
+        check_timeout=${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}
+        check_output=$(timeout "$check_timeout" "$APP" --client-version 2>/dev/null)
+        check_status=$?
+        found=$(printf '%s\n' "$check_output" | sed -n '/^version-[0-9a-f][0-9a-f]*$/p' | tail -n 1)
+        if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
+            settings_set last_known_latest "$found" >/dev/null 2>&1 || true
+            printf 'ok %s\n' "$found" > "$check_result_file.tmp"
+        else
+            printf 'failed %s\n' "$found" > "$check_result_file.tmp"
+        fi
+        mv -f -- "$check_result_file.tmp" "$check_result_file"
+        if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
+            display=$(timeout "$check_timeout" "$APP" --client-version-display 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
+            [ -z "$display" ] || settings_set last_known_latest_display "$display" >/dev/null 2>&1 || true
+        fi
+        # Nobody will read an answer the launch stopped waiting for.
+        [ -e "$check_result_file.abandoned" ] && rm -f -- "$check_result_file" "$check_result_file.abandoned"
+        exit 0
+    ) </dev/null >/dev/null 2>&1 &
+    check_pid=$!
+    # The grace period in 50 ms ticks.
+    ticks=$(awk -v grace="${ROBLOX_MAC_UPDATE_CHECK_GRACE:-1}" 'BEGIN { t = int(grace * 20); print (t > 0 ? t : 0) }' 2>/dev/null || echo 20)
+    while :; do
+        if cancelled; then
+            kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true
+            rm -f -- "$check_result_file" "$check_result_file.tmp" "$check_result_file.abandoned"
+            return 125
+        fi
+        if [ "${1:-}" = wait ]; then
+            kill -0 "$check_pid" 2>/dev/null || break
+        else
+            [ -e "$check_result_file" ] && break
+            kill -0 "$check_pid" 2>/dev/null || break
+            ticks=$((ticks - 1))
+            if [ "$ticks" -lt 0 ]; then
+                # Not answered in time: launch now, offer the update next start.
+                : > "$check_result_file.abandoned"
+                [ -e "$check_result_file" ] && rm -f -- "$check_result_file" "$check_result_file.abandoned"
+                settings_get last_known_latest
+                return 0
+            fi
+        fi
+        sleep 0.05
+    done
+    [ "${1:-}" = wait ] && wait "$check_pid" 2>/dev/null
+    answer=$(cat "$check_result_file" 2>/dev/null || true)
+    rm -f -- "$check_result_file" "$check_result_file.abandoned"
+    case "$answer" in
+        "ok "*) printf '%s\n' "${answer#ok }"; return 0;;
+    esac
+    found=${answer#failed}; found=${found# }
+    if [ -n "$found" ]; then printf '%s\n' "$found"; else settings_get last_known_latest; fi
+    return 1
 }
 
 do_update() {
@@ -602,7 +643,7 @@ case "$command" in
         start_progress || { exec 9>&-; exit 1; }
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
-        latest=$(check_latest); check_result=$?
+        latest=$(check_latest wait); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; notify 'Update check cancelled.' 'Roblox'; exit 125; }
         [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; status_json; exit 1; }
         finish_progress
@@ -618,7 +659,7 @@ case "$command" in
         start_progress || { exec 9>&-; exit 1; }
         first_run || { finish_progress; exit 1; }
         event checking 25 'Checking for updates'
-        latest=$(check_latest); check_result=$?
+        latest=$(check_latest wait); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; exit 125; }
         [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; exit 1; }
         [ -n "$latest" ] || { say 'No latest version is known; update check failed.'; finish_progress; exit 1; }

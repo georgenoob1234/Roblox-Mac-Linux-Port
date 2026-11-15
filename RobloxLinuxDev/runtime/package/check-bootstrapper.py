@@ -47,7 +47,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
   --shell) test ! -e /proc/$$/fd/9; mkdir -p "$HERE/DO_NOT_SHARE/prefix"; exit 0;;
-  --client-version) [ "${FAIL_CHECK:-0}" = 1 ] && exit 1; echo version-abcd; exit 0;;
+  --client-version) sleep "${CHECK_DELAY:-0}"; [ "${FAIL_CHECK:-0}" = 1 ] && exit 1; echo version-abcd; exit 0;;
   # Without this, the display-version query fell through to "launched" below.
   --client-version-display) exit 1;;
   --uri) printf '%s\n' launched-with-uri > "$HERE/uri-launch"; exit 0;;
@@ -271,6 +271,50 @@ exit 3
         (fallback_bin / name).chmod(0o755)
         cancel_case({"PATH": str(fallback_bin), "ROBLOX_MAC_UI_APP": "",
                      "DBUS_SESSION_BUS_ADDRESS": ""})
+    # B10 flow 6: the update check must not delay the launch. A check that
+    # has not answered within a short grace period no longer holds the game
+    # back; it finishes in the background and its answer is offered at the
+    # next start. A fast check still prompts on the same launch.
+    timing_log = tmp / "timing-prompt.log"
+    timing_ui = Path(tmp) / "timing-ui"
+    timing_ui.write_text("""#!/bin/sh
+case "${2:-}" in
+  --progress) cat >/dev/null; exit 0;;
+  --dialog) echo dialog >> "$TIMING_LOG"; exit 1;;
+esac
+exit 3
+""")
+    timing_ui.chmod(0o755)
+    def timed_launch(settings, **extra):
+        (private / "bootstrapper.json").write_text(json.dumps(settings))
+        (release / "RobloxVersion/.version").write_text("version-old\n")
+        (release / "launched").unlink(missing_ok=True)
+        timing_log.write_text("")
+        started = time.monotonic()
+        result = subprocess.run([bootstrap], env={**env, "ROBLOX_MAC_UI_APP": str(timing_ui), "TIMING_LOG": str(timing_log),
+                                                  "ROBLOX_MAC_UPDATE_CHECK_TIMEOUT": "8", **extra},
+                                capture_output=True, text=True, timeout=60)
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0 and (release / "launched").exists(), result.stderr
+        return elapsed, timing_log.read_text().splitlines()
+    fast_elapsed, prompts = timed_launch({"auto_update": "ask", "check_interval_hours": 0})
+    assert prompts == ["dialog"], ("a fast check must still prompt on the same launch", prompts)
+    slow_elapsed, prompts = timed_launch({"auto_update": "ask", "check_interval_hours": 0}, CHECK_DELAY="4")
+    print(f"launch time: fast check {fast_elapsed:.2f}s, 4 s check {slow_elapsed:.2f}s")
+    assert slow_elapsed < fast_elapsed + 1.5, f"a 4 s check delayed the launch: {slow_elapsed:.2f}s (fast {fast_elapsed:.2f}s)"
+    assert prompts == [], prompts
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if json.loads((private / "bootstrapper.json").read_text()).get("last_known_latest") == "version-abcd":
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("the background check did not record its answer")
+    recorded = json.loads((private / "bootstrapper.json").read_text())
+    _, prompts = timed_launch({**recorded, "check_interval_hours": 24})
+    assert prompts == ["dialog"], ("the update found in the background was not offered at the next start", prompts)
+    assert not list(private.glob(".check*")), list(private.glob(".check*"))
+
     # zenity's extra button (Launch without updating) still launches.
     (fallback_bin / "zenity").write_text("#!/bin/sh\necho 'Launch without updating'\nexit 1\n")
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "ask", "check_interval_hours": 0}))

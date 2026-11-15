@@ -101,6 +101,9 @@ static void ui_test_dump(void) {
         const char *title = gtk_window_get_title(item->data);
         json_builder_begin_object(builder);
         json_builder_set_member_name(builder, "title"); json_builder_add_string_value(builder, title ? title : "");
+        int width = 0, height = 0; gtk_window_get_size(item->data, &width, &height);
+        json_builder_set_member_name(builder, "width"); json_builder_add_int_value(builder, width);
+        json_builder_set_member_name(builder, "height"); json_builder_add_int_value(builder, height);
         json_builder_set_member_name(builder, "widgets"); json_builder_begin_array(builder);
         gtk_container_forall(GTK_CONTAINER(item->data), ui_test_widget, builder);
         json_builder_end_array(builder); json_builder_end_object(builder);

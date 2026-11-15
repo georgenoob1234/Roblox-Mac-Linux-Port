@@ -4,7 +4,7 @@
 
 typedef struct {
     char *root, *cancel_file, *cancel_state;
-    GtkWidget *window, *phase, *status, *size, *progress, *progress_area, *notice, *notice_text;
+    GtkWidget *window, *phase, *body, *status, *size, *progress, *progress_area, *notice, *notice_text;
     GtkWidget *error, *error_title, *error_hint, *error_log, *log_button, *cancel;
     /* The latest event, kept so a window that appears after it still shows it. */
     char *last_phase, *last_message, *last_hint, *last_log, *notice_phase;
@@ -201,36 +201,57 @@ static gboolean progress_show(gpointer data) {
     gtk_widget_set_size_request(box, 420, -1);
     gtk_container_add(GTK_CONTAINER(state->window), box);
     state->phase = label("Preparing", "phase"); gtk_box_pack_start(GTK_BOX(box), state->phase, FALSE, FALSE, 0);
-    state->status = label("Setting up Roblox…", "detail"); gtk_label_set_xalign(GTK_LABEL(state->status), 0);
-    gtk_widget_set_margin_top(state->status, 2); gtk_widget_set_margin_bottom(state->status, 14);
-    gtk_box_pack_start(GTK_BOX(box), state->status, FALSE, FALSE, 0);
-    state->progress_area = vbox(6);
+    /* One fixed-height body for every state, so the window never changes
+     * size (George, 2026-11-15): the progress view and the failure view take
+     * turns in it, and long text wraps, or scrolls, inside it. */
+    state->body = gtk_stack_new();
+    gtk_stack_set_homogeneous(GTK_STACK(state->body), TRUE);
+    gtk_stack_set_transition_type(GTK_STACK(state->body), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+    gtk_stack_set_transition_duration(GTK_STACK(state->body), 120);
+    gtk_widget_set_size_request(state->body, 420, 124);
+    gtk_widget_set_margin_top(state->body, 2);
+    gtk_box_pack_start(GTK_BOX(box), state->body, FALSE, FALSE, 0);
+
+    GtkWidget *progress_page = vbox(0);
+    state->status = label("Setting up Roblox…", "detail");
+    gtk_label_set_lines(GTK_LABEL(state->status), 2); gtk_label_set_ellipsize(GTK_LABEL(state->status), PANGO_ELLIPSIZE_END);
+    gtk_box_pack_start(GTK_BOX(progress_page), state->status, FALSE, FALSE, 0);
+    state->notice = hbox(8); add_class(state->notice, "notice"); gtk_widget_set_margin_top(state->notice, 10);
+    GtkWidget *notice_icon = icon("warning", 15); gtk_widget_set_valign(notice_icon, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(state->notice), notice_icon, FALSE, FALSE, 0);
+    state->notice_text = label(NULL, NULL);
+    gtk_label_set_lines(GTK_LABEL(state->notice_text), 2); gtk_label_set_ellipsize(GTK_LABEL(state->notice_text), PANGO_ELLIPSIZE_END);
+    gtk_box_pack_start(GTK_BOX(state->notice), state->notice_text, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(progress_page), state->notice, FALSE, FALSE, 0);
+    state->progress_area = vbox(6); gtk_widget_set_valign(state->progress_area, GTK_ALIGN_END);
     state->size = gtk_label_new(""); add_class(state->size, "faint"); gtk_widget_set_halign(state->size, GTK_ALIGN_END);
     gtk_box_pack_start(GTK_BOX(state->progress_area), state->size, FALSE, FALSE, 0);
     state->progress = gtk_progress_bar_new(); gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(state->progress), FALSE);
     gtk_box_pack_start(GTK_BOX(state->progress_area), state->progress, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), state->progress_area, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(progress_page), state->progress_area, TRUE, TRUE, 0);
+    gtk_stack_add_named(GTK_STACK(state->body), progress_page, "progress");
+
     state->error = hbox(10); add_class(state->error, "error-box");
-    gtk_box_pack_start(GTK_BOX(state->error), icon("warning", 18), FALSE, FALSE, 0);
-    gtk_widget_set_valign(gtk_container_get_children(GTK_CONTAINER(state->error))->data, GTK_ALIGN_START);
+    GtkWidget *error_icon = icon("warning", 18); gtk_widget_set_valign(error_icon, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(state->error), error_icon, FALSE, FALSE, 0);
     GtkWidget *error_text = vbox(3);
-    state->error_title = label(NULL, "error-title"); gtk_label_set_xalign(GTK_LABEL(state->error_title), 0);
-    state->error_hint = label(NULL, NULL); gtk_label_set_xalign(GTK_LABEL(state->error_hint), 0);
-    state->error_log = label(NULL, "path"); gtk_label_set_xalign(GTK_LABEL(state->error_log), 0); gtk_label_set_selectable(GTK_LABEL(state->error_log), TRUE);
-    gtk_label_set_line_wrap_mode(GTK_LABEL(state->error_log), PANGO_WRAP_CHAR);
-    /* A path is not a word: break it anywhere, without hyphens. */
-    PangoAttrList *no_hyphens = pango_attr_list_new();
-    pango_attr_list_insert(no_hyphens, pango_attr_insert_hyphens_new(FALSE));
-    gtk_label_set_attributes(GTK_LABEL(state->error_log), no_hyphens); pango_attr_list_unref(no_hyphens);
+    state->error_title = label(NULL, "error-title");
+    state->error_hint = label(NULL, NULL);
+    /* The log path on one line, shortened in the middle; all of it in the
+     * tooltip and behind Open log. */
+    state->error_log = gtk_label_new(NULL); add_class(state->error_log, "path");
+    gtk_widget_set_halign(state->error_log, GTK_ALIGN_START); gtk_label_set_xalign(GTK_LABEL(state->error_log), 0);
+    gtk_label_set_ellipsize(GTK_LABEL(state->error_log), PANGO_ELLIPSIZE_MIDDLE); gtk_label_set_selectable(GTK_LABEL(state->error_log), TRUE);
     gtk_box_pack_start(GTK_BOX(error_text), state->error_title, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(error_text), state->error_hint, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(error_text), state->error_log, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(state->error), error_text, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(box), state->error, FALSE, FALSE, 0);
-    state->notice = hbox(8); add_class(state->notice, "notice"); gtk_widget_set_margin_top(state->notice, 12);
-    gtk_box_pack_start(GTK_BOX(state->notice), icon("warning", 15), FALSE, FALSE, 0);
-    state->notice_text = label(NULL, NULL); gtk_box_pack_start(GTK_BOX(state->notice), state->notice_text, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(box), state->notice, FALSE, FALSE, 0);
+    GtkWidget *error_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(error_scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height(GTK_SCROLLED_WINDOW(error_scroll), FALSE);
+    gtk_container_add(GTK_CONTAINER(error_scroll), state->error);
+    gtk_stack_add_named(GTK_STACK(state->body), error_scroll, "error");
+
     GtkWidget *foot = hbox(10); gtk_widget_set_margin_top(foot, 16);
     state->log_button = button("Open _log", "log", "ghost"); g_signal_connect(state->log_button, "clicked", G_CALLBACK(open_log_path), state);
     gtk_box_pack_start(GTK_BOX(foot), state->log_button, FALSE, FALSE, 0);
@@ -240,7 +261,6 @@ static gboolean progress_show(gpointer data) {
     gtk_box_pack_start(GTK_BOX(box), foot, FALSE, FALSE, 0);
     gtk_widget_set_sensitive(state->cancel, FALSE); gtk_widget_show_all(state->window);
     gtk_widget_set_no_show_all(state->notice, TRUE); gtk_widget_hide(state->notice);
-    gtk_widget_set_no_show_all(state->error, TRUE); gtk_widget_hide(state->error);
     gtk_widget_set_no_show_all(state->log_button, TRUE); gtk_widget_hide(state->log_button);
     if (state->seen_event) progress_apply(state);
     state->cancel_poll_id = g_timeout_add(CANCEL_POLL_MS, progress_poll_cancel, state);
@@ -248,27 +268,29 @@ static gboolean progress_show(gpointer data) {
 }
 static void progress_apply(ProgressState *state) {
     const char *phase = state->last_phase ? state->last_phase : "", *message = state->last_message ? state->last_message : "";
-    gtk_widget_set_margin_bottom(state->phase, state->failed ? 12 : 0);
     gint64 percent = state->last_percent, done = state->last_done, total = state->last_total;
     if (state->failed) {
-        /* "WHAT: WHY" from the launcher: WHAT is the title. */
+        /* "WHAT: WHY" from the launcher: WHAT is the title, WHY the box's
+         * first line (not repeated: the title already says what failed). */
         const char *colon = strstr(message, ": ");
         char *what = colon ? g_strndup(message, colon - message) : g_strdup(*message ? message : "Something went wrong");
-        char *full = g_strdup_printf("%s%s", message, *message && !g_str_has_suffix(message, ".") ? "." : "");
+        const char *why = colon ? colon + 2 : message;
+        char *full = g_strdup_printf("%s%s", why, *why && !g_str_has_suffix(why, ".") ? "." : "");
+        if (full[0]) full[0] = g_ascii_toupper(full[0]);
         label_text(state->phase, what); label_text(state->error_title, full);
         label_text(state->error_hint, state->last_hint);
         label_text(state->error_log, state->last_log);
+        gtk_widget_set_tooltip_text(state->error_log, state->last_log);
         gtk_widget_set_visible(state->error_hint, state->last_hint && *state->last_hint);
         gtk_widget_set_visible(state->error_log, state->last_log && *state->last_log);
-        gtk_widget_hide(state->status);
-        gtk_widget_hide(state->progress_area); gtk_widget_show(state->error);
+        gtk_stack_set_visible_child_name(GTK_STACK(state->body), "error");
         gtk_widget_set_visible(state->log_button, state->last_log && *state->last_log);
         button_set_text(state->cancel, "_Close"); gtk_widget_set_sensitive(state->cancel, TRUE);
         progress_notice(state, NULL);
         g_free(what); g_free(full);
         return;
     }
-    gtk_widget_show(state->status); gtk_widget_show(state->progress_area); gtk_widget_hide(state->error); gtk_widget_hide(state->log_button);
+    gtk_stack_set_visible_child_name(GTK_STACK(state->body), "progress"); gtk_widget_hide(state->log_button);
     if (!state->cancelled) button_set_text(state->cancel, "_Cancel");
     const char *title = phase_title(phase);
     if (title) label_text(state->phase, title);

@@ -309,11 +309,11 @@ def check_progress_failure_stays_until_closed(display, binary, tmp):
             "hint": "The installed client was kept. Check your internet connection and try again later.", "log": log}) + "\n").encode())
         windows = progress.ui.wait(lambda w: Window.button(w, "Close") is not None)
         texts = Window.texts(windows)
-        for part in ("Roblox update failed", "Roblox update failed: Could not resolve host: setup.rbxcdn.com.",
+        for part in ("Roblox update failed", "Could not resolve host: setup.rbxcdn.com.",
                      "The installed client was kept. Check your internet connection and try again later.", log):
             assert part in texts, (part, texts)
         assert Window.button(windows, "Open log"), texts
-        assert not Window.widgets(windows, "progress"), "the progress bar is still shown under a failure"
+        progress.ui.wait(lambda w: not Window.widgets(w, "progress"), timeout=3)  # after the crossfade
         os.close(progress.write)
         progress.write = os.open(os.devnull, os.O_WRONLY)
         assert progress.ui.exited(1.0) is None, "the failure closed without the user"
@@ -342,13 +342,38 @@ def check_pending_cancel_stays_visible(display, binary, tmp):
         assert progress.ui.exited(5) == 4
 
 
+def check_launch_window_keeps_its_size(display, binary, tmp):
+    """George, 2026-11-15: the window grew when the error appeared. It keeps
+    one size in every state; long text wraps (or scrolls) inside it."""
+    with Progress(display, binary, tmp, state="committing") as progress:
+        progress.ui.wait(lambda w: Window.widgets(w, "progress"))
+        progress.send("downloading", 40, "Downloading Roblox 0.748.0.7480000", 400, 1000)
+        windows = progress.ui.wait(lambda w: "Downloading Roblox 0.748.0.7480000" in Window.texts(w))
+        time.sleep(0.3)
+        size = (progress.ui.dump()[0]["width"], progress.ui.dump()[0]["height"])
+        assert progress.ui.send("close") == {"ok": True}  # the refusal note
+        time.sleep(0.3)
+        windows = progress.ui.dump()
+        assert (windows[0]["width"], windows[0]["height"]) == size, ("the note resized the window", size, windows[0])
+        long_reason = "Could not resolve host: setup.rbxcdn.com " + "(a long explanation that has to wrap) " * 6
+        os.write(progress.write, (json.dumps({
+            "phase": "failed", "percent": 0, "message": "Roblox update failed: " + long_reason,
+            "bytes_done": 0, "bytes_total": 0, "cancellable": False,
+            "hint": "The installed client was kept. Check your internet connection and try again later.",
+            "log": "/home/someone/.local/opt/roblox-mac-linux-port/DO_NOT_SHARE/launcher.log"}) + "\n").encode())
+        progress.ui.wait(lambda w: Window.button(w, "Close") is not None)
+        time.sleep(0.3)
+        windows = progress.ui.dump()
+        assert (windows[0]["width"], windows[0]["height"]) == size, ("the error resized the window", size, windows[0])
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
           check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why,
           check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates,
           check_failed_update_check_says_why, check_progress_failure_stays_until_closed,
-          check_pending_cancel_stays_visible]
+          check_pending_cancel_stays_visible, check_launch_window_keeps_its_size]
 
 
 def main():

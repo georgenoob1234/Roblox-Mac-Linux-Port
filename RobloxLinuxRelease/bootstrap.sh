@@ -152,21 +152,27 @@ reason_from() {
 # report_failure WHAT WHY TODO: what failed, why, what the user can do, and
 # where the details are (B10 defect 2).
 report_failure() {
-    event failed 0 "$1: $2" 0 0 false
+    event failed 0 "$1: $2" 0 0 false false "$3" "$LOG"
     say "$1: $2. $3"
     notify "$1: $2. $3 Details: $LOG" "$1"
 }
-# event PHASE PERCENT MESSAGE [DONE] [TOTAL] [CANCELLABLE] [HIDDEN]
+# event PHASE PERCENT MESSAGE [DONE] [TOTAL] [CANCELLABLE] [HIDDEN] [HINT] [LOG]
 # HIDDEN=true asks the progress window to stay off screen until the next event
 # (sent while the update prompt is open, so the prompt is never covered).
+# HINT and LOG go with a failure: what the user can do, and the log's path;
+# the window keeps a failure on screen until the user closes it.
 event() {
-    payload=$(python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" "${7:-false}" <<'PY'
+    payload=$(python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" "${7:-false}" "${8:-}" "${9:-}" <<'PY'
 import json, sys
 payload = {"phase": sys.argv[1], "percent": int(sys.argv[2]), "message": sys.argv[3],
            "bytes_done": int(sys.argv[4]), "bytes_total": int(sys.argv[5]),
            "cancellable": sys.argv[6].lower() == "true"}
 if sys.argv[7].lower() == "true":
     payload["hidden"] = True
+if sys.argv[8]:
+    payload["hint"] = sys.argv[8]
+if sys.argv[9]:
+    payload["log"] = sys.argv[9]
 print(json.dumps(payload, separators=(",", ":")))
 PY
     )
@@ -803,11 +809,11 @@ case "$command" in
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress || { exec 9>&-; exit 1; }
-        first_run || { finish_progress; exit 1; }
+        first_run || { exec 9>&-; finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest wait); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; notify 'Update check cancelled.' 'Roblox'; exit 125; }
-        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; status_json; exit 1; }
+        [ "$check_result" -eq 0 ] || { event failed 0 "Could not check for updates: $(settings_get last_check_error 2>/dev/null || true)" 0 0 false false 'Check your internet connection and try again.' "$LOG"; exec 9>&-; finish_progress; status_json; exit 1; }
         finish_progress
         exec 9>&-
         status_json; exit 0;;
@@ -819,13 +825,13 @@ case "$command" in
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress || { exec 9>&-; exit 1; }
-        first_run || { finish_progress; exit 1; }
+        first_run || { exec 9>&-; finish_progress; exit 1; }
         event checking 25 'Checking for updates'
         latest=$(check_latest wait); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; exit 125; }
-        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; exit 1; }
+        [ "$check_result" -eq 0 ] || { event failed 0 "Could not check for updates: $(settings_get last_check_error 2>/dev/null || true)" 0 0 false false 'Check your internet connection and try again.' "$LOG"; exec 9>&-; finish_progress; exit 1; }
         [ -n "$latest" ] || { say 'No latest version is known; update check failed.'; finish_progress; exit 1; }
-        do_update; result=$?; finish_progress; [ "$UI_CANCELLED" -eq 1 ] && result=125; exit "$result";;
+        do_update; result=$?; exec 9>&-; finish_progress; [ "$UI_CANCELLED" -eq 1 ] && result=125; exit "$result";;
     update-settings)
         [ "$#" -eq 1 ] || { echo 'Usage: run.sh update-settings' >&2; exit 2; }
         sh "$HERE/run.sh" update
@@ -842,7 +848,7 @@ case "$command" in
             finish_progress; exit 1
         fi
         start_progress required || { exec 9>&-; exit 1; }
-        do_port_update; result=$?; finish_progress; exec 9>&-
+        do_port_update; result=$?; exec 9>&-; finish_progress
         exit "$result";;
     port-update-settings)
         [ "$#" -eq 1 ] || { echo 'Usage: run.sh port-update-settings' >&2; exit 2; }
@@ -867,7 +873,7 @@ if ! flock -n -E 73 9; then
 fi
 recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
 start_progress || { exec 9>&-; exit 1; }
-first_run || { finish_progress; exit 1; }
+first_run || { exec 9>&-; finish_progress; exit 1; }
 installed=$(installed_version)
 event checking 25 'Checking for updates'
 mode=$(settings_get auto_update 2>/dev/null || printf 'ask')

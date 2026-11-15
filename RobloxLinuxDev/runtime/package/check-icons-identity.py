@@ -113,7 +113,8 @@ def test_browser_host_and_wayland_identity():
     print("PASS browser host and wayland identity")
 
 def test_bootstrapper_ui_identity():
-    ui_text = UI_SOURCE.read_text()
+    # bootstrapper-ui.c and the files it includes from ui/.
+    ui_text = "\n".join(path.read_text() for path in [UI_SOURCE, *sorted((UI_SOURCE.parent / "ui").glob("*.[ch]"))])
     assert 'g_set_prgname("roblox-mac-port")' in ui_text, "Missing g_set_prgname(\"roblox-mac-port\") in bootstrapper-ui.c"
     assert 'gdk_set_program_class("roblox-mac-port")' in ui_text, "Missing gdk_set_program_class in bootstrapper-ui.c"
     assert 'gtk_window_set_default_icon_name("roblox-mac-port")' in ui_text, "Missing default icon name in bootstrapper-ui.c"

@@ -49,6 +49,8 @@
 !/runtime/optimized/
 !/runtime/package/
 !/runtime/package/icon.png
+# The bootstrapper's icon sources (rendered into ui/icons.h by make-ui-icons.py).
+!/runtime/package/ui-icons/*.svg
 /native/*
 # These sources are shared with the native x86 runner; the ARM runner is local.
 !/native/renderer/

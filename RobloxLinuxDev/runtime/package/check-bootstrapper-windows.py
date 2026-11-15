@@ -80,13 +80,12 @@ def event(phase, percent=0, message="", done=0, total=0, cancellable=False, hidd
 def check_harness_reads_launcher(display, binary, tmp):
     root = fake_root(tmp)
     with display.open(binary, "--launcher", root) as ui:
-        windows = ui.wait(lambda w: Window.stack(w) == "play" and "Client version: 0.747.0.7471481" in Window.texts(w))
+        windows = ui.wait(lambda w: Window.stack(w) == "play" and "Client 0.747.0.7471481" in Window.texts(w))
         assert [w["title"] for w in windows] == ["Roblox Mac Linux Port"], windows
         nav = [w["text"] for w in Window.widgets(windows, "toggle")]
-        assert any("Info" in text for text in nav), nav
-        info = next(text for text in nav if "Info" in text)
-        assert ui.send(f"click {info}") == {"ok": True}
-        ui.wait(lambda w: Window.stack(w) == "info")
+        assert nav == ["Play", "Updates", "Appearance", "About"], nav
+        assert ui.send("click About") == {"ok": True}
+        ui.wait(lambda w: Window.stack(w) == "about")
         assert ui.send("click No such button") == {"ok": False, "error": "no such button"}
         assert ui.send("close") == {"ok": True}
         assert ui.exited(10) == 0
@@ -133,11 +132,11 @@ def check_settings_opens_on_settings_page(display, binary, tmp):
     """B10 defect 1: --settings highlighted Settings but showed the Play page."""
     root = fake_root(tmp)
     with display.open(binary, "--settings", root) as ui:
-        windows = ui.wait(lambda w: "Client version: 0.747.0.7471481" in Window.texts(w))
+        windows = ui.wait(lambda w: "Client 0.747.0.7471481" in Window.texts(w))
         active = [w["text"] for w in Window.widgets(windows, "toggle") if w["active"]]
-        assert len(active) == 1 and "Settings" in active[0], active
+        assert active == ["Updates"], active
         try:
-            ui.wait(lambda w: Window.stack(w) == "settings", timeout=3)
+            ui.wait(lambda w: Window.stack(w) == "updates", timeout=3)
         except AssertionError:
             raise AssertionError(f"Settings is highlighted but the page shown is {Window.stack(ui.dump())!r}")
 
@@ -264,10 +263,14 @@ def check_prompt_lists_client_and_port_updates(display, binary, tmp):
         return [text for text in Window.texts(windows) if "→" in text]
     cases = [
         (("0.748.0.7480000", "0.747.0.7471481", "v2026.11.20", "v2026.11.15"),
-         ["Roblox: 0.747.0.7471481 → 0.748.0.7480000", "Roblox Mac Linux Port: v2026.11.15 → v2026.11.20"]),
-        (("", "", "v2026.11.20", "v2026.11.15"), ["Roblox Mac Linux Port: v2026.11.15 → v2026.11.20"]),
-        (("0.748.0.7480000", "0.747.0.7471481"), ["Roblox: 0.747.0.7471481 → 0.748.0.7480000"]),
+         ["Roblox", "0.747.0.7471481 → 0.748.0.7480000", "Roblox Mac Linux Port", "v2026.11.15 → v2026.11.20"]),
+        (("", "", "v2026.11.20", "v2026.11.15"), ["Roblox Mac Linux Port", "v2026.11.15 → v2026.11.20"]),
+        (("0.748.0.7480000", "0.747.0.7471481"), ["Roblox", "0.747.0.7471481 → 0.748.0.7480000"]),
     ]
+    def rows(windows):
+        # Each update is a card: its name, then "installed → new".
+        texts = Window.texts(windows)
+        return [t for i, t in enumerate(texts) if "→" in t or (i + 1 < len(texts) and "→" in texts[i + 1])]
     for args, expected in cases:
         with display.open(binary, "--dialog", *args) as ui:
             windows = ui.wait(lambda w: Window.button(w, "Update now") is not None)
@@ -293,12 +296,37 @@ def check_failed_update_check_says_why(display, binary, tmp):
         assert str(root / "DO_NOT_SHARE" / "launcher.log") in message, message
 
 
+def check_progress_failure_stays_until_closed(display, binary, tmp):
+    """B10 phase 3 (George: yes): a failure stays on screen with what failed,
+    why, what to do, the log path and Open log, until the user closes it,
+    even after the launcher has closed the pipe."""
+    log = str(Path(tmp) / "launcher.log")
+    with Progress(display, binary, tmp) as progress:
+        progress.ui.wait(lambda w: Window.widgets(w, "progress"))
+        os.write(progress.write, (json.dumps({
+            "phase": "failed", "percent": 0, "message": "Roblox update failed: Could not resolve host: setup.rbxcdn.com",
+            "bytes_done": 0, "bytes_total": 0, "cancellable": False,
+            "hint": "The installed client was kept. Check your internet connection and try again later.", "log": log}) + "\n").encode())
+        windows = progress.ui.wait(lambda w: Window.button(w, "Close") is not None)
+        texts = Window.texts(windows)
+        for part in ("Roblox update failed", "Roblox update failed: Could not resolve host: setup.rbxcdn.com.",
+                     "The installed client was kept. Check your internet connection and try again later.", log):
+            assert part in texts, (part, texts)
+        assert Window.button(windows, "Open log"), texts
+        assert not Window.widgets(windows, "progress"), "the progress bar is still shown under a failure"
+        os.close(progress.write)
+        progress.write = os.open(os.devnull, os.O_WRONLY)
+        assert progress.ui.exited(1.0) is None, "the failure closed without the user"
+        assert progress.ui.send("click Close") == {"ok": True}
+        assert progress.ui.exited(5) == 1
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
           check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why,
           check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates,
-          check_failed_update_check_says_why]
+          check_failed_update_check_says_why, check_progress_failure_stays_until_closed]
 
 
 def main():

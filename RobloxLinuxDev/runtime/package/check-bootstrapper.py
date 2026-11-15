@@ -9,19 +9,20 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-ui_source = (ROOT / "package/bootstrapper-ui.c").read_text()
+# The UI is bootstrapper-ui.c plus the files it includes from ui/.
+ui_source = "\n".join(path.read_text() for path in [ROOT / "package/bootstrapper-ui.c", *sorted((ROOT / "package/ui").glob("*.[ch]"))])
 assert "g_environ_unsetenv" in ui_source and '"LD_LIBRARY_PATH"' in ui_source
 assert '"APPDIR"' in ui_source and 'g_spawn_async(state->root' in ui_source
 assert '"setsid"' in ui_source and 'host_environment()' in ui_source
 assert "bytes_done" in ui_source and "cancellable" in ui_source and "Cancel" in ui_source
 assert "g_subprocess_communicate_utf8_async" in ui_source and "update-settings" in ui_source
 assert "progress_delete" in ui_source and "ROBLOX_MAC_NO_PROGRESS" in ui_source
-assert "Check for port updates" in ui_source and "port-update-settings" in ui_source
-assert ".nav:checked" in ui_source and "@theme_selected_bg_color" in ui_source
-assert "update-header" in ui_source and "Check for updates" in ui_source and "section-title" in ui_source
-assert 'gtk_style_context_add_class(gtk_widget_get_style_context(state->update), "accent")' in ui_source
+assert "Check for _port updates" in ui_source and "port-update-settings" in ui_source
+assert "button.nav:checked" in ui_source and '"Updates", "update", "updates"' in ui_source
+assert "_Check for updates" in ui_source and '"When updates are found", "section"' in ui_source
+assert 'state->update = button("_Update now", "download", "primary")' in ui_source
 assert "window_decoration" in ui_source and "cursor_appearance" in ui_source
-assert "Restore appearance defaults" in ui_source
+assert "_Restore defaults" in ui_source
 # The progress reader must drain the pipe before it honours a hang-up: the
 # producer's final event and its close can arrive in the same poll().
 progress_input = ui_source.split("static gboolean progress_input", 1)[1].split("static int run_progress", 1)[0]
@@ -526,7 +527,7 @@ exit 2
             os.mkfifo(fifo)
             writer = os.open(fifo, os.O_RDWR)
             reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
-            ui = subprocess.Popen([ui_binary, "--progress", state], stdin=reader,
+            ui = subprocess.Popen([ui_binary, "--progress", state], stdin=reader, env=display_env,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             os.close(reader)
             for chunk in chunks:
@@ -539,8 +540,20 @@ exit 2
         return (json.dumps({"phase": phase, "percent": 100, "message": phase, "bytes_done": 0, "bytes_total": 0,
                             "cancellable": False}, separators=(",", ":")) + "\n").encode()
 
+    # The windows open on a private headless display, never on the tester's.
+    import sys
+    sys.path.insert(0, str(ROOT / "package"))
+    from ui_harness import Display, Unavailable
+    display = None
+    try:
+        display = Display().__enter__() if built else None
+    except Unavailable:
+        display = None
+    display_env = display.env() if display else {}
     if not built:
         print("SKIP progress window exit status: GTK 3 / json-glib development files are not available")
+    elif not display:
+        print("SKIP progress window exit status: no headless GTK display (broadwayd)")
     elif progress_exit([]) == 3:
         print("SKIP progress window exit status: no display for GTK")
     else:
@@ -548,7 +561,8 @@ exit 2
         assert progress_exit([launching]) == 0
         assert progress_exit([progress_line("checking"), launching]) == 0
         assert progress_exit([progress_line("cancelled")]) == 4
-        assert progress_exit([progress_line("failed")]) == 1
+        # A "failed" event now stays on screen until the user closes it:
+        # check-bootstrapper-windows.py, check_progress_failure_stays_until_closed.
         assert progress_exit([progress_line("checking")]) == 1
         assert progress_exit([]) == 1
         # An event split across two writes is one event, not the end of the stream.
@@ -565,10 +579,12 @@ exit 2
             (record_bin / name).write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{notified}'\nexit 0\n")
             (record_bin / name).chmod(0o755)
         for _ in range(3):
-            launch = subprocess.run([bootstrap], env={**env, "PATH": str(record_bin) + ":" + env["PATH"],
-                                                      "DBUS_SESSION_BUS_ADDRESS": "unix:fake", "ROBLOX_MAC_UI_APP": str(real_ui)},
+            launch = subprocess.run([bootstrap], env=display.env({**env, "PATH": str(record_bin) + ":" + env["PATH"],
+                                                      "DBUS_SESSION_BUS_ADDRESS": "unix:fake", "ROBLOX_MAC_UI_APP": str(real_ui)}),
                                     capture_output=True, text=True)
             assert launch.returncode == 0, launch.stderr
             assert not notified.exists(), notified.read_text()
             assert "progress window" not in launch.stderr, launch.stderr
+    if display:
+        display.__exit__(None, None, None)
 print("PASS bootstrap settings/defaults/fake-clock scheduling, first-run marker, decision flow, rollback and one-lock launch")

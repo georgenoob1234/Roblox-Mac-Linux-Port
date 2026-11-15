@@ -50,10 +50,10 @@ static char *when_text(gint64 timestamp) {
 /* The interval choices; any other stored value is shown as its own entry. */
 static void interval_select(LauncherState *state, gint64 hours) {
     char id[32]; g_snprintf(id, sizeof id, "%lld", (long long)hours);
-    if (!gtk_combo_box_set_active_id(GTK_COMBO_BOX(state->interval), id)) {
+    if (!dropdown_set_active(state->interval, id)) {
         char *text = g_strdup_printf("Every %lld hours", (long long)hours);
-        gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(state->interval), id, text); g_free(text);
-        gtk_combo_box_set_active_id(GTK_COMBO_BOX(state->interval), id);
+        dropdown_add(state->interval, id, text); g_free(text);
+        dropdown_set_active(state->interval, id);
     }
 }
 static void settings_refresh(LauncherState *state) {
@@ -70,7 +70,7 @@ static void settings_refresh(LauncherState *state) {
     const char *latest_raw = json_string(object, "latest_known"), *latest_display = json_string(object, "latest_display_version"), *installed_raw = json_string(object, "installed_version");
     state->update_available = json_object_has_member(object, "update_available") ? json_bool(object, "update_available") : (*latest_raw && g_strcmp0(latest_raw, installed_raw));
     state->running = json_bool(object, "game_running");
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(state->mode), *mode ? mode : "ask");
+    dropdown_set_active(state->mode, *mode ? mode : "ask");
     interval_select(state, settings ? json_int(settings, "check_interval_hours") : 24);
     const char *newest = *latest_display ? latest_display : (*latest_raw ? latest_raw : "");
     char *checked = when_text(settings ? json_int(settings, "last_check") : 0);
@@ -91,7 +91,7 @@ static void settings_refresh(LauncherState *state) {
     gtk_widget_set_sensitive(state->forget_skipped, *skipped || *skipped_port);
     /* Appearance. */
     const char *dec = settings ? json_string(settings, "window_decoration") : "auto"; const char *cur = settings ? json_string(settings, "cursor_appearance") : "system";
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(state->decorations_combo), *dec ? dec : "auto");
+    dropdown_set_active(state->decorations_combo, *dec ? dec : "auto");
     gtk_switch_set_active(GTK_SWITCH(state->cursor_switch), g_strcmp0(cur, "legacy") != 0);
     /* Client buttons and message. */
     gtk_widget_set_sensitive(state->update, !state->check_in_progress && !state->running && state->update_available);
@@ -133,10 +133,10 @@ static void settings_refresh(LauncherState *state) {
     state->refreshing = FALSE;
 }
 static void setting_set(LauncherState *state, const char *key, const char *value) { if (!run_release(state->root, "set", key, value, NULL)) settings_message(state, "Could not save this setting."); }
-static void mode_changed(GtkComboBox *combo, gpointer data) { LauncherState *state = data; const char *id = gtk_combo_box_get_active_id(combo); if (id && !state->refreshing) setting_set(state, "auto_update", id); }
-static void interval_changed(GtkComboBox *combo, gpointer data) { LauncherState *state = data; const char *id = gtk_combo_box_get_active_id(combo); if (id && !state->refreshing) setting_set(state, "check_interval_hours", id); }
+static void mode_changed(GtkWidget *dropdown, gpointer data) { LauncherState *state = data; const char *id = dropdown_get_active(dropdown); if (id && !state->refreshing) setting_set(state, "auto_update", id); }
+static void interval_changed(GtkWidget *dropdown, gpointer data) { LauncherState *state = data; const char *id = dropdown_get_active(dropdown); if (id && !state->refreshing) setting_set(state, "check_interval_hours", id); }
 static void appearance_message(LauncherState *state, const char *text) { message_set(gtk_widget_get_parent(state->appearance_message), state->appearance_message, text); }
-static void decorations_changed(GtkComboBox *combo, gpointer data) { LauncherState *state = data; const char *id = gtk_combo_box_get_active_id(combo); if (id && !state->refreshing) { setting_set(state, "window_decoration", id); appearance_message(state, "Window decorations changed. Applies on the next launch."); } }
+static void decorations_changed(GtkWidget *dropdown, gpointer data) { LauncherState *state = data; const char *id = dropdown_get_active(dropdown); if (id && !state->refreshing) { setting_set(state, "window_decoration", id); appearance_message(state, "Window decorations changed. Applies on the next launch."); } }
 static void cursor_changed(GObject *widget, GParamSpec *spec, gpointer data) { LauncherState *state = data; if (state->refreshing) return; setting_set(state, "cursor_appearance", gtk_switch_get_active(GTK_SWITCH(widget)) ? "system" : "legacy"); appearance_message(state, "Cursor changed. Applies on the next launch."); }
 static void appearance_reset(GtkButton *button, gpointer data) {
     LauncherState *state = data;
@@ -385,11 +385,6 @@ static void add_page(LauncherState *state, GtkWidget *page, const char *name) {
     gtk_container_add(GTK_CONTAINER(scroll), page);
     gtk_stack_add_named(GTK_STACK(state->stack), scroll, name);
 }
-static GtkWidget *combo(const char *const *items) {
-    GtkWidget *widget = gtk_combo_box_text_new();
-    for (const char *const *item = items; *item; item += 2) gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(widget), item[0], item[1]);
-    return widget;
-}
 static gchar *newest_log_text(const char *root) {
     gchar *dir = g_build_filename(root, "DO_NOT_SHARE", "diagnostics", NULL); gchar *newest = NULL; time_t latest = 0;
     find_newest_log(dir, &newest, &latest); g_free(dir);
@@ -475,11 +470,11 @@ static int run_launcher(const char *root, gboolean settings_page) {
     gtk_box_pack_start(GTK_BOX(updates), label("When updates are found", "section"), FALSE, FALSE, 0);
     static const char *const modes[] = {"ask", "Ask first", "auto", "Automatically", "off", "Never", NULL};
     GtkWidget *mode_card = card("update", "Updates", "Ask before updating, update by itself, or never offer updates.", NULL);
-    state->mode = combo(modes); g_signal_connect(state->mode, "changed", G_CALLBACK(mode_changed), state); card_add(mode_card, state->mode);
+    state->mode = dropdown_new(modes, mode_changed, state); card_add(mode_card, state->mode);
     gtk_box_pack_start(GTK_BOX(updates), mode_card, FALSE, FALSE, 0);
     static const char *const intervals[] = {"0", "Every launch", "6", "Every 6 hours", "24", "Once a day", "168", "Once a week", NULL};
     GtkWidget *interval_card = card("clock", "Look for updates", "A check never delays the game: a slow answer is offered at the next start.", NULL);
-    state->interval = combo(intervals); g_signal_connect(state->interval, "changed", G_CALLBACK(interval_changed), state); card_add(interval_card, state->interval);
+    state->interval = dropdown_new(intervals, interval_changed, state); card_add(interval_card, state->interval);
     gtk_box_pack_start(GTK_BOX(updates), interval_card, FALSE, FALSE, 0);
     GtkWidget *skipped_card = card("close", "Skipped versions", "None", &state->skipped_sub);
     state->forget_skipped = button("_Forget skipped", NULL, NULL); g_signal_connect(state->forget_skipped, "clicked", G_CALLBACK(forget_skipped), state); card_add(skipped_card, state->forget_skipped);
@@ -490,7 +485,7 @@ static int run_launcher(const char *root, gboolean settings_page) {
     GtkWidget *appearance = page_box("Appearance", "How the game window looks on your desktop. Applies on the next launch.");
     static const char *const decorations[] = {"auto", "Automatic", "system", "Desktop title bar", "gtk", "GTK title bar", "legacy", "Legacy compatibility", NULL};
     GtkWidget *decorations_card = card("window", "Window decorations", "Automatic uses your desktop's title bar when it offers one, else GTK's.", NULL);
-    state->decorations_combo = combo(decorations); g_signal_connect(state->decorations_combo, "changed", G_CALLBACK(decorations_changed), state); card_add(decorations_card, state->decorations_combo);
+    state->decorations_combo = dropdown_new(decorations, decorations_changed, state); card_add(decorations_card, state->decorations_combo);
     gtk_box_pack_start(GTK_BOX(appearance), decorations_card, FALSE, FALSE, 0);
     GtkWidget *cursor_card = card("cursor", "Desktop cursor", "Use your system cursor theme and size; the game's own cursors still show. Off: Roblox's classic cursor.", NULL);
     state->cursor_switch = gtk_switch_new(); g_signal_connect(state->cursor_switch, "notify::active", G_CALLBACK(cursor_changed), state); card_add(cursor_card, state->cursor_switch);

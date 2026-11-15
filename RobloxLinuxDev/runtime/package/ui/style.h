@@ -74,7 +74,11 @@ static const char *UI_CSS =
     ".statusbar .ok { color: #3fb27f; }"
     ".statusbar .new { color: #ff8f91; }"
     /* Inputs */
-    "window.rbx combobox button.combo { min-width: 150px; }"
+    "window.rbx button.dropdown { min-width: 150px; padding: 6px 10px 6px 12px; }"
+    ".dropdown-menu, menu.dropdown-menu { background-color: #151820; border: 1px solid #2e3441; border-radius: 10px; padding: 4px; }"
+    ".dropdown-menu menuitem { padding: 7px 12px; border-radius: 6px; color: #eceef2; }"
+    ".dropdown-menu menuitem:hover { background-color: #222733; }"
+    "window.csd.popup decoration { border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.45); }"
     "window.rbx switch { background-image: none; background-color: #2a2f3a; border: none; border-radius: 99px; min-width: 40px; }"
     "window.rbx switch:checked { background-color: #e23b3e; }"
     "window.rbx switch slider { background-image: none; background-color: #c8ccd4; border: none; border-radius: 99px;"

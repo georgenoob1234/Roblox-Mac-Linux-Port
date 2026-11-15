@@ -399,6 +399,25 @@ def check_windows_ask_for_no_more_than_their_size(display, binary, tmp):
             assert window["wanted_width"] <= window["width"], (args[0], window["width"], window["wanted_width"])
 
 
+def check_dropdowns_open_below_and_pick(display, binary, tmp):
+    """George, 2026-11-15: the dropdown menus opened over the button with
+    GTK's scroll arrows and a clipped first item. A dropdown is now a button
+    whose menu opens below it; picking an item shows it and saves it."""
+    root = fake_root(tmp)
+    with display.open(binary, "--settings", root) as ui:
+        windows = ui.wait(lambda w: Window.button(w, "Ask first") is not None)
+        assert Window.button(windows, "Once a day"), Window.texts(windows)
+        assert not Window.widgets(windows, "combo"), "a GtkComboBox (menu over the button, scroll arrows) is still used"
+        assert ui.send("click Ask first") == {"ok": True}
+        assert ui.send("click Automatically") == {"ok": True}
+        ui.wait(lambda w: Window.button(w, "Automatically") is not None)
+        assert ui.send("click Once a day") == {"ok": True}
+        assert ui.send("click Once a week") == {"ok": True}
+        ui.wait(lambda w: Window.button(w, "Once a week") is not None)
+        changes = (root / "set.log").read_text().splitlines()
+        assert changes == ["auto_update=auto", "check_interval_hours=168"], changes
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
@@ -406,7 +425,7 @@ CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harn
           check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates,
           check_failed_update_check_says_why, check_progress_failure_stays_until_closed,
           check_pending_cancel_stays_visible, check_launch_window_keeps_its_size,
-          check_windows_ask_for_no_more_than_their_size]
+          check_windows_ask_for_no_more_than_their_size, check_dropdowns_open_below_and_pick]
 
 
 def main():

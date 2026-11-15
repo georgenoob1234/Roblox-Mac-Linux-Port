@@ -269,6 +269,69 @@ static void pill_set(GtkWidget *widget, const char *text, gboolean is_new) {
     gtk_style_context_add_class(context, is_new ? "new" : "ok");
 }
 
+/* ---- Dropdown: a button whose menu opens below it. GtkComboBox opens its
+ * menu over the button, aligned on the current item; on Wayland that menu
+ * was clipped and got scroll arrows (George, 2026-11-15). ---- */
+typedef void (*DropdownChanged)(GtkWidget *dropdown, gpointer data);
+static void dropdown_show_text(GtkWidget *dropdown, const char *text) {
+    gtk_label_set_text(GTK_LABEL(g_object_get_data(G_OBJECT(dropdown), "dropdown-text")), text ? text : "");
+}
+static void dropdown_item_activate(GtkMenuItem *item, gpointer data) {
+    GtkWidget *dropdown = data;
+    const char *id = g_object_get_data(G_OBJECT(item), "dropdown-id");
+    gboolean same = !g_strcmp0(id, g_object_get_data(G_OBJECT(dropdown), "dropdown-active"));
+    g_object_set_data_full(G_OBJECT(dropdown), "dropdown-active", g_strdup(id), g_free);
+    dropdown_show_text(dropdown, gtk_menu_item_get_label(item));
+    DropdownChanged changed = (DropdownChanged)g_object_get_data(G_OBJECT(dropdown), "dropdown-changed");
+    if (!same && changed) changed(dropdown, g_object_get_data(G_OBJECT(dropdown), "dropdown-data"));
+}
+static void dropdown_add(GtkWidget *dropdown, const char *id, const char *text) {
+    GtkWidget *item = gtk_menu_item_new_with_label(text);
+    g_object_set_data_full(G_OBJECT(item), "dropdown-id", g_strdup(id), g_free);
+    g_signal_connect(item, "activate", G_CALLBACK(dropdown_item_activate), dropdown);
+    gtk_widget_show(item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(g_object_get_data(G_OBJECT(dropdown), "dropdown-menu")), item);
+}
+/* The menu is as wide as its button. */
+static void dropdown_menu_width(GtkWidget *menu, gpointer data) {
+    gtk_widget_set_size_request(menu, gtk_widget_get_allocated_width(GTK_WIDGET(data)), -1);
+}
+/* items: id, text, id, text, ..., NULL. */
+static GtkWidget *dropdown_new(const char *const *items, DropdownChanged changed, gpointer data) {
+    GtkWidget *dropdown = gtk_menu_button_new(); add_class(dropdown, "dropdown");
+    GtkWidget *content = hbox(10);
+    GtkWidget *text = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(text), 0); gtk_widget_set_hexpand(text, TRUE);
+    gtk_box_pack_start(GTK_BOX(content), text, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(content), icon("chevron", 14), FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(dropdown), content);
+    GtkWidget *menu = gtk_menu_new(); add_class(menu, "dropdown-menu");
+    gtk_menu_button_set_popup(GTK_MENU_BUTTON(dropdown), menu);
+    gtk_menu_button_set_direction(GTK_MENU_BUTTON(dropdown), GTK_ARROW_DOWN);
+    g_signal_connect(menu, "show", G_CALLBACK(dropdown_menu_width), dropdown);
+    g_object_set_data(G_OBJECT(dropdown), "dropdown-text", text);
+    g_object_set_data(G_OBJECT(dropdown), "dropdown-menu", menu);
+    g_object_set_data(G_OBJECT(dropdown), "dropdown-changed", (gpointer)changed);
+    g_object_set_data(G_OBJECT(dropdown), "dropdown-data", data);
+    for (const char *const *item = items; *item; item += 2) dropdown_add(dropdown, item[0], item[1]);
+    gtk_widget_set_valign(dropdown, GTK_ALIGN_CENTER);
+    return dropdown;
+}
+/* Show the item with this id as chosen, without calling the changed
+ * handler. FALSE when there is no such item. */
+static gboolean dropdown_set_active(GtkWidget *dropdown, const char *id) {
+    GList *items = gtk_container_get_children(GTK_CONTAINER(g_object_get_data(G_OBJECT(dropdown), "dropdown-menu")));
+    gboolean found = FALSE;
+    for (GList *item = items; item && !found; item = item->next) {
+        if (g_strcmp0(g_object_get_data(item->data, "dropdown-id"), id)) continue;
+        g_object_set_data_full(G_OBJECT(dropdown), "dropdown-active", g_strdup(id), g_free);
+        dropdown_show_text(dropdown, gtk_menu_item_get_label(item->data));
+        found = TRUE;
+    }
+    g_list_free(items);
+    return found;
+}
+static const char *dropdown_get_active(GtkWidget *dropdown) { return g_object_get_data(G_OBJECT(dropdown), "dropdown-active"); }
+
 /* ---- Window chrome: our own title bar, so every window looks the same and
  * is dragged by it (George: "make sure the bootstrapper is draggable") ---- */
 static void chrome_minimize(GtkButton *button, gpointer window) { gtk_window_iconify(window); }

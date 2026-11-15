@@ -124,6 +124,12 @@ typedef struct { const char *text; GtkWidget *found; } UiTestFind;
 static void ui_test_find_button(GtkWidget *widget, gpointer data) {
     UiTestFind *find = data;
     if (find->found || !gtk_widget_get_mapped(widget)) return;
+    if (GTK_IS_MENU_ITEM(widget)) {
+        char *text = ui_test_plain(gtk_menu_item_get_label(GTK_MENU_ITEM(widget)));
+        gboolean match = !g_strcmp0(text, find->text); g_free(text);
+        if (match) find->found = widget;
+        return;
+    }
     if (GTK_IS_BUTTON(widget)) {
         char *text = ui_test_button_name(widget);
         gboolean match = !g_strcmp0(text, find->text); g_free(text);
@@ -136,11 +142,22 @@ static void ui_test_command(const char *line) {
     GList *windows = ui_test_windows();
     if (g_str_has_prefix(line, "click ")) {
         UiTestFind find = {line + 6, NULL};
+        /* Open menus are popup windows: search them first. */
+        GList *all = gtk_window_list_toplevels();
+        for (GList *item = all; item && !find.found; item = item->next)
+            if (gtk_window_get_window_type(item->data) == GTK_WINDOW_POPUP && gtk_widget_get_mapped(item->data))
+                gtk_container_forall(GTK_CONTAINER(item->data), ui_test_find_button, &find);
+        g_list_free(all);
         for (GList *item = windows; item && !find.found; item = item->next)
             gtk_container_forall(GTK_CONTAINER(item->data), ui_test_find_button, &find);
         if (!find.found) ui_test_simple(FALSE, "no such button");
         else if (!gtk_widget_is_sensitive(find.found)) ui_test_simple(FALSE, "insensitive");
-        else { ui_test_simple(TRUE, NULL); gtk_button_clicked(GTK_BUTTON(find.found)); }
+        else if (GTK_IS_MENU_ITEM(find.found)) {
+            ui_test_simple(TRUE, NULL);
+            GtkWidget *shell = gtk_widget_get_parent(find.found);
+            gtk_menu_item_activate(GTK_MENU_ITEM(find.found));
+            if (GTK_IS_MENU_SHELL(shell)) gtk_menu_shell_deactivate(GTK_MENU_SHELL(shell));
+        } else { ui_test_simple(TRUE, NULL); gtk_button_clicked(GTK_BUTTON(find.found)); }
     } else if (!g_strcmp0(line, "close") || g_str_has_prefix(line, "close ")) {
         const char *title = line[5] ? line + 6 : NULL;
         GtkWidget *target = NULL;

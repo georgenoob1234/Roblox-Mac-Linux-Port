@@ -92,11 +92,12 @@ fi
 
 # --- Release script consistency -------------------------------------------------------------
 echo '== Release script consistency =='
-for script in bootstrap.sh update-roblox.sh run.sh; do
+# README.md is the copy build-release.sh ships; the one in RobloxLinuxRelease is what the repository shows.
+for script in bootstrap.sh update-roblox.sh run.sh README.md; do
     src="RobloxLinuxDev/runtime/package/$script"
     rel="RobloxLinuxRelease/$script"
     if ! cmp -s "$src" "$rel"; then
-        echo "FAIL: release script out of sync: $rel differs from $src" >&2
+        echo "FAIL: release file out of sync: $rel differs from $src" >&2
         fail=1
     fi
 done

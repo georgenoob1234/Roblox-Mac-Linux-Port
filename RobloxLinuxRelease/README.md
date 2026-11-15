@@ -75,7 +75,10 @@ sh run.sh reset-appearance             # restores appearance defaults
 `DO_NOT_SHARE/bootstrapper.json` stores the update mode (`ask` by default),
 check interval (24 hours by default), appearance settings (`window_decoration: "auto"`,
 `cursor_appearance: "system"`), skipped version, last check and last
-known latest.
+known latest. Network checks have a short timeout and never prevent a launch;
+`0` checks every launch. Exit codes are `0` for success or a dropped second
+launch, `1` for setup/update/check failure, `2` for invalid input, and `125`
+for cancellation.
 
 ### Appearance and Desktop Integration
 - **Window Decorations (`window_decoration` / `ROBLOX_MAC_DECORATIONS`)**:
@@ -87,10 +90,8 @@ known latest.
   - `system` (default): Uses the desktop cursor theme and size (e.g. Breeze or Adwaita from `~/.config/gtk-3.0/settings.ini` or `XCURSOR_THEME`/`XCURSOR_SIZE`). Maps standard cursor shapes (pointer, text I-beam, crosshair, hand) to native desktop cursors while preserving Shift Lock and input capture.
   - `legacy`: Uses the bundled Roblox PNG textures for standard cursors.
 - **Environment Overrides**: `ROBLOX_MAC_DECORATIONS` and `ROBLOX_MAC_CURSOR_APPEARANCE` can be set in the shell to override saved preferences without modifying `bootstrapper.json`.
-- **Reset**: Run `sh run.sh reset-appearance` or click "Restore appearance defaults" in the Settings UI. Network checks have a short timeout and never prevent a launch;
-`0` checks every launch. Exit codes are `0` for success or a dropped second
-launch, `1` for setup/update/check failure, `2` for invalid input, and `125`
-for cancellation.
+- **Reset**: Run `sh run.sh reset-appearance` or click "Restore appearance defaults" in the Settings UI.
+
 Use the scripts on systems with AppImageLauncher. They prevent it from moving
 the AppImage away from its client and keep temporary files in this release folder.
 Older releases could fail before Roblox started with `//DO_NOT_SHARE` permission

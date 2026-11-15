@@ -5,6 +5,11 @@ static const char *UI_CSS =
     "* { text-shadow: none; -gtk-icon-shadow: none; }"
     "window.rbx, window.rbx.background { background-color: #0e1015; color: #eceef2; }"
     "window.rbx decoration { border-radius: 12px; box-shadow: 0 16px 44px rgba(0,0,0,0.45), 0 0 0 1px #2e3441; }"
+    /* The window body is drawn square unless the window itself is rounded:
+     * round its bottom corners to match the title bar's top ones. */
+    "window.rbx.csd { border-radius: 0 0 12px 12px; }"
+    "window.rbx.csd.maximized, window.rbx.csd.tiled { border-radius: 0; }"
+    "window.rbx.csd.maximized decoration, window.rbx.csd.tiled decoration { border-radius: 0; }"
     "window.rbx label { color: inherit; }"
     "window.rbx label:selected { background-color: #e23b3e; }"
     /* Title bar */

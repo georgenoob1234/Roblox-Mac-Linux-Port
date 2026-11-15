@@ -321,12 +321,34 @@ def check_progress_failure_stays_until_closed(display, binary, tmp):
         assert progress.ui.exited(5) == 1
 
 
+def check_pending_cancel_stays_visible(display, binary, tmp):
+    """George, 2026-11-15: after Cancel, the "Cancelling" note vanished when the
+    phase changed, and the X then did nothing visible. A pending cancel must
+    stay on screen until the launcher ends the run, and X must answer."""
+    with Progress(display, binary, tmp) as progress:
+        progress.ui.wait(lambda w: Window.widgets(w, "progress"))
+        progress.send("downloading", 40, "Downloading Roblox", 400, 1000, cancellable=True)
+        progress.ui.wait(lambda w: (Window.button(w, "Cancel") or {}).get("sensitive"))
+        assert progress.ui.send("click Cancel") == {"ok": True}
+        progress.send("verifying", 80, "Verifying the downloaded client", cancellable=True)
+        windows = progress.ui.wait(lambda w: "Verifying the downloaded client" in Window.texts(w))
+        def notes(windows):  # the note line, not the button's own "Cancelling…"
+            return [w["text"] for w in Window.widgets(windows, "label") if w["text"].startswith("Cancelling")]
+        assert notes(windows), f"the pending cancel is no longer shown: {Window.texts(windows)}"
+        assert progress.ui.send("close") == {"ok": True}
+        windows = progress.ui.dump()
+        assert any("closes" in t for t in notes(windows)), f"closing during a pending cancel showed nothing: {Window.texts(windows)}"
+        progress.send("cancelled", 0, "Update cancelled")
+        assert progress.ui.exited(5) == 4
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
           check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why,
           check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates,
-          check_failed_update_check_says_why, check_progress_failure_stays_until_closed]
+          check_failed_update_check_says_why, check_progress_failure_stays_until_closed,
+          check_pending_cancel_stays_visible]
 
 
 def main():

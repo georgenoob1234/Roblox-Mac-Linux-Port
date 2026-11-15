@@ -154,9 +154,11 @@ static void progress_cancel(GtkButton *button, gpointer data) {
 static gboolean progress_delete(GtkWidget *window, GdkEvent *event, gpointer data) {
     ProgressState *state = data;
     if (state->failed) { progress_close(state, 1); return TRUE; }
-    if (state->cancellable && !state->cancelled)
+    if (state->cancelled)
+        progress_notice(state, "Cancelling… The window closes as soon as the current step has stopped.");
+    else if (state->cancellable)
         progress_request_cancel(state, state->cancel);
-    else if (!state->cancelled)
+    else
         progress_notice(state, "This step can't be cancelled safely. The window closes by itself when it is done.");
     return TRUE;
 }
@@ -272,7 +274,9 @@ static void progress_apply(ProgressState *state) {
     if (title) label_text(state->phase, title);
     else if (*phase) { char *text = g_strdup(phase); text[0] = g_ascii_toupper(text[0]); for (char *c = text; *c; ++c) if (*c == '-') *c = ' '; label_text(state->phase, text); g_free(text); }
     if (*message) label_text(state->status, message);
-    if (state->notice && gtk_widget_get_visible(state->notice) && g_strcmp0(state->notice_phase, phase)) progress_notice(state, NULL);
+    /* A note answers the user's last action and goes when the phase moves on,
+     * except a pending cancel: that stays until the launcher ends the run. */
+    if (state->notice && gtk_widget_get_visible(state->notice) && !state->cancelled && g_strcmp0(state->notice_phase, phase)) progress_notice(state, NULL);
     if (!state->cancelled) gtk_widget_set_sensitive(state->cancel, state->cancellable);
     if (percent >= 0) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->progress), percent / 100.0);
     else gtk_progress_bar_pulse(GTK_PROGRESS_BAR(state->progress));

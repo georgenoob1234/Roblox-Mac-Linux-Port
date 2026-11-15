@@ -128,12 +128,18 @@ PY
 }
 
 say() { echo "roblox: $*" >&2; }
+# event PHASE PERCENT MESSAGE [DONE] [TOTAL] [CANCELLABLE] [HIDDEN]
+# HIDDEN=true asks the progress window to stay off screen until the next event
+# (sent while the update prompt is open, so the prompt is never covered).
 event() {
-    payload=$(python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" <<'PY'
+    payload=$(python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" "${7:-false}" <<'PY'
 import json, sys
-print(json.dumps({"phase": sys.argv[1], "percent": int(sys.argv[2]), "message": sys.argv[3],
-                  "bytes_done": int(sys.argv[4]), "bytes_total": int(sys.argv[5]),
-                  "cancellable": sys.argv[6].lower() == "true"}, separators=(",", ":")))
+payload = {"phase": sys.argv[1], "percent": int(sys.argv[2]), "message": sys.argv[3],
+           "bytes_done": int(sys.argv[4]), "bytes_total": int(sys.argv[5]),
+           "cancellable": sys.argv[6].lower() == "true"}
+if sys.argv[7].lower() == "true":
+    payload["hidden"] = True
+print(json.dumps(payload, separators=(",", ":")))
 PY
     )
     if [ "$EVENTS" = 1 ]; then
@@ -394,6 +400,7 @@ ask_update() {
     latest=$1
     installed=$2
     if [ -n "$UI_APP" ]; then
+        event prompt 25 'Waiting for an answer to the update prompt' 0 0 false true
         choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" 9>&- >/dev/null 2>&1; printf '%s' "$?" )
         case "$choice" in
             0) return 0;;

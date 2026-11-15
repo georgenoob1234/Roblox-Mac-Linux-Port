@@ -212,6 +212,10 @@ typedef struct {
     char *last_phase, *last_message, *notice_phase;
     gint64 last_percent, last_done, last_total;
     gboolean seen_event;
+    /* Set by an event with "hidden": true, which the launcher sends before it
+     * opens the update prompt; the next event without it shows the window
+     * again (B10 defect 4: the progress window covered the prompt). */
+    gboolean hidden;
     guint show_id, close_id, cancel_poll_id;
     gboolean done, cancellable, cancelled, closed, authoritative;
     int result;
@@ -487,7 +491,7 @@ static void setup_ui_identity(GtkWidget *win, const char *root) {
 
 static void progress_apply(ProgressState *state);
 static gboolean progress_show(gpointer data) {
-    ProgressState *state = data; state->show_id = 0; if (state->done) return G_SOURCE_REMOVE;
+    ProgressState *state = data; state->show_id = 0; if (state->done || state->hidden) return G_SOURCE_REMOVE;
     state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state->window), "Roblox");
     setup_ui_identity(state->window, state->root);
     gtk_window_set_default_size(GTK_WINDOW(state->window), 460, 170); gtk_window_set_resizable(GTK_WINDOW(state->window), FALSE); gtk_window_set_position(GTK_WINDOW(state->window), GTK_WIN_POS_CENTER);
@@ -527,6 +531,17 @@ static void progress_event(ProgressState *state, const char *line) {
     if (*message) { g_free(state->last_message); state->last_message = g_strdup(message); }
     state->last_percent = json_int(object, "percent"); state->last_done = json_int(object, "bytes_done"); state->last_total = json_int(object, "bytes_total");
     state->seen_event = TRUE;
+    gboolean hidden = json_bool(object, "hidden");
+    if (hidden && !state->hidden) {
+        state->hidden = TRUE;
+        if (state->window) gtk_widget_hide(state->window);
+    } else if (!hidden && state->hidden) {
+        state->hidden = FALSE;
+        if (state->window) gtk_widget_show(state->window);
+        /* The show delay may have passed while hidden: show at once, since
+         * the user has just answered the prompt and expects the next step. */
+        else if (!state->show_id && !state->done) state->show_id = g_idle_add(progress_show, state);
+    }
     if (state->window) progress_apply(state);
     if (!g_strcmp0(phase, "launching") || !g_strcmp0(phase, "update") ||
         !g_strcmp0(phase, "cancelled") || !g_strcmp0(phase, "failed")) {
@@ -535,8 +550,8 @@ static void progress_event(ProgressState *state, const char *line) {
          * request must not turn a reported success into a local "cancelled". */
         state->authoritative = TRUE;
         state->result = !g_strcmp0(phase, "failed") ? 1 : (!g_strcmp0(phase, "cancelled") ? 4 : 0);
-        if (state->window && !state->close_id) state->close_id = g_timeout_add(350, progress_hide, state);
-        else if (!state->window) progress_close(state, state->result);
+        if (state->window && gtk_widget_get_visible(state->window)) { if (!state->close_id) state->close_id = g_timeout_add(350, progress_hide, state); }
+        else progress_close(state, state->result);
     }
     json_object_unref(object);
 }

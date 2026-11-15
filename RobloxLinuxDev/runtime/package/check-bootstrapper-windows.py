@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -67,9 +68,12 @@ def fake_root(tmp, status=STATUS, port_version="1.2.3"):
     return root
 
 
-def event(phase, percent=0, message="", done=0, total=0, cancellable=False):
-    return (json.dumps({"phase": phase, "percent": percent, "message": message, "bytes_done": done,
-                        "bytes_total": total, "cancellable": cancellable}) + "\n").encode()
+def event(phase, percent=0, message="", done=0, total=0, cancellable=False, hidden=False):
+    payload = {"phase": phase, "percent": percent, "message": message, "bytes_done": done,
+               "bytes_total": total, "cancellable": cancellable}
+    if hidden:
+        payload["hidden"] = True
+    return (json.dumps(payload) + "\n").encode()
 
 
 def check_harness_reads_launcher(display, binary, tmp):
@@ -197,9 +201,28 @@ def check_progress_refused_close_says_why(display, binary, tmp):
         assert not (progress.root / ".bootstrap-cancel").exists()
 
 
+def check_progress_stays_hidden_while_prompt_is_open(display, binary, tmp):
+    """B10 defect 4: the progress window appeared after the update prompt and
+    covered it. A "hidden" event (sent before the prompt opens) must keep it
+    off screen, even when it arrives before the window's first appearance."""
+    with Progress(display, binary, tmp) as progress:
+        progress.send("checking", 25, "Checking for updates")
+        progress.send("prompt", 25, "Waiting for an answer to the update prompt", hidden=True)
+        time.sleep(1.0)  # well past the 450 ms show delay
+        windows = progress.ui.dump()
+        assert windows == [], f"the progress window is visible while the prompt is open: {windows}"
+        progress.send("downloading", 30, "Downloading Roblox", cancellable=True)
+        progress.ui.wait(lambda w: "Downloading Roblox" in Window.texts(w))
+        progress.send("prompt", 30, "Waiting", hidden=True)
+        progress.ui.wait(lambda w: w == [])
+        progress.send("launching", 100, "Launching Roblox")
+        assert progress.ui.exited(5) == 0
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
-          check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why]
+          check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
+          check_progress_stays_hidden_while_prompt_is_open]
 
 
 def main():

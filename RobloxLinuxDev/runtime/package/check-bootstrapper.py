@@ -184,6 +184,26 @@ exit 3
     assert json.loads((private / "bootstrapper.json").read_text())["skipped_version"] == "version-abcd"
     assert "version-abcd" not in skipped.stdout
 
+    # B10 defect 4: the progress window must not cover the update prompt.
+    # Before the prompt opens, the progress window is told to hide.
+    prompt_log = tmp / "prompt-order.log"
+    prompt_ui = Path(tmp) / "prompt-ui"
+    prompt_ui.write_text("""#!/bin/sh
+case "${2:-}" in
+  --progress) while IFS= read -r line; do printf 'progress %s\\n' "$line" >> "$PROMPT_LOG"; done; exit 0;;
+  --dialog) sleep 0.3; echo dialog >> "$PROMPT_LOG"; exit 1;;
+esac
+exit 3
+""")
+    prompt_ui.chmod(0o755)
+    (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "ask", "check_interval_hours": 0}))
+    subprocess.run([bootstrap], env={**env, "ROBLOX_MAC_UI_APP": str(prompt_ui), "PROMPT_LOG": str(prompt_log)},
+                   capture_output=True, text=True, check=True)
+    order = prompt_log.read_text().splitlines()
+    assert "dialog" in order, order
+    before = [json.loads(line.split(" ", 1)[1]) for line in order[:order.index("dialog")] if line.startswith("progress ")]
+    assert before and before[-1].get("hidden") is True, f"the progress window was not hidden before the prompt: {order}"
+
     subprocess.run([bootstrap, "set", "auto_update", "auto"], env=env, check=True)
     (private / "bootstrapper.json").write_text(json.dumps({"auto_update": "auto", "check_interval_hours": 0}))
     uri = "roblox://place/+%2B:opaque"

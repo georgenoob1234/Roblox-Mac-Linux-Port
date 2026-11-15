@@ -10,6 +10,10 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+# Launches in this check must never reach the tester's desktop.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import quiet_desktop  # noqa: E402
+quiet_desktop.install()
 
 root = Path(__file__).resolve().parents[1]
 build_release = (root / 'package/build-release.sh').read_text()

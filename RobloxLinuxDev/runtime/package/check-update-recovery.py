@@ -31,6 +31,11 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+# Launches in this check must never reach the tester's desktop.
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import quiet_desktop  # noqa: E402
+quiet_desktop.install()
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "package"

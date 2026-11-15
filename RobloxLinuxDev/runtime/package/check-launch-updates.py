@@ -109,8 +109,21 @@ def make_release(tmp, settings):
     return release
 
 
+def quiet_tools(release):
+    """Notification and dialog tools that record instead of reaching the desktop."""
+    tools = release / "quiet-bin"
+    if not tools.exists():
+        tools.mkdir()
+        for name in ("notify-send", "kdialog", "zenity", "gdbus"):
+            (tools / name).write_text(f'#!/bin/sh\nprintf "%s\\n" "{name} $*" >> "{release / "notifications"}"\nexit 0\n')
+            (tools / name).chmod(0o755)
+    return tools
+
+
 def launch(release, target, **env_extra):
     env = {**os.environ, "ROBLOX_MAC_UI_APP": str(release / "prompt-ui"), "TRACE": str(release / "trace"),
+           "PATH": f"{quiet_tools(release)}:{os.environ['PATH']}", "DBUS_SESSION_BUS_ADDRESS": "",
+           "ROBLOX_MAC_NOTIFY_DBUS_SESSION_BUS_ADDRESS": "",
            "ROBLOX_MAC_UPDATE_CHECK_TIMEOUT": "5", "ROBLOX_MAC_UPDATE_CHECK_GRACE": "5", **env_extra}
     args = []
     if target == "place":

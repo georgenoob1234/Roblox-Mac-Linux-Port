@@ -62,7 +62,16 @@ mkdir -p "$(dirname -- "$0")/RobloxVersion"
 printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
 """)
     (release / "update-roblox.sh").chmod(0o755)
-    env = {**os.environ, "PATH": os.environ["PATH"], "ROBLOX_MAC_UPDATE_CHECK_TIMEOUT": "2"}
+    # Notifications and dialogs must never reach the desktop of whoever runs
+    # the checks: these record instead (cases that test notify() itself put
+    # their own recorders first in PATH).
+    desktop_quiet_bin = tmp / "quiet-bin"
+    desktop_quiet_bin.mkdir()
+    for name in ("notify-send", "kdialog", "zenity", "gdbus"):
+        (desktop_quiet_bin / name).write_text(f'#!/bin/sh\nprintf "%s\\n" "{name} $*" >> "{tmp / "quiet-notifications"}"\nexit 0\n')
+        (desktop_quiet_bin / name).chmod(0o755)
+    env = {**os.environ, "PATH": f"{desktop_quiet_bin}:{os.environ['PATH']}", "ROBLOX_MAC_UPDATE_CHECK_TIMEOUT": "2",
+           "DBUS_SESSION_BUS_ADDRESS": "", "ROBLOX_MAC_NOTIFY_DBUS_SESSION_BUS_ADDRESS": ""}
     bootstrap = release / "bootstrap.sh"
 
     status = json.loads(subprocess.check_output([bootstrap, "status"], env=env, text=True))

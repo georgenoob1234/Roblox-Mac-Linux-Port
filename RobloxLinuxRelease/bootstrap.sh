@@ -127,7 +127,35 @@ PY
     return $?
 }
 
-say() { echo "roblox: $*" >&2; }
+# The launcher's own log. What the user is told about a failure points here.
+LOG=$DATA/launcher.log
+log_line() {
+    [ -d "$DATA" ] || return 0
+    if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        mv -f -- "$LOG" "$LOG.1" 2>/dev/null || true
+    fi
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || true
+}
+say() { echo "roblox: $*" >&2; log_line "$*"; }
+# keep_errors FILE STEP: pass a step's captured error output on to stderr and
+# into the log.
+keep_errors() {
+    [ -s "$1" ] || return 0
+    cat -- "$1" >&2
+    while IFS= read -r _line || [ -n "$_line" ]; do log_line "$2: $_line"; done < "$1"
+}
+# reason_from FILE: the step's last error line, without tool prefixes.
+reason_from() {
+    sed -n '/[^[:space:]]/p' "$1" 2>/dev/null | tail -n 1 |
+        sed -e 's/^roblox: //' -e 's/^! //' -e 's/^curl: ([0-9]*) //' -e 's/[.]$//'
+}
+# report_failure WHAT WHY TODO: what failed, why, what the user can do, and
+# where the details are (B10 defect 2).
+report_failure() {
+    event failed 0 "$1: $2" 0 0 false
+    say "$1: $2. $3"
+    notify "$1: $2. $3 Details: $LOG" "$1"
+}
 # event PHASE PERCENT MESSAGE [DONE] [TOTAL] [CANCELLABLE] [HIDDEN]
 # HIDDEN=true asks the progress window to stay off screen until the next event
 # (sent while the update prompt is open, so the prompt is never covered).
@@ -485,13 +513,24 @@ first_run() {
     # the alias that the actual game launch will receive from run.sh.
     # The warm-up does not own the instance lock. Close FD 9 before exec so a
     # Darling/AppImage child cannot strand the lock if timeout has to kill it.
-    if ! (unset ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA
-          timeout --foreground --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
-        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true); then
-        say 'First-run setup failed or timed out; the client was not launched.'
-        notify 'Roblox first-run setup failed; the client was not launched.' 'Roblox setup failed'
+    first_errors=$DATA/.first-run-errors.$$
+    (unset ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA
+     timeout --foreground --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
+        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true) 2>"$first_errors"
+    first_status=$?
+    keep_errors "$first_errors" first-run
+    if [ "$first_status" -ne 0 ]; then
+        if [ "$first_status" -eq 124 ]; then
+            why="it did not finish within ${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120} seconds"
+        else
+            why=$(reason_from "$first_errors")
+            [ -n "$why" ] || why="it ended with status $first_status"
+        fi
+        rm -f -- "$first_errors"
+        report_failure 'Roblox first-run setup failed' "$why" 'Roblox was not started. Start Roblox again.'
         return 1
     fi
+    rm -f -- "$first_errors"
     tmp=$DATA/.first-run.initialized.$$
     printf 'initialized\n' > "$tmp"
     chmod 600 "$tmp"
@@ -535,15 +574,27 @@ check_latest() {
     (
         exec 8>&- 9>&-
         check_timeout=${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}
-        check_output=$(timeout "$check_timeout" "$APP" --client-version 2>/dev/null)
+        check_output=$(timeout "$check_timeout" "$APP" --client-version 2>"$check_result_file.err")
         check_status=$?
         found=$(printf '%s\n' "$check_output" | sed -n '/^version-[0-9a-f][0-9a-f]*$/p' | tail -n 1)
         if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
             settings_set last_known_latest "$found" >/dev/null 2>&1 || true
+            settings_set last_check_error '' >/dev/null 2>&1 || true
             printf 'ok %s\n' "$found" > "$check_result_file.tmp"
         else
+            # Keep the reason for the Settings page and the log (B10 defect 2).
+            if [ "$check_status" -eq 124 ]; then
+                why="Roblox's version service did not answer within $check_timeout seconds"
+            else
+                why=$(reason_from "$check_result_file.err")
+                [ -n "$why" ] || why="the version lookup ended with status $check_status"
+            fi
+            settings_set last_check_error "$why" >/dev/null 2>&1 || true
+            while IFS= read -r _line || [ -n "$_line" ]; do log_line "update check: $_line"; done < "$check_result_file.err"
+            log_line "Could not check for Roblox updates: $why"
             printf 'failed %s\n' "$found" > "$check_result_file.tmp"
         fi
+        rm -f -- "$check_result_file.err"
         mv -f -- "$check_result_file.tmp" "$check_result_file"
         if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
             display=$(timeout "$check_timeout" "$APP" --client-version-display 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
@@ -645,21 +696,32 @@ do_update() {
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
     event downloading 25 'Downloading Roblox' 0 0 true
     # The bootstrapper keeps FD 9; updater children must not inherit it.
-    if ! timeout --foreground --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
+    update_errors=$DATA/.update-errors.$$
+    timeout --foreground --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
         'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 \
             ROBLOX_MAC_PROGRESS_FD=8 ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
-            sh "$HERE/update-roblox.sh"; then
+            sh "$HERE/update-roblox.sh" 2>"$update_errors"
+    update_status=$?
+    keep_errors "$update_errors" update
+    if [ "$update_status" -ne 0 ]; then
         if cancelled; then
+            rm -f -- "$update_errors"
             event cancelled 0 'Update cancelled; keeping the installed client' 0 0 false
             say 'Update cancelled; the installed client was kept.'
             notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
             return 125
         fi
-        event failed 0 'Update failed; keeping the installed client' 0 0 false
-        say 'Update failed or timed out; the installed client was kept.'
-        notify 'Roblox update failed; the installed client was kept.' 'Roblox update failed'
+        if [ "$update_status" -eq 124 ]; then
+            why="it did not finish within ${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}"
+        else
+            why=$(reason_from "$update_errors")
+            [ -n "$why" ] || why="the updater ended with status $update_status"
+        fi
+        rm -f -- "$update_errors"
+        report_failure 'Roblox update failed' "$why" 'The installed client was kept. Check your internet connection and try again later.'
         return 1
     fi
+    rm -f -- "$update_errors"
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
     event verifying 78 'Verifying the downloaded client' 0 0 true
     event preparing 90 'Preparing shaders' 0 0 true
@@ -668,8 +730,7 @@ do_update() {
 
 do_port_update() {
     if [ ! -f "$HERE/installer.py" ]; then
-        event failed 0 'Port updater is not included in this release' 0 0 false
-        say 'Port updater is unavailable; install a release containing installer.py.'
+        report_failure 'Port update failed' 'this release does not include the port updater (installer.py)' 'Install the latest release from the project page.'
         return 1
     fi
     event checking 5 'Checking the latest port release' 0 0 true
@@ -689,12 +750,16 @@ do_port_update() {
     # default 30m, applied only before the commit boundary), and an
     # interruption of the commit itself is repaired by the launcher's
     # recovery entry point on the next start.
+    port_errors=$DATA/.port-update-errors.$$
     env ROBLOX_MAC_PROGRESS_FD=8 \
         ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
         ROBLOX_MAC_CANCEL_STATE_FILE="${ROBLOX_MAC_CANCEL_STATE_FILE:-}" \
         ROBLOX_MAC_LOCK_HELD=1 \
-        python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop
+        python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop 2>"$port_errors"
     _port_update_status=$?
+    keep_errors "$port_errors" port-update
+    port_why=$(reason_from "$port_errors")
+    rm -f -- "$port_errors"
     case "$_port_update_status" in
         0)
             event update 100 'Port update complete' 0 0 false
@@ -712,8 +777,8 @@ do_port_update() {
             say 'Port update cancelled; the current release was kept.'
             return 125;;
     esac
-    event failed 0 'Port update failed; the current release was kept' 0 0 false
-    say 'Port update failed; the current release was kept.'
+    [ -n "$port_why" ] || port_why="the installer ended with status $_port_update_status"
+    report_failure 'Port update failed' "$port_why" 'The current release was kept. Check your internet connection and try again later.'
     return 1
 }
 
@@ -867,7 +932,7 @@ if [ "$answer" -eq 0 ] && [ -n "$port_offer" ]; then
             notify 'Port update cancelled; the current release was kept. Roblox was not started.' 'Roblox update cancelled'
             exit 125;;
         *)
-            notify 'Port update failed; the current release was kept. Roblox is starting anyway.' 'Roblox port update failed';;
+            say 'Roblox is starting with the current release.';;
     esac
 fi
 if [ -n "${ROBLOX_MAC_URI_RECEIVED_AT:-}" ] && [ -n "${ROBLOX_MAC_LAUNCH_URI:-}" ]; then

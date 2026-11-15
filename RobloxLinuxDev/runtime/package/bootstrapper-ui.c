@@ -671,7 +671,19 @@ static void settings_check_done(GObject *source, GAsyncResult *result, gpointer 
     g_object_unref(process);
     settings_refresh(state);
     if (ok) settings_message(state, state->update_available ? "An update is available." : "Your installed client is up to date.");
-    else settings_message(state, "Could not check for updates. Check your connection and try again; the last known status is shown.");
+    else {
+        /* B10 defect 2: what failed, why (kept by the launcher as
+         * last_check_error), what to do, and where the log is. */
+        JsonObject *latest = settings_status(state);
+        JsonObject *values = latest && json_object_has_member(latest, "settings") ? json_object_get_object_member(latest, "settings") : NULL;
+        const char *why = values ? json_string(values, "last_check_error") : "";
+        char *log = g_build_filename(state->root, "DO_NOT_SHARE", "launcher.log", NULL);
+        char *text = g_strdup_printf("Could not check for updates: %s.\nCheck your internet connection and try again; the last known status is shown. Details: %s",
+                                     *why ? why : "the check did not finish", log);
+        settings_message(state, text);
+        g_free(text); g_free(log);
+        if (latest) json_object_unref(latest);
+    }
     if (status) json_object_unref(status);
 }
 static void settings_check(GtkButton *button, gpointer data) {

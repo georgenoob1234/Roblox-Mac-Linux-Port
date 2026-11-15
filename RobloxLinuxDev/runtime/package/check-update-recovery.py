@@ -169,7 +169,10 @@ def snapshot(private):
         if not path.is_file():
             continue
         rel = str(path.relative_to(private))
-        if rel == "instance.lock" or rel.startswith("tmp/") or path.name.startswith((".check.", ".bootstrap-")):
+        # Launcher-owned files, not user data: the lock, transient state and
+        # the launcher's own log (bootstrap.sh writes launcher.log on purpose).
+        if rel in ("instance.lock", "launcher.log", "launcher.log.1") or rel.startswith("tmp/") or \
+                path.name.startswith((".check.", ".bootstrap-")):
             continue
         out[rel] = path.read_bytes()
     return out

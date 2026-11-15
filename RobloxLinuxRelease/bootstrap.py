@@ -17,6 +17,8 @@ DEFAULTS = {
     "last_check": 0,
     "last_known_latest": "",
     "last_known_latest_display": "",
+    # Why the last client update check failed ("" after a successful one).
+    "last_check_error": "",
     "window_decoration": "auto",
     "cursor_appearance": "system",
     "port_last_check": 0,
@@ -58,7 +60,8 @@ def read_settings(data):
             values[key] = max(0, int(values.get(key, 0)))
         except (TypeError, ValueError):
             values[key] = 0
-    for key in ("skipped_version", "skipped_port_version", "last_known_latest", "last_known_latest_display", "port_latest"):
+    for key in ("skipped_version", "skipped_port_version", "last_known_latest", "last_known_latest_display", "port_latest",
+                "last_check_error"):
         value = values.get(key, "")
         values[key] = value if isinstance(value, str) else ""
     if values.get("window_decoration") not in VALID_DECORATIONS:

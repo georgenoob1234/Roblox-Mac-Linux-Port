@@ -63,6 +63,7 @@ def fake_root(tmp, status=STATUS, port_version="1.2.3"):
         '  status) cat "$HERE/status.json" ;;\n'
         '  port-version) cat "$HERE/port-version" ;;\n'
         '  set) printf \'%s=%s\\n\' "$2" "$3" >> "$HERE/set.log" ;;\n'
+        '  check) [ -e "$HERE/check-fails" ] && exit 1; cat "$HERE/status.json" ;;\n'
         '  *) exit 9 ;;\n'
         'esac\n')
     return root
@@ -275,11 +276,29 @@ def check_prompt_lists_client_and_port_updates(display, binary, tmp):
             assert ui.exited(3) == 2
 
 
+def check_failed_update_check_says_why(display, binary, tmp):
+    """B10 defect 2: Settings → Check for updates must say why it failed and
+    where the log is (the launcher keeps the reason as last_check_error)."""
+    status = json.loads(json.dumps(STATUS))
+    status["settings"]["last_check_error"] = "Could not resolve host: clientsettingscdn.roblox.com"
+    root = fake_root(tmp, status=status)
+    (root / "check-fails").write_text("")
+    with display.open(binary, "--settings", root) as ui:
+        ui.wait(lambda w: (Window.button(w, "Check for updates") or {}).get("sensitive"))
+        assert ui.send("click Check for updates") == {"ok": True}
+        windows = ui.wait(lambda w: any("Could not check for updates" in t for t in Window.texts(w)))
+        message = next(t for t in Window.texts(windows) if "Could not check for updates" in t)
+        assert "Could not resolve host: clientsettingscdn.roblox.com" in message, message
+        assert "try again" in message, message
+        assert str(root / "DO_NOT_SHARE" / "launcher.log") in message, message
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
           check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why,
-          check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates]
+          check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates,
+          check_failed_update_check_says_why]
 
 
 def main():

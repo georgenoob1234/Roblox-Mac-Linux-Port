@@ -27,8 +27,8 @@ PACKAGE = Path(__file__).resolve().parent
 APPIMAGE = r'''#!/bin/sh
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
-  --shell) exit 0;;
-  --client-version) echo "${CLIENT_LATEST:-version-0000bb}"; exit 0;;
+  --shell) [ -z "${FIRST_RUN_ERROR:-}" ] || { echo "$FIRST_RUN_ERROR" >&2; exit 1; }; exit 0;;
+  --client-version) [ -z "${CHECK_ERROR:-}" ] || { echo "$CHECK_ERROR" >&2; exit 6; }; echo "${CLIENT_LATEST:-version-0000bb}"; exit 0;;
   --client-version-display) echo 0.748.0.7480000; exit 0;;
   --uri) shift; printf 'game port=%s client=%s uri=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$(cat "$HERE/RobloxVersion/.version")" "$1" "$*" >> "$HERE/trace"; exit 0;;
   *) printf 'game port=%s client=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$(cat "$HERE/RobloxVersion/.version")" "$*" >> "$HERE/trace"; exit 0;;
@@ -47,6 +47,7 @@ printf 'run.sh port=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$*"
 UPDATER = r'''#!/bin/sh
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 echo 'client-update' >> "$HERE/trace"
+[ -z "${CLIENT_UPDATE_ERROR:-}" ] || { echo 'fetching client version-0000bb' >&2; echo "$CLIENT_UPDATE_ERROR" >&2; exit 1; }
 printf '%s\n' "${CLIENT_LATEST:-version-0000bb}" > "$HERE/RobloxVersion/.version"
 '''
 
@@ -66,6 +67,8 @@ if sys.argv[1] == "release-status":
 if sys.argv[1] == "update":
     trace("port-update")
     result = int(os.environ.get("PORT_UPDATE_RESULT", "0"))
+    if result not in (0, 3, 125):
+        print("! " + os.environ.get("PORT_UPDATE_ERROR", "Port update failed (test)."), file=sys.stderr)
     if result == 0:
         # Like the real installer: the scripts are replaced by new files.
         for name in ("run.sh", "bootstrap.sh"):
@@ -210,7 +213,54 @@ def check_skip_failed_auto_and_off(tmp):
     expect_game(games, "place", "v-old", "version-0000aa")
 
 
-CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off]
+def notifications(release):
+    path = release / "notifications"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def check_failures_say_what_why_and_where(tmp):
+    """B10 defect 2: every error says what failed, why, what the user can
+    do, and where the log is."""
+    def expect(release, *parts):
+        log = release / "DO_NOT_SHARE" / "launcher.log"
+        sent = [line for line in notifications(release) if parts[0] in line]
+        assert sent, (parts[0], notifications(release))
+        for part in parts[1:] + (str(log),):
+            assert part in sent[-1], (part, sent[-1])
+        assert log.exists() and parts[1] in log.read_text(), (parts[1], log.read_text() if log.exists() else "no log")
+    # A failed client update: the updater's own last error line is the reason.
+    release = make_release(tmp, {"auto_update": "auto"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v-old",
+                                  CLIENT_UPDATE_ERROR="curl: (6) Could not resolve host: setup.rbxcdn.com")
+    expect(release, "Roblox update failed", "Could not resolve host: setup.rbxcdn.com", "installed client was kept")
+    expect_game(games, "place", "v-old", "version-0000aa")
+    # A failed first-run setup.
+    release = make_release(tmp, {"auto_update": "off"})
+    (release / "DO_NOT_SHARE/first-run.initialized").unlink()
+    result, trace, games = launch(release, "place", FIRST_RUN_ERROR="darling: could not set up the prefix (test)")
+    assert result.returncode != 0 and not games, (result.returncode, games)
+    expect(release, "first-run setup failed", "darling: could not set up the prefix (test)", "Start Roblox again")
+    # A failed port update: the installer's "! " line is the reason.
+    release = make_release(tmp, {"auto_update": "auto"})
+    result, trace, games = launch(release, "place", CLIENT_LATEST="version-0000aa", PORT_LATEST="v-new",
+                                  PORT_UPDATE_RESULT="1", PORT_UPDATE_ERROR="Could not download the release: test reason.")
+    expect(release, "Port update failed", "Could not download the release: test reason", "current release was kept")
+    expect_game(games, "place", "v-old", "version-0000aa")
+    # A failed update check keeps its reason for the Settings page.
+    release = make_release(tmp, {"auto_update": "ask"})
+    env = {**os.environ, "PATH": f"{quiet_tools(release)}:{os.environ['PATH']}", "DBUS_SESSION_BUS_ADDRESS": "",
+           "ROBLOX_MAC_NOTIFY_DBUS_SESSION_BUS_ADDRESS": "", "ROBLOX_MAC_NO_PROGRESS": "1",
+           "CHECK_ERROR": "curl: (28) Connection timed out after 8001 milliseconds"}
+    checked = subprocess.run([release / "bootstrap.sh", "check"], env=env, capture_output=True, text=True, timeout=60)
+    assert checked.returncode == 1, checked.stderr
+    status = json.loads(checked.stdout)
+    assert status["settings"]["last_check_error"] == "Connection timed out after 8001 milliseconds", status["settings"]
+    env.pop("CHECK_ERROR")
+    checked = subprocess.run([release / "bootstrap.sh", "check"], env=env, capture_output=True, text=True, timeout=60)
+    assert checked.returncode == 0 and json.loads(checked.stdout)["settings"]["last_check_error"] == "", checked.stdout
+
+
+CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off, check_failures_say_what_why_and_where]
 
 
 def main():

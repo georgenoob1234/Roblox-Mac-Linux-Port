@@ -58,6 +58,8 @@ static void ui_test_widget(GtkWidget *widget, gpointer data) {
         json_builder_begin_object(builder);
         json_builder_set_member_name(builder, "type"); json_builder_add_string_value(builder, type);
         json_builder_set_member_name(builder, "sensitive"); json_builder_add_boolean_value(builder, gtk_widget_is_sensitive(widget));
+        int minimum = 0, natural = 0; gtk_widget_get_preferred_width(widget, &minimum, &natural);
+        json_builder_set_member_name(builder, "wanted_width"); json_builder_add_int_value(builder, natural);
         if (GTK_IS_LABEL(widget)) {
             json_builder_set_member_name(builder, "text"); json_builder_add_string_value(builder, gtk_label_get_text(GTK_LABEL(widget)));
         } else if (GTK_IS_BUTTON(widget)) {
@@ -104,9 +106,12 @@ static void ui_test_dump(void) {
         int width = 0, height = 0; gtk_window_get_size(item->data, &width, &height);
         json_builder_set_member_name(builder, "width"); json_builder_add_int_value(builder, width);
         json_builder_set_member_name(builder, "height"); json_builder_add_int_value(builder, height);
-        /* The width the window asks for. Some displays do not resize a window
-         * to it (broadway), others do (KDE Wayland), so checks look at this. */
-        int minimum = 0, natural = 0; gtk_widget_get_preferred_width(item->data, &minimum, &natural);
+        /* The width the window's content asks for (the window's own figure
+         * adds its shadow). Some displays do not resize a window to it
+         * (broadway), others do (KDE Wayland), so checks look at this. */
+        int minimum = 0, natural = 0;
+        GtkWidget *content = gtk_bin_get_child(GTK_BIN(item->data));
+        if (content) gtk_widget_get_preferred_width(content, &minimum, &natural);
         json_builder_set_member_name(builder, "wanted_width"); json_builder_add_int_value(builder, natural);
         json_builder_set_member_name(builder, "widgets"); json_builder_begin_array(builder);
         gtk_container_forall(GTK_CONTAINER(item->data), ui_test_widget, builder);

@@ -385,13 +385,28 @@ def check_launch_window_keeps_its_size(display, binary, tmp):
         settled(progress.ui, lambda s: s[0] == width)
 
 
+def check_windows_ask_for_no_more_than_their_size(display, binary, tmp):
+    """On KDE Wayland a window takes the width its texts ask for (the launch
+    window grew to 1095 px there). No window may ask for more than its own
+    size: the prompt asked for 1006 px, the settings window for 925 px."""
+    root = fake_root(tmp)
+    for args in (["--dialog", "0.748.0.7480000", "0.747.0.7471481", "v2026.11.20", "v2026.11.15"],
+                 ["--dialog", "0.748.0.7480000", "0.747.0.7471481"], ["--settings", root], ["--launcher", root]):
+        with display.open(binary, *args) as ui:
+            ui.wait(lambda w: w)
+            time.sleep(0.5)
+            window = ui.dump()[0]
+            assert window["wanted_width"] <= window["width"], (args[0], window["width"], window["wanted_width"])
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
           check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why,
           check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates,
           check_failed_update_check_says_why, check_progress_failure_stays_until_closed,
-          check_pending_cancel_stays_visible, check_launch_window_keeps_its_size]
+          check_pending_cancel_stays_visible, check_launch_window_keeps_its_size,
+          check_windows_ask_for_no_more_than_their_size]
 
 
 def main():

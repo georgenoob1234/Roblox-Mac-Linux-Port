@@ -53,7 +53,8 @@ static void label_text(GtkWidget *widget, const char *text) { gtk_label_set_text
 static GtkWidget *label(const char *text, const char *class_name) {
     GtkWidget *widget = gtk_label_new(text); gtk_widget_set_halign(widget, GTK_ALIGN_START); gtk_label_set_xalign(GTK_LABEL(widget), 0);
     if (class_name) gtk_style_context_add_class(gtk_widget_get_style_context(widget), class_name);
-    gtk_label_set_line_wrap(GTK_LABEL(widget), TRUE); return widget;
+    /* Wrap instead of asking for the whole text's width (see fit_text). */
+    gtk_label_set_line_wrap(GTK_LABEL(widget), TRUE); gtk_label_set_max_width_chars(GTK_LABEL(widget), 56); return widget;
 }
 
 static char *find_icon_path(const char *root) {

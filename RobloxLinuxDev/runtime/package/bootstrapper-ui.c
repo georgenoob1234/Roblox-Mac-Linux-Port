@@ -883,7 +883,12 @@ static int run_launcher(const char *root, gboolean settings_page) {
     gtk_container_add(GTK_CONTAINER(settings_scroll), settings);
     gtk_stack_add_named(GTK_STACK(state->stack), settings_scroll, "settings");
     GtkWidget *info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(info), 42); gtk_box_pack_start(GTK_BOX(info), label("About Roblox Mac Linux Port", "title"), FALSE, FALSE, 0); state->info_client = label("Client version: —", "subtitle"); gtk_box_pack_start(GTK_BOX(info), state->info_client, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(info), label("Runtime build: bundled Darling + Wayland/Vulkan AppImage", "subtitle"), FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(info), label("An experimental Intel macOS Roblox client runner for Linux using Darling, Wayland and Vulkan.", NULL), FALSE, FALSE, 0); char *paths = g_strdup_printf("Release: %s\nData and logs: %s/DO_NOT_SHARE", root, root); gtk_box_pack_start(GTK_BOX(info), label(paths, "muted"), FALSE, FALSE, 0); g_free(paths); gtk_box_pack_start(GTK_BOX(info), label("Logs can contain account details; review them before sharing.", "muted"), FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(info), label("Project: https://github.com/georgenoob1234/Roblox-Mac-Linux-Port", "muted"), FALSE, FALSE, 0); gtk_stack_add_named(GTK_STACK(state->stack), info, "info");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(settings_page ? settings_nav : play_nav), TRUE); gtk_widget_show_all(state->window); settings_refresh(state); gtk_main(); if (state->launch_check_id) g_source_remove(state->launch_check_id); g_free(state->root); g_free(state); return 0;
+    /* A GtkStack ignores a switch to a page that is not visible yet, so the
+     * window is shown before the first page is chosen (B10 defect 1). */
+    gtk_widget_show_all(state->window);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(settings_page ? settings_nav : play_nav), TRUE);
+    gtk_stack_set_visible_child_full(GTK_STACK(state->stack), settings_page ? "settings" : "play", GTK_STACK_TRANSITION_TYPE_NONE);
+    settings_refresh(state); gtk_main(); if (state->launch_check_id) g_source_remove(state->launch_check_id); g_free(state->root); g_free(state); return 0;
 }
 
 int main(int argc, char **argv) {

@@ -124,7 +124,21 @@ def check_harness_reads_prompt(display, binary, tmp):
         assert ui.exited(10) == 0
 
 
-CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt]
+def check_settings_opens_on_settings_page(display, binary, tmp):
+    """B10 defect 1: --settings highlighted Settings but showed the Play page."""
+    root = fake_root(tmp)
+    with display.open(binary, "--settings", root) as ui:
+        windows = ui.wait(lambda w: "Client version: 0.747.0.7471481" in Window.texts(w))
+        active = [w["text"] for w in Window.widgets(windows, "toggle") if w["active"]]
+        assert len(active) == 1 and "Settings" in active[0], active
+        try:
+            ui.wait(lambda w: Window.stack(w) == "settings", timeout=3)
+        except AssertionError:
+            raise AssertionError(f"Settings is highlighted but the page shown is {Window.stack(ui.dump())!r}")
+
+
+CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
+          check_settings_opens_on_settings_page]
 
 
 def main():

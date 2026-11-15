@@ -351,7 +351,9 @@ def check_launch_window_keeps_its_size(display, binary, tmp):
     height when the note goes away."""
     def size(ui):
         window = ui.dump()[0]
-        return window["width"], window["height"]
+        # On KDE Wayland the window takes the width it asks for; broadway
+        # does not, so the wanted width is the one to hold steady.
+        return max(window["width"], window["wanted_width"]), window["height"]
     def settled(ui, test, timeout=3.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -374,9 +376,12 @@ def check_launch_window_keeps_its_size(display, binary, tmp):
         os.write(progress.write, (json.dumps({
             "phase": "failed", "percent": 0, "message": "Roblox update failed: " + long_reason,
             "bytes_done": 0, "bytes_total": 0, "cancellable": False,
-            "hint": "The installed client was kept. Check your internet connection and try again later.",
-            "log": "/home/someone/.local/opt/roblox-mac-linux-port/DO_NOT_SHARE/launcher.log"}) + "\n").encode())
+            "hint": "The installed client was kept. Check your internet connection and try again later. " * 3,
+            "log": "/home/someone-with-a-long-name/.local/opt/roblox-mac-linux-port/a/very/deep/folder/that/goes/on/DO_NOT_SHARE/launcher.log"}) + "\n").encode())
         progress.ui.wait(lambda w: Window.button(w, "Close") is not None)
+        settled(progress.ui, lambda s: s[0] == width)
+        # The longest single line the window may hold: no text may widen it.
+        progress.send("checking", -1, "Checking " + "a-very-long-word-without-spaces-" * 6)
         settled(progress.ui, lambda s: s[0] == width)
 
 

@@ -175,6 +175,12 @@ static GtkWidget *app_image(const char *root, int size, int scale) {
     return image;
 }
 
+/* A text that wraps (or is shortened) inside whatever width it is given,
+ * without asking for more: in GTK 3 a wrapping label asks for the width of
+ * its whole text, and on KDE Wayland a fixed-size window grew to that
+ * (460 -> 1095 px when an error appeared, George's desktop, 2026-11-15). */
+static void fit_text(GtkWidget *widget, int characters) { gtk_label_set_max_width_chars(GTK_LABEL(widget), characters); }
+
 /* ---- Small builders ---- */
 static void add_class(GtkWidget *widget, const char *name) { gtk_style_context_add_class(gtk_widget_get_style_context(widget), name); }
 static GtkWidget *hbox(int spacing) { return gtk_box_new(GTK_ORIENTATION_HORIZONTAL, spacing); }

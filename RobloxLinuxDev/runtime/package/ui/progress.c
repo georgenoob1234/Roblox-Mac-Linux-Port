@@ -251,6 +251,12 @@ static gboolean progress_show(gpointer data) {
     gtk_box_pack_start(GTK_BOX(error_text), state->error_log, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(state->error), error_text, TRUE, TRUE, 0);
     gtk_container_add(GTK_CONTAINER(state->error_reveal), state->error);
+    /* Every text here wraps or shortens inside the window's fixed width. */
+    /* About as many characters as the 420 px body holds (less inside the
+     * boxes, which have an icon and padding); text beyond that wraps. */
+    fit_text(state->phase, 46); fit_text(state->status, 46);
+    GtkWidget *boxed[] = {state->notice_text, state->error_title, state->error_hint, state->error_log};
+    for (size_t i = 0; i < G_N_ELEMENTS(boxed); ++i) fit_text(boxed[i], 38);
     gtk_box_pack_start(GTK_BOX(box), state->error_reveal, FALSE, FALSE, 0);
 
     GtkWidget *foot = hbox(10); gtk_widget_set_margin_top(foot, 16);

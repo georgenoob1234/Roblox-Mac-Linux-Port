@@ -104,6 +104,10 @@ static void ui_test_dump(void) {
         int width = 0, height = 0; gtk_window_get_size(item->data, &width, &height);
         json_builder_set_member_name(builder, "width"); json_builder_add_int_value(builder, width);
         json_builder_set_member_name(builder, "height"); json_builder_add_int_value(builder, height);
+        /* The width the window asks for. Some displays do not resize a window
+         * to it (broadway), others do (KDE Wayland), so checks look at this. */
+        int minimum = 0, natural = 0; gtk_widget_get_preferred_width(item->data, &minimum, &natural);
+        json_builder_set_member_name(builder, "wanted_width"); json_builder_add_int_value(builder, natural);
         json_builder_set_member_name(builder, "widgets"); json_builder_begin_array(builder);
         gtk_container_forall(GTK_CONTAINER(item->data), ui_test_widget, builder);
         json_builder_end_array(builder); json_builder_end_object(builder);

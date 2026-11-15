@@ -46,6 +46,165 @@ static void apply_css(void) {
     g_object_unref(provider);
 }
 
+/* Test-only control channel, off unless ROBLOX_MAC_UI_TEST_IN (a FIFO) and
+ * ROBLOX_MAC_UI_TEST_OUT (a file) are both set. Checks use it to read what the
+ * windows show and to act on them the way a user would, without guessing pixel
+ * positions. One command per line; one JSON line answers each:
+ *   dump           every mapped window: title, and its mapped widgets in order
+ *   click TEXT     press the mapped button labelled TEXT; refused if insensitive
+ *   close [TITLE]  ask the (first, or named) window to close, as its X does */
+static FILE *ui_test_out;
+
+static char *ui_test_plain(const char *text) {
+    GString *plain = g_string_new(NULL);
+    for (const char *c = text ? text : ""; *c; ++c) {
+        if (*c == '_' && c[1] == '_') { g_string_append_c(plain, '_'); ++c; }
+        else if (*c != '_') g_string_append_c(plain, *c);
+    }
+    return g_string_free(plain, FALSE);
+}
+static void ui_test_reply(JsonBuilder *builder) {
+    JsonGenerator *generator = json_generator_new();
+    JsonNode *root = json_builder_get_root(builder);
+    json_generator_set_root(generator, root);
+    char *text = json_generator_to_data(generator, NULL);
+    fprintf(ui_test_out, "%s\n", text); fflush(ui_test_out);
+    g_free(text); json_node_unref(root); g_object_unref(generator); g_object_unref(builder);
+}
+static void ui_test_simple(gboolean ok, const char *error) {
+    JsonBuilder *builder = json_builder_new(); json_builder_begin_object(builder);
+    json_builder_set_member_name(builder, "ok"); json_builder_add_boolean_value(builder, ok);
+    if (error) { json_builder_set_member_name(builder, "error"); json_builder_add_string_value(builder, error); }
+    json_builder_end_object(builder); ui_test_reply(builder);
+}
+static void ui_test_widget(GtkWidget *widget, gpointer data) {
+    JsonBuilder *builder = data;
+    if (!gtk_widget_get_mapped(widget)) return;
+    const char *type = NULL;
+    if (GTK_IS_LABEL(widget) && !GTK_IS_ACCEL_LABEL(widget)) type = "label";
+    else if (GTK_IS_TOGGLE_BUTTON(widget)) type = "toggle";
+    else if (GTK_IS_BUTTON(widget)) type = "button";
+    else if (GTK_IS_PROGRESS_BAR(widget)) type = "progress";
+    else if (GTK_IS_STACK(widget)) type = "stack";
+    else if (GTK_IS_COMBO_BOX(widget)) type = "combo";
+    else if (GTK_IS_SPIN_BUTTON(widget)) type = "spin";
+    else if (GTK_IS_SWITCH(widget)) type = "switch";
+    if (type) {
+        json_builder_begin_object(builder);
+        json_builder_set_member_name(builder, "type"); json_builder_add_string_value(builder, type);
+        json_builder_set_member_name(builder, "sensitive"); json_builder_add_boolean_value(builder, gtk_widget_is_sensitive(widget));
+        if (GTK_IS_LABEL(widget)) {
+            json_builder_set_member_name(builder, "text"); json_builder_add_string_value(builder, gtk_label_get_text(GTK_LABEL(widget)));
+        } else if (GTK_IS_BUTTON(widget)) {
+            char *text = ui_test_plain(gtk_button_get_label(GTK_BUTTON(widget)));
+            json_builder_set_member_name(builder, "text"); json_builder_add_string_value(builder, text); g_free(text);
+            if (GTK_IS_TOGGLE_BUTTON(widget)) { json_builder_set_member_name(builder, "active"); json_builder_add_boolean_value(builder, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget))); }
+        } else if (GTK_IS_PROGRESS_BAR(widget)) {
+            json_builder_set_member_name(builder, "fraction"); json_builder_add_double_value(builder, gtk_progress_bar_get_fraction(GTK_PROGRESS_BAR(widget)));
+            json_builder_set_member_name(builder, "text"); json_builder_add_string_value(builder, gtk_progress_bar_get_text(GTK_PROGRESS_BAR(widget)) ? gtk_progress_bar_get_text(GTK_PROGRESS_BAR(widget)) : "");
+        } else if (GTK_IS_STACK(widget)) {
+            const char *name = gtk_stack_get_visible_child_name(GTK_STACK(widget));
+            json_builder_set_member_name(builder, "visible"); json_builder_add_string_value(builder, name ? name : "");
+        } else if (GTK_IS_SPIN_BUTTON(widget)) {
+            json_builder_set_member_name(builder, "value"); json_builder_add_double_value(builder, gtk_spin_button_get_value(GTK_SPIN_BUTTON(widget)));
+        } else if (GTK_IS_COMBO_BOX(widget)) {
+            const char *id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(widget));
+            json_builder_set_member_name(builder, "active"); json_builder_add_string_value(builder, id ? id : "");
+        } else if (GTK_IS_SWITCH(widget)) {
+            json_builder_set_member_name(builder, "active"); json_builder_add_boolean_value(builder, gtk_switch_get_active(GTK_SWITCH(widget)));
+        }
+        json_builder_end_object(builder);
+    }
+    /* A button's own label and a combo's or spin's internals are part of it. */
+    if (GTK_IS_CONTAINER(widget) && !GTK_IS_BUTTON(widget) && !GTK_IS_COMBO_BOX(widget))
+        gtk_container_forall(GTK_CONTAINER(widget), ui_test_widget, builder);
+}
+static GList *ui_test_windows(void) {
+    GList *windows = NULL, *all = gtk_window_list_toplevels();
+    for (GList *item = all; item; item = item->next)
+        if (gtk_window_get_window_type(item->data) == GTK_WINDOW_TOPLEVEL && gtk_widget_get_mapped(item->data))
+            windows = g_list_append(windows, item->data);
+    g_list_free(all);
+    return windows;
+}
+static void ui_test_dump(void) {
+    JsonBuilder *builder = json_builder_new(); json_builder_begin_object(builder);
+    json_builder_set_member_name(builder, "ok"); json_builder_add_boolean_value(builder, TRUE);
+    json_builder_set_member_name(builder, "windows"); json_builder_begin_array(builder);
+    GList *windows = ui_test_windows();
+    for (GList *item = windows; item; item = item->next) {
+        const char *title = gtk_window_get_title(item->data);
+        json_builder_begin_object(builder);
+        json_builder_set_member_name(builder, "title"); json_builder_add_string_value(builder, title ? title : "");
+        json_builder_set_member_name(builder, "widgets"); json_builder_begin_array(builder);
+        gtk_container_forall(GTK_CONTAINER(item->data), ui_test_widget, builder);
+        json_builder_end_array(builder); json_builder_end_object(builder);
+    }
+    g_list_free(windows);
+    json_builder_end_array(builder); json_builder_end_object(builder); ui_test_reply(builder);
+}
+typedef struct { const char *text; GtkWidget *found; } UiTestFind;
+static void ui_test_find_button(GtkWidget *widget, gpointer data) {
+    UiTestFind *find = data;
+    if (find->found || !gtk_widget_get_mapped(widget)) return;
+    if (GTK_IS_BUTTON(widget)) {
+        char *text = ui_test_plain(gtk_button_get_label(GTK_BUTTON(widget)));
+        gboolean match = !g_strcmp0(text, find->text); g_free(text);
+        if (match) { find->found = widget; return; }
+    }
+    if (GTK_IS_CONTAINER(widget)) gtk_container_forall(GTK_CONTAINER(widget), ui_test_find_button, find);
+}
+static void ui_test_command(const char *line) {
+    if (!g_strcmp0(line, "dump")) { ui_test_dump(); return; }
+    GList *windows = ui_test_windows();
+    if (g_str_has_prefix(line, "click ")) {
+        UiTestFind find = {line + 6, NULL};
+        for (GList *item = windows; item && !find.found; item = item->next)
+            gtk_container_forall(GTK_CONTAINER(item->data), ui_test_find_button, &find);
+        if (!find.found) ui_test_simple(FALSE, "no such button");
+        else if (!gtk_widget_is_sensitive(find.found)) ui_test_simple(FALSE, "insensitive");
+        else { ui_test_simple(TRUE, NULL); gtk_button_clicked(GTK_BUTTON(find.found)); }
+    } else if (!g_strcmp0(line, "close") || g_str_has_prefix(line, "close ")) {
+        const char *title = line[5] ? line + 6 : NULL;
+        GtkWidget *target = NULL;
+        for (GList *item = windows; item && !target; item = item->next)
+            if (!title || !g_strcmp0(gtk_window_get_title(item->data), title)) target = item->data;
+        if (!target) ui_test_simple(FALSE, "no such window");
+        else { ui_test_simple(TRUE, NULL); gtk_window_close(GTK_WINDOW(target)); }
+    } else ui_test_simple(FALSE, "unknown command");
+    g_list_free(windows);
+}
+static gboolean ui_test_input(GIOChannel *channel, GIOCondition condition, gpointer data) {
+    GIOStatus result;
+    do {
+        gchar *line = NULL; gsize length = 0;
+        result = g_io_channel_read_line(channel, &line, &length, NULL, NULL);
+        if (result == G_IO_STATUS_NORMAL && line) { g_strchomp(line); ui_test_command(line); }
+        g_free(line);
+    } while (result == G_IO_STATUS_NORMAL);
+    return G_SOURCE_CONTINUE;
+}
+static void ui_test_init(void) {
+    const char *in = g_getenv("ROBLOX_MAC_UI_TEST_IN"), *out = g_getenv("ROBLOX_MAC_UI_TEST_OUT");
+    if (!in || !*in || !out || !*out || ui_test_out) return;
+    /* Read-write so the FIFO never reports end of file between test commands. */
+    int fd = open(in, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return;
+    ui_test_out = fopen(out, "ae");
+    if (!ui_test_out) { close(fd); return; }
+    GIOChannel *channel = g_io_channel_unix_new(fd);
+    g_io_channel_set_encoding(channel, NULL, NULL);
+    g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL);
+    g_io_add_watch(channel, G_IO_IN, ui_test_input, NULL);
+    g_io_channel_unref(channel);
+}
+/* Every window mode starts here: GTK, the shared style, the test channel. */
+static gboolean ui_init(void) {
+    if (!gtk_init_check(NULL, NULL)) return FALSE;
+    apply_css(); ui_test_init();
+    return TRUE;
+}
+
 typedef struct {
     char *root, *cancel_file, *cancel_state;
     GtkWidget *window, *phase, *status, *progress, *cancel;
@@ -376,8 +535,7 @@ static gboolean progress_input(GIOChannel *channel, GIOCondition condition, gpoi
     return G_SOURCE_REMOVE;
 }
 static int run_progress(const char *root) {
-    if (!gtk_init_check(NULL, NULL)) return 3;
-    apply_css();
+    if (!ui_init()) return 3;
     ProgressState *state = g_new0(ProgressState, 1); state->result = 1; state->root = g_strdup(root); state->cancel_file = g_build_filename(root, ".bootstrap-cancel", NULL); state->cancel_state = g_build_filename(root, ".bootstrap-cancel-state", NULL);
     state->show_id = g_timeout_add(UI_DELAY_MS, progress_show, state); GIOChannel *channel = g_io_channel_unix_new(STDIN_FILENO); g_io_channel_set_encoding(channel, NULL, NULL); g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL); g_io_add_watch(channel, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL, progress_input, state); gtk_main();
     int result = state->authoritative ? state->result : (state->cancelled ? 4 : state->result); g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state->cancel_state); g_free(state); return result;
@@ -387,8 +545,8 @@ static void dialog_finish(DialogState *state, int result) { state->result = resu
 static gboolean dialog_timeout(gpointer data) { dialog_finish(data, 1); return G_SOURCE_REMOVE; }
 static void dialog_button(GtkWidget *button, gpointer data) { dialog_finish(data, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "result"))); }
 static int run_dialog(const char *latest, const char *installed) {
-    if (!gtk_init_check(NULL, NULL)) return 3;
-    apply_css(); DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state.window), "Roblox update available"); setup_ui_identity(state.window, NULL); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
+    if (!ui_init()) return 3;
+    DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state.window), "Roblox update available"); setup_ui_identity(state.window, NULL); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), NULL);
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 26); gtk_container_add(GTK_CONTAINER(state.window), box); gtk_box_pack_start(GTK_BOX(box), label("A Roblox update is ready", "title"), FALSE, FALSE, 0); char *versions = g_strdup_printf("Installed: %s\nNew version: %s", *installed ? installed : "none", *latest ? latest : "available"); gtk_box_pack_start(GTK_BOX(box), label(versions, NULL), FALSE, FALSE, 0); g_free(versions); gtk_box_pack_start(GTK_BOX(box), label("The prompt closes after 30 seconds and launches without updating.", "muted"), FALSE, FALSE, 0);
     GtkWidget *buttons = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL); gtk_button_box_set_layout(GTK_BUTTON_BOX(buttons), GTK_BUTTONBOX_END); gtk_box_set_spacing(GTK_BOX(buttons), 8); const char *names[] = {"Update now", "Launch without updating", "Skip this version"}; for (int i = 0; i < 3; ++i) { GtkWidget *button = gtk_button_new_with_mnemonic(names[i]); g_object_set_data(G_OBJECT(button), "result", GINT_TO_POINTER(i == 0 ? 0 : (i == 1 ? 1 : 2))); g_signal_connect(button, "clicked", G_CALLBACK(dialog_button), &state); gtk_container_add(GTK_CONTAINER(buttons), button); if (i == 1) gtk_widget_grab_focus(button); } gtk_box_pack_end(GTK_BOX(box), buttons, FALSE, FALSE, 0); gtk_widget_show_all(state.window); g_timeout_add_seconds(DIALOG_TIMEOUT_SECONDS, dialog_timeout, &state); gtk_main(); gtk_widget_destroy(state.window); return state.result;
 }
@@ -609,8 +767,8 @@ static void show_page(GtkToggleButton *button, gpointer data) { if (!gtk_toggle_
 static GtkWidget *nav_button(const char *text, const char *page, LauncherState *state, GSList **group) { GtkWidget *button = gtk_radio_button_new_with_label(*group, text); *group = gtk_radio_button_get_group(GTK_RADIO_BUTTON(button)); gtk_toggle_button_set_mode(GTK_TOGGLE_BUTTON(button), FALSE); g_object_set_data(G_OBJECT(button), "page", (gpointer)page); gtk_style_context_add_class(gtk_widget_get_style_context(button), "nav"); g_signal_connect(button, "toggled", G_CALLBACK(show_page), state); return button; }
 
 static int run_launcher(const char *root, gboolean settings_page) {
-    if (!gtk_init_check(NULL, NULL)) return 1;
-    apply_css(); LauncherState *state = g_new0(LauncherState, 1); state->root = g_strdup(root); state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state->window), "Roblox Mac Linux Port"); setup_ui_identity(state->window, state->root); gtk_window_set_default_size(GTK_WINDOW(state->window), 820, 560); gtk_widget_set_size_request(state->window, 680, 460); gtk_window_set_position(GTK_WINDOW(state->window), GTK_WIN_POS_CENTER); g_signal_connect(state->window, "delete-event", G_CALLBACK(launcher_delete), state); g_signal_connect(state->window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    if (!ui_init()) return 1;
+    LauncherState *state = g_new0(LauncherState, 1); state->root = g_strdup(root); state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state->window), "Roblox Mac Linux Port"); setup_ui_identity(state->window, state->root); gtk_window_set_default_size(GTK_WINDOW(state->window), 820, 560); gtk_widget_set_size_request(state->window, 680, 460); gtk_window_set_position(GTK_WINDOW(state->window), GTK_WIN_POS_CENTER); g_signal_connect(state->window, "delete-event", G_CALLBACK(launcher_delete), state); g_signal_connect(state->window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
     GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0); gtk_container_add(GTK_CONTAINER(state->window), outer); GtkWidget *sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4); gtk_widget_set_size_request(sidebar, 190, -1); gtk_style_context_add_class(gtk_widget_get_style_context(sidebar), "sidebar"); gtk_box_pack_start(GTK_BOX(outer), sidebar, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(sidebar), label("Roblox Mac Linux Port", "brand"), FALSE, FALSE, 0); GtkWidget *nav = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3); gtk_box_pack_start(GTK_BOX(sidebar), nav, FALSE, FALSE, 0); GSList *group = NULL; GtkWidget *play_nav = nav_button("▶  Play", "play", state, &group); GtkWidget *settings_nav = nav_button("⚙  Settings", "settings", state, &group); GtkWidget *info_nav = nav_button("●  Info", "info", state, &group); gtk_box_pack_start(GTK_BOX(nav), play_nav, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(nav), settings_nav, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(nav), info_nav, FALSE, FALSE, 0);
     state->stack = gtk_stack_new(); gtk_stack_set_transition_type(GTK_STACK(state->stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE); gtk_box_pack_start(GTK_BOX(outer), state->stack, TRUE, TRUE, 0);
     GtkWidget *play = gtk_box_new(GTK_ORIENTATION_VERTICAL, 18); gtk_container_set_border_width(GTK_CONTAINER(play), 42); gchar *icon_path = find_icon_path(root); GError *icon_error = NULL; GdkPixbuf *pixbuf = icon_path ? gdk_pixbuf_new_from_file_at_scale(icon_path, 160, 160, TRUE, &icon_error) : NULL; GtkWidget *image = pixbuf ? gtk_image_new_from_pixbuf(pixbuf) : gtk_image_new(); if (pixbuf) g_object_unref(pixbuf); g_clear_error(&icon_error); g_free(icon_path); gtk_widget_set_halign(image, GTK_ALIGN_CENTER); gtk_box_pack_start(GTK_BOX(play), image, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(play), label("Roblox Mac Linux Port", "title"), FALSE, FALSE, 0); state->play_version = label("Client version: —", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_version, FALSE, FALSE, 0); state->play_status = label("Checking…", "subtitle"); gtk_box_pack_start(GTK_BOX(play), state->play_status, FALSE, FALSE, 0); GtkWidget *play_button = gtk_button_new_with_mnemonic("_Play"); gtk_style_context_add_class(gtk_widget_get_style_context(play_button), "accent"); g_signal_connect(play_button, "clicked", G_CALLBACK(play_launch), state); gtk_box_pack_start(GTK_BOX(play), play_button, FALSE, FALSE, 0); GtkWidget *log_button = gtk_button_new_with_mnemonic("Open last _log"); g_signal_connect(log_button, "clicked", G_CALLBACK(open_log), state); gtk_box_pack_start(GTK_BOX(play), log_button, FALSE, FALSE, 0); gtk_stack_add_named(GTK_STACK(state->stack), play, "play");

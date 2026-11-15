@@ -174,6 +174,13 @@ with tempfile.TemporaryDirectory(prefix='roblox diagnostics é ') as tmp:
     assert run({'ROBLOX_MAC_DIAGNOSTICS_KEEP': 'many'}).returncode == 0 and len(ours()) == 10
     assert run({'ROBLOX_MAC_DIAGNOSTICS_KEEP': '3'}).returncode == 0 and len(ours()) == 3
     assert run({'ROBLOX_MAC_DIAGNOSTICS_KEEP': '1'}).returncode == 0 and len(ours()) == 1
+    # The dev launcher passes a data path with '..' in it, which mkdtemp drops from the path it
+    # returns; the folder of this run must still be recognised and kept.
+    previous = ours()
+    dotted = subprocess.run([sys.executable, script, '--diagnose', runtime, data / '..' / data.name, child],
+                            env={**env, 'ROBLOX_MAC_DIAGNOSTICS_KEEP': '1'}, capture_output=True, text=True)
+    assert dotted.returncode == 0, dotted.stderr
+    assert len(ours()) == 1 and ours() != previous and (logs / ours()[0] / 'system.txt').is_file(), ours()
     # A folder that cannot be listed never stops a run.
     assert diag.prune(folder / 'missing', None) is None
     (data / 'config.env').unlink()

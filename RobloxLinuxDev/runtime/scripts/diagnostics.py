@@ -117,10 +117,11 @@ def prune(logs, current):
         return
     try:
         # The names begin with the UTC time, so name order is age order. The folder of this run
-        # always stays, whatever a folder of the same second is called.
+        # always stays, whatever a folder of the same second is called. It is matched by name:
+        # mkdtemp drops a '..' from the path it returns, and the dev launcher's data path has one.
         older = sorted(path for path in logs.iterdir()
                        if re.fullmatch(r'\d{8}T\d{6}Z-[a-z0-9_]{8}', path.name) and path.is_dir()
-                       and not path.is_symlink() and path != current)
+                       and not path.is_symlink() and path.name != current.name)
     except OSError:
         return
     for path in older[:max(len(older) - (keep - 1), 0)]:

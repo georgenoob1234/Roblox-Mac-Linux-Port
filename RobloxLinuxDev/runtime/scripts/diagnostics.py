@@ -107,6 +107,26 @@ def report(root):
     return '\n'.join(lines) + '\n'
 
 
+def prune(logs, current):
+    """Keep the newest folders of this script's own making; an update's shader logs are 18 MB each."""
+    try:
+        keep = int(os.environ.get('ROBLOX_MAC_DIAGNOSTICS_KEEP', '10'))
+    except ValueError:
+        keep = 10
+    if keep <= 0:
+        return
+    try:
+        # The names begin with the UTC time, so name order is age order. The folder of this run
+        # always stays, whatever a folder of the same second is called.
+        older = sorted(path for path in logs.iterdir()
+                       if re.fullmatch(r'\d{8}T\d{6}Z-[a-z0-9_]{8}', path.name) and path.is_dir()
+                       and not path.is_symlink() and path != current)
+    except OSError:
+        return
+    for path in older[:max(len(older) - (keep - 1), 0)]:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def main():
     mode = sys.argv[1]
     if mode == '--llvm-check':
@@ -125,6 +145,7 @@ def main():
     logs.mkdir(exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-'), dir=logs))
     print(f'Diagnostics: {folder}', file=sys.stderr, flush=True)
+    prune(logs, folder)
     summary = report(root)
     (folder / 'system.txt').write_text(summary)
     if mode == '--diagnose':

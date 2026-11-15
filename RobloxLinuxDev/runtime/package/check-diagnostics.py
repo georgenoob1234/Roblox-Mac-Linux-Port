@@ -144,8 +144,40 @@ with tempfile.TemporaryDirectory(prefix='roblox diagnostics é ') as tmp:
                                 env={**env, 'PATH': f'{tools}:{env["PATH"]}'}, capture_output=True, text=True)
         assert result.returncode == 128 + signal.SIGABRT and 'GPU driver faults' not in result.stderr
     assert len(list((data / 'diagnostics').glob('*/gpu-faults.txt'))) == 1
+    # Old diagnostics folders are pruned: the ten newest stay. Only this script's own folders are
+    # touched; a link is never followed.
+    logs = data / 'diagnostics'
+    ours = lambda: sorted(path.name for path in logs.iterdir() if path.name[:8].isdigit() and path.is_dir() and not path.is_symlink())
+    for path in [logs / name for name in ours()]:
+        shutil.rmtree(path)
+    for index in range(12):
+        old = logs / f'202001{index + 1:02d}T000000Z-aaaaaaaa'
+        (old / 'shaders').mkdir(parents=True)
+        (old / 'shaders/shader.out').write_text('old')
+    outside = folder / 'outside'
+    outside.mkdir()
+    (outside / 'precious').write_text('keep')
+    (logs / '20190101T000000Z-linkaaaa').symlink_to(outside)
+    (logs / 'my notes').mkdir()
+    (logs / '20190101T000000Z-file.txt').write_text('keep')
+    run = lambda extra: subprocess.run([sys.executable, script, '--diagnose', runtime, data, child],
+                                       env={**env, **extra}, capture_output=True, text=True)
+    result = run({})
+    assert result.returncode == 0, result.stderr
+    kept = ours()
+    assert len(kept) == 10 and kept[0] == '20200104T000000Z-aaaaaaaa' and kept[-1][:4] >= '2026', kept
+    assert (logs / kept[-1] / 'system.txt').is_file() and (logs / kept[0] / 'shaders/shader.out').read_text() == 'old'
+    assert (outside / 'precious').read_text() == 'keep' and (logs / '20190101T000000Z-linkaaaa').is_symlink()
+    assert (logs / 'my notes').is_dir() and (logs / '20190101T000000Z-file.txt').read_text() == 'keep'
+    # ROBLOX_MAC_DIAGNOSTICS_KEEP sets the number; 0 keeps everything; nonsense means the default.
+    assert run({'ROBLOX_MAC_DIAGNOSTICS_KEEP': '0'}).returncode == 0 and len(ours()) == 11
+    assert run({'ROBLOX_MAC_DIAGNOSTICS_KEEP': 'many'}).returncode == 0 and len(ours()) == 10
+    assert run({'ROBLOX_MAC_DIAGNOSTICS_KEEP': '3'}).returncode == 0 and len(ours()) == 3
+    assert run({'ROBLOX_MAC_DIAGNOSTICS_KEEP': '1'}).returncode == 0 and len(ours()) == 1
+    # A folder that cannot be listed never stops a run.
+    assert diag.prune(folder / 'missing', None) is None
     (data / 'config.env').unlink()
     # Explicit diagnostic arguments are forwarded directly to the AppImage.
     actual = subprocess.check_output(['sh', release / 'run.sh', '--debug', '--show-config'], env=env, text=True).splitlines()
     assert any(line.startswith('CONFIG=') for line in actual) and any(line.startswith('SHADER_CACHE=') for line in actual)
-print('PASS diagnostics: signals, namespace/tool checks, no-launch mode, private logs, exit status, shader log retention, GPU faults, arguments')
+print('PASS diagnostics: signals, namespace/tool checks, no-launch mode, private logs, exit status, shader log retention, GPU faults, pruning, arguments')

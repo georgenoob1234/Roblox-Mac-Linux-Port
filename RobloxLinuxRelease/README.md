@@ -139,6 +139,9 @@ versions or terminating signals under the shader memory limit. It also checks
 native UI and EGL driver loading and reports missing libraries or symbol versions.
 Each run prints its folder under `DO_NOT_SHARE/diagnostics/`, containing
 `system.txt` and, for debug launches, `runtime.log` with the exit status.
+The ten newest of these folders are kept and older ones are deleted when a new
+one is made; set `ROBLOX_MAC_DIAGNOSTICS_KEEP` to another number, or to `0` to
+keep them all.
 Debug launches enable Vulkan loader errors and warnings to expose driver-loading failures.
 The updater automatically logs shader preparation there and preserves individual
 shader text logs even when an update fails. No session files or environment dump

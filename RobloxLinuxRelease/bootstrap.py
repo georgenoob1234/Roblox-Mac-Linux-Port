@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Small headless state helper for the Roblox release bootstrapper."""
+import contextlib
+import fcntl
 import json
 import os
 import sys
@@ -92,6 +94,21 @@ def write_settings(data, values):
         raise
 
 
+@contextlib.contextmanager
+def settings_lock(data):
+    """Serialise read-modify-write of bootstrapper.json: the launcher's
+    background update check and the Settings window can write at once, and
+    an unlocked "set" could silently undo the other's change."""
+    path = Path(data)
+    path.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path / "bootstrapper.json.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def installed_version(version_dir):
     path = Path(version_dir) / ".version"
     try:
@@ -156,6 +173,33 @@ def emit(phase, percent, message, bytes_done=0, bytes_total=0, cancellable=True)
                       "cancellable": bool(cancellable)}, separators=(",", ":")))
 
 
+def settings_change(data, operation, argv):
+    values = read_settings(data)
+    if operation == "set" and len(argv) == 6:
+        key, value = argv[4], argv[5]
+        if key not in DEFAULTS:
+            raise SystemExit(2)
+        if key == "auto_update" and value not in VALID_MODES:
+            raise SystemExit("auto_update must be auto, ask or off")
+        if key == "window_decoration" and value not in VALID_DECORATIONS:
+            raise SystemExit("window_decoration must be auto, system, gtk or legacy")
+        if key == "cursor_appearance" and value not in VALID_CURSORS:
+            raise SystemExit("cursor_appearance must be system or legacy")
+        if key == "check_interval_hours":
+            value = max(0, int(value))
+        elif key in {"last_check", "port_last_check"}:
+            value = max(0, int(value))
+        values[key] = value
+        write_settings(data, values)
+        return
+    if operation == "reset_appearance" and len(argv) == 4:
+        values["window_decoration"] = DEFAULTS["window_decoration"]
+        values["cursor_appearance"] = DEFAULTS["cursor_appearance"]
+        write_settings(data, values)
+        return
+    raise SystemExit(2)
+
+
 def main(argv):
     if len(argv) < 2:
         raise SystemExit("usage: bootstrap.py settings|status|event DATA ...")
@@ -169,27 +213,9 @@ def main(argv):
                 raise SystemExit(2)
             print(json.dumps(values[key]) if not isinstance(values[key], str) else values[key])
             return
-        if operation == "set" and len(argv) == 6:
-            key, value = argv[4], argv[5]
-            if key not in DEFAULTS:
-                raise SystemExit(2)
-            if key == "auto_update" and value not in VALID_MODES:
-                raise SystemExit("auto_update must be auto, ask or off")
-            if key == "window_decoration" and value not in VALID_DECORATIONS:
-                raise SystemExit("window_decoration must be auto, system, gtk or legacy")
-            if key == "cursor_appearance" and value not in VALID_CURSORS:
-                raise SystemExit("cursor_appearance must be system or legacy")
-            if key == "check_interval_hours":
-                value = max(0, int(value))
-            elif key in {"last_check", "port_last_check"}:
-                value = max(0, int(value))
-            values[key] = value
-            write_settings(data, values)
-            return
-        if operation == "reset_appearance" and len(argv) == 4:
-            values["window_decoration"] = DEFAULTS["window_decoration"]
-            values["cursor_appearance"] = DEFAULTS["cursor_appearance"]
-            write_settings(data, values)
+        if operation in {"set", "reset_appearance"}:
+            with settings_lock(data):
+                settings_change(data, operation, argv)
             return
         raise SystemExit(2)
     if command == "status" and len(argv) == 4:

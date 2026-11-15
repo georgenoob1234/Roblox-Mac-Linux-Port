@@ -85,6 +85,18 @@ printf 'version-abcd\\n' > "$(dirname -- "$0")/RobloxVersion/.version"
     due = subprocess.check_output([ROOT / "package/bootstrap.py", "due", private, "86500"], text=True).strip()
     assert due == "1"
 
+    # Two writers at once must not lose each other's change: every "set" is
+    # a read-modify-write of bootstrapper.json (the launcher's background
+    # update check and the Settings window can write at the same time).
+    race_dir = tmp / "settings-race"
+    race_dir.mkdir()
+    writers = [subprocess.Popen(["sh", "-c", f'for i in $(seq 1 60); do "{ROOT / "package/bootstrap.py"}" settings "{race_dir}" set {key} "{value}$i" || exit 1; done'])
+               for key, value in (("skipped_version", "version-skip"), ("last_known_latest", "version-latest"))]
+    assert all(writer.wait(timeout=120) == 0 for writer in writers)
+    raced = json.loads((race_dir / "bootstrapper.json").read_text())
+    assert raced["skipped_version"] == "version-skip60" and raced["last_known_latest"] == "version-latest60", raced
+    # (The race test above runs before the general settings tests.)
+
     # Test setting appearance settings
     subprocess.run([bootstrap, "set", "window_decoration", "legacy"], env=env, check=True)
     assert subprocess.check_output([bootstrap, "get", "window_decoration"], env=env, text=True).strip() == "legacy"

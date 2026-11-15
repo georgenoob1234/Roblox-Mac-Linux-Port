@@ -219,10 +219,31 @@ def check_progress_stays_hidden_while_prompt_is_open(display, binary, tmp):
         assert progress.ui.exited(5) == 0
 
 
+def check_failed_port_check_says_why(display, binary, tmp):
+    """B10 defect 5: a failed port-update check must say what failed, why,
+    what to do, and where the log is."""
+    root = fake_root(tmp)
+    (root / "installer.py").write_text(
+        "import sys\n"
+        "print('! Could not query the latest GitHub release: could not reach GitHub "
+        "(Temporary failure in name resolution).', file=sys.stderr)\n"
+        "sys.exit(1)\n")
+    state = Path(tmp) / "state home"
+    with display.open(binary, "--settings", root, env={**os.environ, "XDG_STATE_HOME": str(state)}) as ui:
+        ui.wait(lambda w: Window.button(w, "Check for port updates") is not None
+                and Window.button(w, "Check for port updates")["sensitive"])
+        assert ui.send("click Check for port updates") == {"ok": True}
+        windows = ui.wait(lambda w: any("Could not check for port updates" in t for t in Window.texts(w)))
+        message = next(t for t in Window.texts(windows) if "Could not check for port updates" in t)
+        assert "Temporary failure in name resolution" in message, message
+        assert "try again" in message, message
+        assert str(state / "roblox-mac-linux-port" / "installer.log") in message, message
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
-          check_progress_stays_hidden_while_prompt_is_open]
+          check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why]
 
 
 def main():

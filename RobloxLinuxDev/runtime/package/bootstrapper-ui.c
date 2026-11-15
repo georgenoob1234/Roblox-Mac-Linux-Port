@@ -714,6 +714,29 @@ static void settings_update(GtkButton *button, gpointer data) {
     gtk_widget_hide(state->window);
     gtk_widget_destroy(state->window);
 }
+/* Why a port-update check failed, from the installer's own message: its last
+ * "! ..." line on stderr, without the "Could not query ..." lead-in. */
+static char *port_check_cause(gboolean communicated, GSubprocess *process, const char *error_output) {
+    if (!communicated || !g_subprocess_get_if_exited(process))
+        return g_strdup("the check stopped unexpectedly");
+    char *cause = NULL;
+    gchar **lines = g_strsplit(error_output ? error_output : "", "\n", -1);
+    for (gchar **line = lines; *line; ++line) {
+        char *text = g_strstrip(*line);
+        if (g_str_has_prefix(text, "! ")) { g_free(cause); cause = g_strdup(text + 2); }
+    }
+    g_strfreev(lines);
+    const char *lead = "Could not query the latest GitHub release: ";
+    if (cause && g_str_has_prefix(cause, lead)) { char *rest = g_strdup(cause + strlen(lead)); g_free(cause); cause = rest; }
+    if (cause && g_str_has_suffix(cause, ".")) cause[strlen(cause) - 1] = '\0';
+    if (!cause || !*cause) {
+        g_free(cause);
+        cause = g_subprocess_get_exit_status(process) == 0
+            ? g_strdup("the installer's answer could not be read")
+            : g_strdup_printf("the installer exited with status %d", g_subprocess_get_exit_status(process));
+    }
+    return cause;
+}
 static void settings_port_check_done(GObject *source, GAsyncResult *result, gpointer data) {
     LauncherState *state = data;
     GSubprocess *process = G_SUBPROCESS(source);
@@ -723,6 +746,7 @@ static void settings_port_check_done(GObject *source, GAsyncResult *result, gpoi
     JsonObject *metadata = communicated && g_subprocess_get_if_exited(process) && g_subprocess_get_exit_status(process) == 0
         ? parse_json(output) : NULL;
     gboolean ok = metadata && *json_string(metadata, "latest_version");
+    char *cause = ok ? NULL : port_check_cause(communicated, process, error_output);
     if (error) g_clear_error(&error);
     g_free(output); g_free(error_output);
     state->port_check_in_progress = FALSE;
@@ -735,7 +759,14 @@ static void settings_port_check_done(GObject *source, GAsyncResult *result, gpoi
     }
     settings_refresh(state);
     if (ok) label_text(state->port_message, state->port_update_available ? "A newer port release is available." : "The port is up to date.");
-    else label_text(state->port_message, "Could not check for port updates. Verify the network and try again.");
+    else {
+        /* B10 defect 5: what failed, why, what to do, where the details are. */
+        char *log = g_build_filename(g_get_user_state_dir(), "roblox-mac-linux-port", "installer.log", NULL);
+        char *text = g_strdup_printf("Could not check for port updates: %s.\nCheck your internet connection and try again. Details: %s", cause, log);
+        label_text(state->port_message, text);
+        g_free(text); g_free(log);
+    }
+    g_free(cause);
     if (metadata) json_object_unref(metadata);
 }
 static void settings_port_check(GtkButton *button, gpointer data) {

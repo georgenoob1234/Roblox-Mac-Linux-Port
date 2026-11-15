@@ -6,7 +6,7 @@ set -eu
 REPOSITORY=georgenoob1234/Roblox-Mac-Linux-Port
 REF=main
 BASE_URL="https://raw.githubusercontent.com/$REPOSITORY/$REF/installer"
-EXPECTED_SHA256='3df6063ef7b72a4dcc143ee691435583e49b3ce7c066c64f45c1e82065b8bfd8'
+EXPECTED_SHA256='a1a1ec0111fce1d2ccf8cb2c6bea44dd5de13f87d059ffe330aa2af03e39242b'
 
 fail() {
     echo "install.sh: $*" >&2

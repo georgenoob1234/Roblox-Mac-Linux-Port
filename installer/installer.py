@@ -19,6 +19,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -2198,13 +2199,37 @@ def remove_full_data(target: Path, manifest: dict[str, Any]) -> list[Path]:
     return removed
 
 
+def describe_http_failure(exc: BaseException, timeout: int) -> str:
+    """One plain sentence naming why a request to GitHub failed."""
+    if isinstance(exc, urllib.error.HTTPError):
+        headers = exc.headers or {}
+        if exc.code in (403, 429) and headers.get("X-RateLimit-Remaining") == "0":
+            reset = headers.get("X-RateLimit-Reset", "")
+            when = ""
+            if reset.isdigit():
+                when = time.strftime(" (it resets at %H:%M)", time.localtime(int(reset)))
+            return f"GitHub's limit of requests from this network was reached{when}"
+        return f"GitHub answered HTTP {exc.code} {exc.reason}".rstrip()
+    if isinstance(exc, (TimeoutError, socket.timeout)) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, (TimeoutError, socket.timeout))):
+        return f"GitHub did not answer within {timeout} seconds"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, OSError) and reason.strerror:
+            reason = reason.strerror
+        return f"could not reach GitHub ({reason})"
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "GitHub's answer was not valid JSON"
+    return str(exc) or type(exc).__name__
+
+
 def fetch_json(url: str) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"User-Agent": f"{APP_ID}-installer", "Accept": "application/vnd.github+json"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        fail(f"Could not query the latest GitHub release: {exc}")
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        fail(f"Could not query the latest GitHub release: {describe_http_failure(exc, 30)}.")
 
 
 def latest_release_metadata() -> dict[str, Any]:

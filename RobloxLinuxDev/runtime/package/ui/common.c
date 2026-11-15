@@ -243,9 +243,10 @@ static GtkWidget *card(const char *icon_name, const char *title, const char *des
     if (sub) *sub = description_label;
     return row;
 }
+/* A card's control sits at its right edge, whatever the window's width. */
 static void card_add(GtkWidget *row, GtkWidget *control) {
     gtk_widget_set_valign(control, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(row), control, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(row), control, FALSE, FALSE, 0);
 }
 /* A card whose buttons sit on their own row under the text, so a long
  * description is not squeezed. Returns the card; *actions is the row. */
@@ -300,7 +301,9 @@ static void dropdown_menu_width(GtkWidget *menu, gpointer data) {
 static GtkWidget *dropdown_new(const char *const *items, DropdownChanged changed, gpointer data) {
     GtkWidget *dropdown = gtk_menu_button_new(); add_class(dropdown, "dropdown");
     GtkWidget *content = hbox(10);
-    GtkWidget *text = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(text), 0); gtk_widget_set_hexpand(text, TRUE);
+    /* No hexpand here: it would spread to the button and make every card
+     * share its spare width with the dropdown (it then left the right edge). */
+    GtkWidget *text = gtk_label_new(""); gtk_label_set_xalign(GTK_LABEL(text), 0);
     gtk_box_pack_start(GTK_BOX(content), text, TRUE, TRUE, 0);
     gtk_box_pack_end(GTK_BOX(content), icon("chevron", 14), FALSE, FALSE, 0);
     gtk_container_add(GTK_CONTAINER(dropdown), content);

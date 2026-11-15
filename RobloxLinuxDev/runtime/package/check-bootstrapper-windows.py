@@ -418,6 +418,31 @@ def check_dropdowns_open_below_and_pick(display, binary, tmp):
         assert changes == ["auto_update=auto", "check_interval_hours=168"], changes
 
 
+def check_card_controls_line_up(display, binary, tmp):
+    """George, 2026-11-15: the dropdowns on the Updates page did not line up
+    with each other or with the button under them. The controls at the right
+    of the cards share one left and one right edge, on every page."""
+    root = fake_root(tmp)
+    with display.open(binary, "--settings", root) as ui:
+        ui.wait(lambda w: Window.button(w, "Ask first") is not None)
+        # Also maximized: the controls must stay at the cards' right edge.
+        for width, height in ((900, 600), (1600, 1000)):
+            assert ui.send(f"resize {width} {height}") == {"ok": True}
+            ui.wait(lambda w: w[0]["width"] == width)
+            for page, controls in (("Updates", ["Ask first", "Once a day", "Forget skipped"]),
+                                   ("Appearance", ["Automatic", "Restore defaults"])):
+                assert ui.send(f"click {page}") == {"ok": True}
+                ui.wait(lambda w: all(Window.button(w, c) for c in controls))
+                time.sleep(0.4)  # the page crossfade and the resize
+                windows = ui.dump()
+                edges = [(Window.button(windows, c)["x"], Window.button(windows, c)["x"] + Window.button(windows, c)["allocated_width"])
+                         for c in controls]
+                assert len(set(edges)) == 1, (width, page, dict(zip(controls, edges)))
+                right = edges[0][1]
+                # content padding 30 + card border and padding 17 from the window's right edge
+                assert width - right <= 60, (width, page, f"controls end at {right}, {width - right} px from the right edge")
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
@@ -425,7 +450,8 @@ CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harn
           check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates,
           check_failed_update_check_says_why, check_progress_failure_stays_until_closed,
           check_pending_cancel_stays_visible, check_launch_window_keeps_its_size,
-          check_windows_ask_for_no_more_than_their_size, check_dropdowns_open_below_and_pick]
+          check_windows_ask_for_no_more_than_their_size, check_dropdowns_open_below_and_pick,
+          check_card_controls_line_up]
 
 
 def main():

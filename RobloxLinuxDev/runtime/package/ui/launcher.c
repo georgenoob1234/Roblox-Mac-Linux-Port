@@ -424,6 +424,11 @@ static int run_launcher(const char *root, gboolean settings_page) {
     gtk_stack_set_transition_duration(GTK_STACK(state->stack), 150);
     gtk_box_pack_start(GTK_BOX(main), state->stack, TRUE, TRUE, 0);
 
+    /* The controls at the right of a page's cards share one width, so they
+     * line up (George, 2026-11-15). The cursor switch keeps its own size. */
+    GtkSizeGroup *play_controls = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL), *update_controls = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+    GtkSizeGroup *appearance_controls = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL), *about_controls = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+
     /* Play */
     GtkWidget *play = page_box(NULL, NULL);
     GtkWidget *hero = hbox(22); add_class(hero, "hero");
@@ -445,10 +450,10 @@ static int run_launcher(const char *root, gboolean settings_page) {
     gchar *log_text = newest_log_text(root);
     GtkWidget *log_card = card("log", "Last log", log_text, &state->last_log); g_free(log_text);
     GtkWidget *log_button = button("Open _log", "log", NULL); g_signal_connect(log_button, "clicked", G_CALLBACK(open_log), state);
-    card_add(log_card, log_button); gtk_box_pack_start(GTK_BOX(play), log_card, FALSE, FALSE, 0);
+    card_add(log_card, log_button); gtk_size_group_add_widget(play_controls, log_button); gtk_box_pack_start(GTK_BOX(play), log_card, FALSE, FALSE, 0);
     GtkWidget *data_card = card("folder", "Data and logs", "Logs can contain account details; review them before sharing.", NULL);
     GtkWidget *data_button = button("Open _folder", NULL, NULL); g_signal_connect(data_button, "clicked", G_CALLBACK(open_data_folder), state);
-    card_add(data_card, data_button); gtk_box_pack_start(GTK_BOX(play), data_card, FALSE, FALSE, 0);
+    card_add(data_card, data_button); gtk_size_group_add_widget(play_controls, data_button); gtk_box_pack_start(GTK_BOX(play), data_card, FALSE, FALSE, 0);
     add_page(state, play, "play");
 
     /* Updates */
@@ -456,28 +461,28 @@ static int run_launcher(const char *root, gboolean settings_page) {
     GtkWidget *client_top = NULL, *client_actions = NULL;
     GtkWidget *client_card = action_card("download", "Roblox client", "", &state->client_sub, &client_top, &client_actions);
     state->client_pill = pill("…"); card_add(client_top, state->client_pill);
-    state->update = button("_Update now", "download", "primary"); g_signal_connect(state->update, "clicked", G_CALLBACK(settings_update), state); card_add(client_actions, state->update);
-    state->check = button("_Check for updates", NULL, NULL); g_signal_connect(state->check, "clicked", G_CALLBACK(settings_check), state); card_add(client_actions, state->check);
+    state->update = button("_Update now", "download", "primary"); g_signal_connect(state->update, "clicked", G_CALLBACK(settings_update), state); gtk_box_pack_start(GTK_BOX(client_actions), state->update, FALSE, FALSE, 0);
+    state->check = button("_Check for updates", NULL, NULL); g_signal_connect(state->check, "clicked", G_CALLBACK(settings_check), state); gtk_box_pack_start(GTK_BOX(client_actions), state->check, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(updates), client_card, FALSE, FALSE, 0);
     state->message_box = message_area(&state->message); gtk_box_pack_start(GTK_BOX(updates), state->message_box, FALSE, FALSE, 0);
     GtkWidget *port_top = NULL, *port_actions = NULL;
     GtkWidget *port_card = action_card("shield", "Roblox Mac Linux Port", "", &state->port_sub, &port_top, &port_actions);
     state->port_pill = pill("…"); card_add(port_top, state->port_pill);
-    state->port_update = button("Update p_ort", "download", "primary"); g_signal_connect(state->port_update, "clicked", G_CALLBACK(settings_port_update), state); card_add(port_actions, state->port_update);
-    state->port_check = button("Check for _port updates", NULL, NULL); g_signal_connect(state->port_check, "clicked", G_CALLBACK(settings_port_check), state); card_add(port_actions, state->port_check);
+    state->port_update = button("Update p_ort", "download", "primary"); g_signal_connect(state->port_update, "clicked", G_CALLBACK(settings_port_update), state); gtk_box_pack_start(GTK_BOX(port_actions), state->port_update, FALSE, FALSE, 0);
+    state->port_check = button("Check for _port updates", NULL, NULL); g_signal_connect(state->port_check, "clicked", G_CALLBACK(settings_port_check), state); gtk_box_pack_start(GTK_BOX(port_actions), state->port_check, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(updates), port_card, FALSE, FALSE, 0);
     state->port_message_box = message_area(&state->port_message_label); gtk_box_pack_start(GTK_BOX(updates), state->port_message_box, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(updates), label("When updates are found", "section"), FALSE, FALSE, 0);
     static const char *const modes[] = {"ask", "Ask first", "auto", "Automatically", "off", "Never", NULL};
     GtkWidget *mode_card = card("update", "Updates", "Ask before updating, update by itself, or never offer updates.", NULL);
-    state->mode = dropdown_new(modes, mode_changed, state); card_add(mode_card, state->mode);
+    state->mode = dropdown_new(modes, mode_changed, state); card_add(mode_card, state->mode); gtk_size_group_add_widget(update_controls, state->mode);
     gtk_box_pack_start(GTK_BOX(updates), mode_card, FALSE, FALSE, 0);
     static const char *const intervals[] = {"0", "Every launch", "6", "Every 6 hours", "24", "Once a day", "168", "Once a week", NULL};
     GtkWidget *interval_card = card("clock", "Look for updates", "A check never delays the game: a slow answer is offered at the next start.", NULL);
-    state->interval = dropdown_new(intervals, interval_changed, state); card_add(interval_card, state->interval);
+    state->interval = dropdown_new(intervals, interval_changed, state); card_add(interval_card, state->interval); gtk_size_group_add_widget(update_controls, state->interval);
     gtk_box_pack_start(GTK_BOX(updates), interval_card, FALSE, FALSE, 0);
     GtkWidget *skipped_card = card("close", "Skipped versions", "None", &state->skipped_sub);
-    state->forget_skipped = button("_Forget skipped", NULL, NULL); g_signal_connect(state->forget_skipped, "clicked", G_CALLBACK(forget_skipped), state); card_add(skipped_card, state->forget_skipped);
+    state->forget_skipped = button("_Forget skipped", NULL, NULL); g_signal_connect(state->forget_skipped, "clicked", G_CALLBACK(forget_skipped), state); card_add(skipped_card, state->forget_skipped); gtk_size_group_add_widget(update_controls, state->forget_skipped);
     gtk_box_pack_start(GTK_BOX(updates), skipped_card, FALSE, FALSE, 0);
     add_page(state, updates, "updates");
 
@@ -485,13 +490,13 @@ static int run_launcher(const char *root, gboolean settings_page) {
     GtkWidget *appearance = page_box("Appearance", "How the game window looks on your desktop. Applies on the next launch.");
     static const char *const decorations[] = {"auto", "Automatic", "system", "Desktop title bar", "gtk", "GTK title bar", "legacy", "Legacy compatibility", NULL};
     GtkWidget *decorations_card = card("window", "Window decorations", "Automatic uses your desktop's title bar when it offers one, else GTK's.", NULL);
-    state->decorations_combo = dropdown_new(decorations, decorations_changed, state); card_add(decorations_card, state->decorations_combo);
+    state->decorations_combo = dropdown_new(decorations, decorations_changed, state); card_add(decorations_card, state->decorations_combo); gtk_size_group_add_widget(appearance_controls, state->decorations_combo);
     gtk_box_pack_start(GTK_BOX(appearance), decorations_card, FALSE, FALSE, 0);
     GtkWidget *cursor_card = card("cursor", "Desktop cursor", "Use your system cursor theme and size; the game's own cursors still show. Off: Roblox's classic cursor.", NULL);
     state->cursor_switch = gtk_switch_new(); g_signal_connect(state->cursor_switch, "notify::active", G_CALLBACK(cursor_changed), state); card_add(cursor_card, state->cursor_switch);
     gtk_box_pack_start(GTK_BOX(appearance), cursor_card, FALSE, FALSE, 0);
     GtkWidget *reset_card = card("update", "Restore defaults", "Automatic decorations and the desktop cursor.", NULL);
-    GtkWidget *reset = button("_Restore defaults", NULL, NULL); g_signal_connect(reset, "clicked", G_CALLBACK(appearance_reset), state); card_add(reset_card, reset);
+    GtkWidget *reset = button("_Restore defaults", NULL, NULL); g_signal_connect(reset, "clicked", G_CALLBACK(appearance_reset), state); card_add(reset_card, reset); gtk_size_group_add_widget(appearance_controls, reset);
     gtk_box_pack_start(GTK_BOX(appearance), reset_card, FALSE, FALSE, 0);
     GtkWidget *appearance_box = message_area(&state->appearance_message); gtk_box_pack_start(GTK_BOX(appearance), appearance_box, FALSE, FALSE, 0);
     add_page(state, appearance, "appearance");
@@ -501,10 +506,10 @@ static int run_launcher(const char *root, gboolean settings_page) {
     GtkWidget *versions_card = card("about", "Versions", "", &state->about_versions);
     gtk_box_pack_start(GTK_BOX(about), versions_card, FALSE, FALSE, 0);
     GtkWidget *folder_card = card("folder", "Install folder", root, NULL);
-    GtkWidget *folder_button = button("Open _install folder", NULL, NULL); g_signal_connect(folder_button, "clicked", G_CALLBACK(open_install_folder), state); card_add(folder_card, folder_button);
+    GtkWidget *folder_button = button("Open _install folder", NULL, NULL); g_signal_connect(folder_button, "clicked", G_CALLBACK(open_install_folder), state); card_add(folder_card, folder_button); gtk_size_group_add_widget(about_controls, folder_button);
     gtk_box_pack_start(GTK_BOX(about), folder_card, FALSE, FALSE, 0);
     GtkWidget *project_card = card("shield", "Project page", "github.com/georgenoob1234/Roblox-Mac-Linux-Port", NULL);
-    GtkWidget *project_button = button("Open project _page", NULL, NULL); g_signal_connect(project_button, "clicked", G_CALLBACK(open_project), state); card_add(project_card, project_button);
+    GtkWidget *project_button = button("Open project _page", NULL, NULL); g_signal_connect(project_button, "clicked", G_CALLBACK(open_project), state); card_add(project_card, project_button); gtk_size_group_add_widget(about_controls, project_button);
     gtk_box_pack_start(GTK_BOX(about), project_card, FALSE, FALSE, 0);
     add_page(state, about, "about");
 
@@ -514,6 +519,8 @@ static int run_launcher(const char *root, gboolean settings_page) {
     gtk_box_pack_start(GTK_BOX(statusbar), spacer(), TRUE, TRUE, 0);
     state->status_port = gtk_label_new(""); gtk_box_pack_start(GTK_BOX(statusbar), state->status_port, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(outer), statusbar, FALSE, FALSE, 0);
+
+    g_object_unref(play_controls); g_object_unref(update_controls); g_object_unref(appearance_controls); g_object_unref(about_controls);
 
     /* A GtkStack ignores a switch to a page that is not visible yet, so the
      * window is shown before the first page is chosen (B10 defect 1). */

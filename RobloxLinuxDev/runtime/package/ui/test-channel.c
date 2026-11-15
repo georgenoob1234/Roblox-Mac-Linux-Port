@@ -4,7 +4,8 @@
  * positions. One command per line; one JSON line answers each:
  *   dump           every mapped window: title, and its mapped widgets in order
  *   click TEXT     press the mapped button labelled TEXT; refused if insensitive
- *   close [TITLE]  ask the (first, or named) window to close, as its X does */
+ *   close [TITLE]  ask the (first, or named) window to close, as its X does
+ *   resize W H     resize the first window (as the user or "maximize" would) */
 static FILE *ui_test_out;
 
 static char *ui_test_plain(const char *text) {
@@ -60,6 +61,10 @@ static void ui_test_widget(GtkWidget *widget, gpointer data) {
         json_builder_set_member_name(builder, "sensitive"); json_builder_add_boolean_value(builder, gtk_widget_is_sensitive(widget));
         int minimum = 0, natural = 0; gtk_widget_get_preferred_width(widget, &minimum, &natural);
         json_builder_set_member_name(builder, "wanted_width"); json_builder_add_int_value(builder, natural);
+        /* Where it is: x relative to its window, and its allocated width. */
+        int x = 0, y = 0; gtk_widget_translate_coordinates(widget, gtk_widget_get_toplevel(widget), 0, 0, &x, &y);
+        json_builder_set_member_name(builder, "x"); json_builder_add_int_value(builder, x);
+        json_builder_set_member_name(builder, "allocated_width"); json_builder_add_int_value(builder, gtk_widget_get_allocated_width(widget));
         if (GTK_IS_LABEL(widget)) {
             json_builder_set_member_name(builder, "text"); json_builder_add_string_value(builder, gtk_label_get_text(GTK_LABEL(widget)));
         } else if (GTK_IS_BUTTON(widget)) {
@@ -165,6 +170,10 @@ static void ui_test_command(const char *line) {
             if (!title || !g_strcmp0(gtk_window_get_title(item->data), title)) target = item->data;
         if (!target) ui_test_simple(FALSE, "no such window");
         else { ui_test_simple(TRUE, NULL); gtk_window_close(GTK_WINDOW(target)); }
+    } else if (g_str_has_prefix(line, "resize ")) {
+        int width = 0, height = 0;
+        if (sscanf(line + 7, "%d %d", &width, &height) != 2 || !windows) ui_test_simple(FALSE, "usage: resize WIDTH HEIGHT");
+        else { gtk_window_resize(windows->data, width, height); ui_test_simple(TRUE, NULL); }
     } else ui_test_simple(FALSE, "unknown command");
     g_list_free(windows);
 }

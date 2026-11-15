@@ -256,11 +256,30 @@ def check_prompt_close_and_cancel_mean_cancel(display, binary, tmp):
         assert ui.exited(3) == 4
 
 
+def check_prompt_lists_client_and_port_updates(display, binary, tmp):
+    """B10 flow 9 (George: one prompt for both): --dialog LATEST INSTALLED
+    [PORT_LATEST PORT_INSTALLED]; an empty pair means "no update of that kind"."""
+    def rows(windows):
+        return [text for text in Window.texts(windows) if "→" in text]
+    cases = [
+        (("0.748.0.7480000", "0.747.0.7471481", "v2026.11.20", "v2026.11.15"),
+         ["Roblox: 0.747.0.7471481 → 0.748.0.7480000", "Roblox Mac Linux Port: v2026.11.15 → v2026.11.20"]),
+        (("", "", "v2026.11.20", "v2026.11.15"), ["Roblox Mac Linux Port: v2026.11.15 → v2026.11.20"]),
+        (("0.748.0.7480000", "0.747.0.7471481"), ["Roblox: 0.747.0.7471481 → 0.748.0.7480000"]),
+    ]
+    for args, expected in cases:
+        with display.open(binary, "--dialog", *args) as ui:
+            windows = ui.wait(lambda w: Window.button(w, "Update now") is not None)
+            assert rows(windows) == expected, (args, rows(windows))
+            assert ui.send("click Skip this version") == {"ok": True}
+            assert ui.exited(3) == 2
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
           check_progress_stays_hidden_while_prompt_is_open, check_failed_port_check_says_why,
-          check_prompt_close_and_cancel_mean_cancel]
+          check_prompt_close_and_cancel_mean_cancel, check_prompt_lists_client_and_port_updates]
 
 
 def main():

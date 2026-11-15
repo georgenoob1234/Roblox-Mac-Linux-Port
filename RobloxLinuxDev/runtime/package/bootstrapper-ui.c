@@ -589,10 +589,20 @@ enum { PROMPT_UPDATE = 0, PROMPT_LAUNCH = 1, PROMPT_SKIP = 2, PROMPT_CANCEL = 4 
 static void dialog_finish(DialogState *state, int result) { state->result = result; gtk_main_quit(); }
 static gboolean dialog_delete(GtkWidget *window, GdkEvent *event, gpointer data) { dialog_finish(data, PROMPT_CANCEL); return TRUE; }
 static void dialog_button(GtkWidget *button, gpointer data) { dialog_finish(data, GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "result"))); }
-static int run_dialog(const char *latest, const char *installed) {
+/* The update prompt lists every update that is ready: the Roblox client
+ * (LATEST/INSTALLED) and the port (PORT_LATEST/PORT_INSTALLED); an empty
+ * LATEST means no update of that kind (B10 flow 9: one prompt for both). */
+static int run_dialog(const char *latest, const char *installed, const char *port_latest, const char *port_installed) {
     if (!ui_init()) return 3;
-    DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state.window), "Roblox update available"); setup_ui_identity(state.window, NULL); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(dialog_delete), &state);
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 26); gtk_container_add(GTK_CONTAINER(state.window), box); gtk_box_pack_start(GTK_BOX(box), label("A Roblox update is ready", "title"), FALSE, FALSE, 0); char *versions = g_strdup_printf("Installed: %s\nNew version: %s", *installed ? installed : "none", *latest ? latest : "available"); gtk_box_pack_start(GTK_BOX(box), label(versions, NULL), FALSE, FALSE, 0); g_free(versions); gtk_box_pack_start(GTK_BOX(box), label("Cancel stops here: nothing is updated and Roblox does not start.", "muted"), FALSE, FALSE, 0);
+    gboolean client = latest && *latest, port = port_latest && *port_latest;
+    DialogState state = {0}; state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(state.window), client && port ? "Updates available" : (port ? "Port update available" : "Roblox update available"));
+    setup_ui_identity(state.window, NULL); gtk_window_set_default_size(GTK_WINDOW(state.window), 500, 270); gtk_window_set_resizable(GTK_WINDOW(state.window), FALSE); gtk_window_set_modal(GTK_WINDOW(state.window), TRUE); gtk_window_set_position(GTK_WINDOW(state.window), GTK_WIN_POS_CENTER); g_signal_connect(state.window, "delete-event", G_CALLBACK(dialog_delete), &state);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 26); gtk_container_add(GTK_CONTAINER(state.window), box);
+    gtk_box_pack_start(GTK_BOX(box), label(client && port ? "Updates are ready" : (port ? "A port update is ready" : "A Roblox update is ready"), "title"), FALSE, FALSE, 0);
+    if (client) { char *row = g_strdup_printf("Roblox: %s → %s", installed && *installed ? installed : "none", latest); gtk_box_pack_start(GTK_BOX(box), label(row, NULL), FALSE, FALSE, 0); g_free(row); }
+    if (port) { char *row = g_strdup_printf("Roblox Mac Linux Port: %s → %s", port_installed && *port_installed ? port_installed : "unknown", port_latest); gtk_box_pack_start(GTK_BOX(box), label(row, NULL), FALSE, FALSE, 0); g_free(row); }
+    gtk_box_pack_start(GTK_BOX(box), label("Cancel stops here: nothing is updated and Roblox does not start.", "muted"), FALSE, FALSE, 0);
     GtkWidget *buttons = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL); gtk_button_box_set_layout(GTK_BUTTON_BOX(buttons), GTK_BUTTONBOX_END); gtk_box_set_spacing(GTK_BOX(buttons), 8); const char *names[] = {"Cancel", "Skip this version", "Launch without updating", "Update now"}; const int results[] = {PROMPT_CANCEL, PROMPT_SKIP, PROMPT_LAUNCH, PROMPT_UPDATE}; for (int i = 0; i < 4; ++i) { GtkWidget *button = gtk_button_new_with_mnemonic(names[i]); g_object_set_data(G_OBJECT(button), "result", GINT_TO_POINTER(results[i])); g_signal_connect(button, "clicked", G_CALLBACK(dialog_button), &state); gtk_container_add(GTK_CONTAINER(buttons), button); if (results[i] == PROMPT_LAUNCH) gtk_widget_grab_focus(button); if (results[i] == PROMPT_UPDATE) gtk_style_context_add_class(gtk_widget_get_style_context(button), "accent"); } gtk_box_pack_end(GTK_BOX(box), buttons, FALSE, FALSE, 0); gtk_widget_show_all(state.window); gtk_main(); gtk_widget_destroy(state.window); return state.result;
 }
 
@@ -971,7 +981,7 @@ int main(int argc, char **argv) {
     g_set_prgname("roblox-mac-port");
     g_set_application_name("Roblox");
     if (argc >= 2 && !strcmp(argv[1], "--progress")) return run_progress(argc >= 3 ? argv[2] : ".");
-    if (argc >= 4 && !strcmp(argv[1], "--dialog")) return run_dialog(argv[2], argv[3]);
+    if (argc >= 4 && !strcmp(argv[1], "--dialog")) return run_dialog(argv[2], argv[3], argc >= 6 ? argv[4] : "", argc >= 6 ? argv[5] : "");
     if (argc >= 3 && !strcmp(argv[1], "--settings")) return run_launcher(argv[2], TRUE);
     if (argc >= 3 && !strcmp(argv[1], "--launcher")) return run_launcher(argv[2], FALSE);
     return 2;

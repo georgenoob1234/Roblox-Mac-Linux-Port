@@ -13,6 +13,7 @@ DEFAULTS = {
     "auto_update": "ask",
     "check_interval_hours": 24,
     "skipped_version": "",
+    "skipped_port_version": "",
     "last_check": 0,
     "last_known_latest": "",
     "last_known_latest_display": "",
@@ -57,7 +58,7 @@ def read_settings(data):
             values[key] = max(0, int(values.get(key, 0)))
         except (TypeError, ValueError):
             values[key] = 0
-    for key in ("skipped_version", "last_known_latest", "last_known_latest_display", "port_latest"):
+    for key in ("skipped_version", "skipped_port_version", "last_known_latest", "last_known_latest_display", "port_latest"):
         value = values.get(key, "")
         values[key] = value if isinstance(value, str) else ""
     if values.get("window_decoration") not in VALID_DECORATIONS:
@@ -256,11 +257,15 @@ def main(argv):
                 value = ""
         print(value)
         return
-    if command == "due" and len(argv) == 4:
+    if command == "due" and len(argv) in (4, 5):
+        # due DATA NOW [last_check|port_last_check]: is that check due?
         values = read_settings(argv[2])
         now = int(argv[3])
+        key = argv[4] if len(argv) == 5 else "last_check"
+        if key not in ("last_check", "port_last_check"):
+            raise SystemExit(2)
         interval = values["check_interval_hours"]
-        print("1" if interval == 0 or now - values["last_check"] >= interval * 3600 else "0")
+        print("1" if interval == 0 or now - values[key] >= interval * 3600 else "0")
         return
     raise SystemExit(2)
 

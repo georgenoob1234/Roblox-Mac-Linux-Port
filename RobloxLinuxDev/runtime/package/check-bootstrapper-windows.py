@@ -137,8 +137,69 @@ def check_settings_opens_on_settings_page(display, binary, tmp):
             raise AssertionError(f"Settings is highlighted but the page shown is {Window.stack(ui.dump())!r}")
 
 
+class Progress:
+    """A progress window fed through a pipe, the way bootstrap.sh feeds it."""
+
+    def __init__(self, display, binary, tmp, state="open"):
+        self.root = fake_root(tmp)
+        if state is not None:
+            (self.root / ".bootstrap-cancel-state").write_text(state + "\n")
+        read, self.write = os.pipe()
+        self.ui = display.open(binary, "--progress", self.root, stdin=read)
+        os.close(read)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.write)
+        self.ui.__exit__(*exc)
+
+    def send(self, *args, **kwargs):
+        os.write(self.write, event(*args, **kwargs))
+
+
+def check_progress_shows_events_sent_before_it_appears(display, binary, tmp):
+    """An event that arrived during the window's 450 ms delay was dropped."""
+    with Progress(display, binary, tmp) as progress:
+        progress.send("downloading", 40, "Downloading Roblox", 400, 1000, cancellable=True)
+        windows = progress.ui.wait(lambda w: Window.widgets(w, "progress"))
+        try:
+            progress.ui.wait(lambda w: "Downloading Roblox" in Window.texts(w), timeout=2)
+        except AssertionError:
+            raise AssertionError(f"the first event is not shown: {Window.texts(progress.ui.dump())}")
+
+
+def check_progress_close_while_cancellable_cancels(display, binary, tmp):
+    """Closing the window is the same as pressing Cancel when Cancel is allowed."""
+    with Progress(display, binary, tmp) as progress:
+        progress.ui.wait(lambda w: Window.widgets(w, "progress"))
+        progress.send("downloading", 40, "Downloading Roblox", 400, 1000, cancellable=True)
+        progress.ui.wait(lambda w: (Window.button(w, "Cancel") or {}).get("sensitive"))
+        assert progress.ui.send("close") == {"ok": True}
+        progress.ui.wait(lambda w: any("Cancelling" in text for text in Window.texts(w)))
+        assert (progress.root / ".bootstrap-cancel").read_text() == "cancel\n"
+
+
+def check_progress_refused_close_says_why(display, binary, tmp):
+    """B10 defect 3: closing in a phase that cannot be cancelled did nothing
+    visible. The reason must stay on screen while progress continues."""
+    with Progress(display, binary, tmp, state="committing") as progress:
+        progress.ui.wait(lambda w: Window.widgets(w, "progress"))
+        progress.send("installing", 50, "Installing Roblox")
+        progress.ui.wait(lambda w: "Installing Roblox" in Window.texts(w))
+        assert progress.ui.send("close") == {"ok": True}
+        progress.send("installing", 60, "Installing Roblox (60%)")
+        windows = progress.ui.wait(lambda w: "Installing Roblox (60%)" in Window.texts(w))
+        reasons = [text for text in Window.texts(windows) if "can't be cancelled" in text or "cannot be cancelled" in text]
+        assert reasons, f"no reason visible after a refused close: {Window.texts(windows)}"
+        assert progress.ui.exited(0.5) is None, "the window closed although the phase cannot be cancelled"
+        assert not (progress.root / ".bootstrap-cancel").exists()
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
-          check_settings_opens_on_settings_page]
+          check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
+          check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why]
 
 
 def main():

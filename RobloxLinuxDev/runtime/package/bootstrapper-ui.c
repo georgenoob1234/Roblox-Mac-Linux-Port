@@ -207,7 +207,11 @@ static gboolean ui_init(void) {
 
 typedef struct {
     char *root, *cancel_file, *cancel_state;
-    GtkWidget *window, *phase, *status, *progress, *cancel;
+    GtkWidget *window, *phase, *status, *notice, *progress, *cancel;
+    /* The latest event, kept so a window that appears after it still shows it. */
+    char *last_phase, *last_message, *notice_phase;
+    gint64 last_percent, last_done, last_total;
+    gboolean seen_event;
     guint show_id, close_id, cancel_poll_id;
     gboolean done, cancellable, cancelled, closed, authoritative;
     int result;
@@ -286,6 +290,15 @@ static GtkWidget *label(const char *text, const char *class_name) {
     gtk_label_set_line_wrap(GTK_LABEL(widget), TRUE); return widget;
 }
 
+/* Feedback to the user's own action (a refused close, a refused or accepted
+ * cancel). It has its own line because every progress event rewrites the
+ * status line; it stays until the phase changes (B10 defect 3). */
+static void progress_notice(ProgressState *state, const char *text) {
+    g_free(state->notice_phase); state->notice_phase = g_strdup(state->last_phase ? state->last_phase : "");
+    if (!state->notice) return;
+    label_text(state->notice, text);
+    gtk_widget_set_visible(state->notice, text && *text);
+}
 static void progress_close(ProgressState *state, int result) {
     if (state->closed) return;
     state->closed = TRUE; state->result = result;
@@ -371,7 +384,7 @@ static void progress_request_cancel(ProgressState *state, GtkWidget *button) {
     if (result == CANCEL_ACCEPTED) {
         state->cancelled = TRUE; state->cancellable = FALSE;
         if (button) { gtk_button_set_label(GTK_BUTTON(button), "Cancelling…"); gtk_widget_set_sensitive(button, FALSE); }
-        label_text(state->status, "Cancelling…");
+        progress_notice(state, "Cancelling…");
         return;
     }
     /* Never claim the request was accepted unless it was recorded under a valid
@@ -379,9 +392,9 @@ static void progress_request_cancel(ProgressState *state, GtkWidget *button) {
     state->cancellable = FALSE;
     if (button) gtk_widget_set_sensitive(button, FALSE);
     if (result == CANCEL_REFUSED)
-        label_text(state->status, "This update is already being applied and can no longer be cancelled.");
+        progress_notice(state, "This update is already being applied and can no longer be cancelled.");
     else
-        label_text(state->status, "Cancellation is unavailable; the update status could not be verified safely.");
+        progress_notice(state, "Cancellation is unavailable; the update status could not be verified safely.");
 }
 /* The state file is authoritative, so poll it instead of trusting that the
  * non-cancellable progress event has already been processed: the commit may
@@ -396,7 +409,7 @@ static gboolean progress_poll_cancel(gpointer data) {
             state->cancellable = FALSE;
             gtk_widget_set_sensitive(state->cancel, FALSE);
             if (current == CANCEL_STATE_UNKNOWN)
-                label_text(state->status, "Cancellation is unavailable; the update status could not be verified safely.");
+                progress_notice(state, "Cancellation is unavailable; the update status could not be verified safely.");
         }
     }
     return G_SOURCE_CONTINUE;
@@ -407,7 +420,7 @@ static gboolean progress_delete(GtkWidget *window, GdkEvent *event, gpointer dat
     if (state->cancellable && !state->cancelled)
         progress_request_cancel(state, state->cancel);
     else if (!state->cancelled)
-        label_text(state->status, "Please wait; this phase cannot be cancelled safely.");
+        progress_notice(state, "This step can't be cancelled safely. The window closes by itself when it is done.");
     return TRUE;
 }
 static char *find_icon_path(const char *root) {
@@ -472,6 +485,7 @@ static void setup_ui_identity(GtkWidget *win, const char *root) {
     }
 }
 
+static void progress_apply(ProgressState *state);
 static gboolean progress_show(gpointer data) {
     ProgressState *state = data; state->show_id = 0; if (state->done) return G_SOURCE_REMOVE;
     state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL); gtk_window_set_title(GTK_WINDOW(state->window), "Roblox");
@@ -481,18 +495,21 @@ static gboolean progress_show(gpointer data) {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 14); gtk_container_set_border_width(GTK_CONTAINER(box), 24); gtk_container_add(GTK_CONTAINER(state->window), box);
     state->phase = label("Preparing", "subtitle"); gtk_box_pack_start(GTK_BOX(box), state->phase, FALSE, FALSE, 0);
     state->status = label("Setting up Roblox…", NULL); gtk_box_pack_start(GTK_BOX(box), state->status, FALSE, FALSE, 0);
+    state->notice = label(NULL, "muted"); gtk_box_pack_start(GTK_BOX(box), state->notice, FALSE, FALSE, 0);
     state->progress = gtk_progress_bar_new(); gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(state->progress), TRUE); gtk_box_pack_start(GTK_BOX(box), state->progress, FALSE, FALSE, 0);
     state->cancel = gtk_button_new_with_mnemonic("_Cancel"); gtk_widget_set_halign(state->cancel, GTK_ALIGN_END); g_signal_connect(state->cancel, "clicked", G_CALLBACK(progress_cancel), state); gtk_box_pack_start(GTK_BOX(box), state->cancel, FALSE, FALSE, 0);
     gtk_widget_set_sensitive(state->cancel, FALSE); gtk_widget_show_all(state->window);
+    gtk_widget_set_no_show_all(state->notice, TRUE); gtk_widget_hide(state->notice);
+    if (state->seen_event) progress_apply(state);
     state->cancel_poll_id = g_timeout_add(CANCEL_POLL_MS, progress_poll_cancel, state);
     return G_SOURCE_REMOVE;
 }
-static void progress_event(ProgressState *state, const char *line) {
-    JsonObject *object = parse_json(line); if (!object) return;
-    const char *message = json_string(object, "message"); const char *phase = json_string(object, "phase"); gint64 percent = json_int(object, "percent");
-    gint64 done = json_int(object, "bytes_done"); gint64 total = json_int(object, "bytes_total"); state->cancellable = json_bool(object, "cancellable");
+static void progress_apply(ProgressState *state) {
+    const char *phase = state->last_phase ? state->last_phase : "", *message = state->last_message ? state->last_message : "";
+    gint64 percent = state->last_percent, done = state->last_done, total = state->last_total;
     if (state->phase && *phase) { char *text = g_strdup_printf("Phase: %s", phase); label_text(state->phase, text); g_free(text); }
     if (state->status && *message) label_text(state->status, message);
+    if (state->notice && gtk_widget_get_visible(state->notice) && g_strcmp0(state->notice_phase, phase)) progress_notice(state, NULL);
     if (state->cancel && !state->cancelled) gtk_widget_set_sensitive(state->cancel, state->cancellable);
     if (state->progress) {
         if (percent >= 0) gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->progress), percent / 100.0);
@@ -501,6 +518,16 @@ static void progress_event(ProgressState *state, const char *line) {
         else if (percent >= 0) { char *text = g_strdup_printf("%lld%%", (long long)percent); gtk_progress_bar_set_text(GTK_PROGRESS_BAR(state->progress), text); g_free(text); }
         else gtk_progress_bar_set_text(GTK_PROGRESS_BAR(state->progress), "Working…");
     }
+}
+static void progress_event(ProgressState *state, const char *line) {
+    JsonObject *object = parse_json(line); if (!object) return;
+    const char *message = json_string(object, "message"); const char *phase = json_string(object, "phase");
+    state->cancellable = json_bool(object, "cancellable");
+    if (*phase) { g_free(state->last_phase); state->last_phase = g_strdup(phase); }
+    if (*message) { g_free(state->last_message); state->last_message = g_strdup(message); }
+    state->last_percent = json_int(object, "percent"); state->last_done = json_int(object, "bytes_done"); state->last_total = json_int(object, "bytes_total");
+    state->seen_event = TRUE;
+    if (state->window) progress_apply(state);
     if (!g_strcmp0(phase, "launching") || !g_strcmp0(phase, "update") ||
         !g_strcmp0(phase, "cancelled") || !g_strcmp0(phase, "failed")) {
         state->done = TRUE;
@@ -538,7 +565,7 @@ static int run_progress(const char *root) {
     if (!ui_init()) return 3;
     ProgressState *state = g_new0(ProgressState, 1); state->result = 1; state->root = g_strdup(root); state->cancel_file = g_build_filename(root, ".bootstrap-cancel", NULL); state->cancel_state = g_build_filename(root, ".bootstrap-cancel-state", NULL);
     state->show_id = g_timeout_add(UI_DELAY_MS, progress_show, state); GIOChannel *channel = g_io_channel_unix_new(STDIN_FILENO); g_io_channel_set_encoding(channel, NULL, NULL); g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL); g_io_add_watch(channel, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL, progress_input, state); gtk_main();
-    int result = state->authoritative ? state->result : (state->cancelled ? 4 : state->result); g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state->cancel_state); g_free(state); return result;
+    int result = state->authoritative ? state->result : (state->cancelled ? 4 : state->result); g_io_channel_unref(channel); g_free(state->root); g_free(state->cancel_file); g_free(state->cancel_state); g_free(state->last_phase); g_free(state->last_message); g_free(state->notice_phase); g_free(state); return result;
 }
 
 static void dialog_finish(DialogState *state, int result) { state->result = result; gtk_main_quit(); }

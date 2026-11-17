@@ -14,7 +14,9 @@ DEFAULTS = {
     "check_interval_hours": 24,
     "skipped_version": "",
     "skipped_port_version": "",
+    # Time of the last successful client check, and of the last attempt.
     "last_check": 0,
+    "last_attempt": 0,
     "last_known_latest": "",
     "last_known_latest_display": "",
     # Why the last client update check failed ("" after a successful one).
@@ -22,9 +24,14 @@ DEFAULTS = {
     "window_decoration": "auto",
     "cursor_appearance": "system",
     "port_last_check": 0,
+    "port_last_attempt": 0,
     "port_latest": "",
 }
 VALID_MODES = {"auto", "ask", "off"}
+TIMESTAMPS = ("last_check", "last_attempt", "port_last_check", "port_last_attempt")
+# A failed lookup (offline, GitHub rate limit) is retried after this long,
+# not at every launch; after a successful one check_interval_hours applies.
+RETRY_AFTER_FAILURE = 3600
 VALID_DECORATIONS = {"auto", "system", "gtk", "legacy"}
 VALID_CURSORS = {"system", "legacy"}
 KNOWN_DISPLAY_VERSIONS = {
@@ -55,7 +62,7 @@ def read_settings(data):
         values["check_interval_hours"] = max(0, interval)
     except (TypeError, ValueError):
         values["check_interval_hours"] = DEFAULTS["check_interval_hours"]
-    for key in ("last_check", "port_last_check"):
+    for key in TIMESTAMPS:
         try:
             values[key] = max(0, int(values.get(key, 0)))
         except (TypeError, ValueError):
@@ -191,7 +198,7 @@ def settings_change(data, operation, argv):
             raise SystemExit("cursor_appearance must be system or legacy")
         if key == "check_interval_hours":
             value = max(0, int(value))
-        elif key in {"last_check", "port_last_check"}:
+        elif key in TIMESTAMPS:
             value = max(0, int(value))
         values[key] = value
         write_settings(data, values)
@@ -268,7 +275,10 @@ def main(argv):
         if key not in ("last_check", "port_last_check"):
             raise SystemExit(2)
         interval = values["check_interval_hours"]
-        print("1" if interval == 0 or now - values[key] >= interval * 3600 else "0")
+        succeeded, attempted = values[key], values[key.replace("check", "attempt")]
+        # An attempt newer than the last success failed or is still running.
+        waiting = attempted > succeeded and 0 <= now - attempted < RETRY_AFTER_FAILURE
+        print("1" if interval == 0 or (not waiting and now - succeeded >= interval * 3600) else "0")
         return
     raise SystemExit(2)
 

@@ -28,7 +28,7 @@ APPIMAGE = r'''#!/bin/sh
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
   --shell) [ -z "${FIRST_RUN_ERROR:-}" ] || { echo "$FIRST_RUN_ERROR" >&2; exit 1; }; exit 0;;
-  --client-version) [ -z "${CHECK_ERROR:-}" ] || { echo "$CHECK_ERROR" >&2; exit 6; }; echo "${CLIENT_LATEST:-version-0000bb}"; exit 0;;
+  --client-version) echo client-check >> "$HERE/trace"; [ -z "${CHECK_ERROR:-}" ] || { echo "$CHECK_ERROR" >&2; exit 6; }; echo "${CLIENT_LATEST:-version-0000bb}"; exit 0;;
   --client-version-display) echo 0.748.0.7480000; exit 0;;
   --uri) shift; printf 'game port=%s client=%s uri=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$(cat "$HERE/RobloxVersion/.version")" "$1" "$*" >> "$HERE/trace"; exit 0;;
   *) printf 'game port=%s client=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$(cat "$HERE/RobloxVersion/.version")" "$*" >> "$HERE/trace"; exit 0;;
@@ -57,6 +57,7 @@ def trace(line):
     with open(os.path.join(here, "trace"), "a") as stream:
         stream.write(line + "\n")
 if sys.argv[1] == "release-status":
+    trace("port-check")
     latest = os.environ.get("PORT_LATEST", "")
     if not latest:
         print("! Could not query the latest GitHub release: could not reach GitHub (test).", file=sys.stderr)
@@ -278,8 +279,54 @@ def check_failures_say_what_why_and_where(tmp):
     assert checked.returncode == 0 and json.loads(checked.stdout)["settings"]["last_check_error"] == "", checked.stdout
 
 
+def check_failed_checks_retry_after_an_hour(tmp):
+    """A failed client or port lookup (offline, GitHub rate limit) is retried
+    an hour later, not at every launch; after a successful one the normal
+    interval applies. Settings' "Check for updates" always looks."""
+    release = make_release(tmp, {"auto_update": "ask", "check_interval_hours": 24})
+    settings_file = release / "DO_NOT_SHARE/bootstrapper.json"
+    def lookups():
+        trace = (release / "trace").read_text().splitlines()
+        (release / "trace").write_text("")
+        return [line for line in trace if line in ("client-check", "port-check")], trace
+    # Both lookups fail; the launch goes on and records no successful check.
+    result, trace, games = launch(release, "place", CHECK_ERROR="curl: (6) Could not resolve host (test)", PORT_LATEST="")
+    assert len(games) == 1, trace
+    done, trace = lookups()
+    assert sorted(done) == ["client-check", "port-check"], trace
+    settings = json.loads(settings_file.read_text())
+    assert settings["last_check"] == 0 and settings["port_last_check"] == 0, settings
+    # Within the hour neither lookup is repeated.
+    result, trace, games = launch(release, "place", CHECK_ERROR="curl: (6) Could not resolve host (test)", PORT_LATEST="")
+    done, trace = lookups()
+    assert len(games) == 1 and done == [], trace
+    # An hour later both are retried; they succeed and the updates are offered.
+    settings = json.loads(settings_file.read_text())
+    settings["last_attempt"] -= 3601; settings["port_last_attempt"] -= 3601
+    settings_file.write_text(json.dumps(settings))
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.2.0", PROMPT_ANSWER="1")
+    done, trace = lookups()
+    assert sorted(done) == ["client-check", "port-check"], trace
+    assert [line for line in trace if line.startswith("prompt")], trace
+    settings = json.loads(settings_file.read_text())
+    assert settings["last_check"] > 0 and settings["port_last_check"] > 0, settings
+    # After a success the 24-hour interval applies, even an hour later.
+    settings["last_attempt"] -= 3601; settings["port_last_attempt"] -= 3601
+    settings_file.write_text(json.dumps(settings))
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.2.0", PROMPT_ANSWER="1")
+    done, trace = lookups()
+    assert len(games) == 1 and done == [], trace
+    # Settings' "Check for updates" looks even when no check is due.
+    env = {**os.environ, "PATH": f"{quiet_tools(release)}:{os.environ['PATH']}", "DBUS_SESSION_BUS_ADDRESS": "",
+           "ROBLOX_MAC_NOTIFY_DBUS_SESSION_BUS_ADDRESS": "", "ROBLOX_MAC_NO_PROGRESS": "1", "CLIENT_LATEST": "version-0000cc"}
+    checked = subprocess.run([release / "bootstrap.sh", "check"], env=env, capture_output=True, text=True, timeout=60)
+    done, trace = lookups()
+    assert checked.returncode == 0 and done == ["client-check"], (trace, checked.stderr)
+    assert json.loads(checked.stdout)["latest_known"] == "version-0000cc", checked.stdout
+
+
 CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off, check_failures_say_what_why_and_where,
-          check_port_offer_only_when_newer]
+          check_port_offer_only_when_newer, check_failed_checks_retry_after_an_hour]
 
 
 def main():

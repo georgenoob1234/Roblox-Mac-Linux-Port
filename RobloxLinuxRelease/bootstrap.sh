@@ -562,17 +562,22 @@ lookup_deadline() {
 # updates", an explicit update) the answer is awaited; otherwise (a launch)
 # it is awaited for at most ROBLOX_MAC_UPDATE_CHECK_GRACE seconds (default 1)
 # and the launch goes on: the background lookup still records its answer, so
-# the update is offered at the next start (B10 flow 6). Returns 0 with a
-# fresh or not-yet-due answer, 1 when the lookup failed, 125 when cancelled.
+# the update is offered at the next start (B10 flow 6). A launch looks only
+# when a check is due (a failed one is retried an hour later); "wait" always
+# looks. Returns 0 with a fresh or not-yet-due answer, 1 when the lookup
+# failed, 125 when cancelled.
 check_latest() {
     if cancelled; then return 125; fi
     now=$(date +%s)
-    due=$(python3 "$HELPER" due "$DATA" "$now" 2>/dev/null || echo 1)
-    if [ "$due" != 1 ]; then
-        settings_get last_known_latest
-        return 0
+    if [ "${1:-}" != wait ]; then
+        due=$(python3 "$HELPER" due "$DATA" "$now" 2>/dev/null || echo 1)
+        if [ "$due" != 1 ]; then
+            settings_get last_known_latest
+            return 0
+        fi
     fi
-    settings_set last_check "$now" >/dev/null 2>&1 || true
+    # The attempt time also keeps launches meanwhile from starting a second lookup.
+    settings_set last_attempt "$now" >/dev/null 2>&1 || true
     check_result_file=$DATA/.check.$$
     rm -f -- "$check_result_file" "$check_result_file.tmp" "$check_result_file.abandoned"
     # The lookup must not keep the instance lock (9) or the progress pipe (8)
@@ -585,6 +590,7 @@ check_latest() {
         found=$(printf '%s\n' "$check_output" | sed -n '/^version-[0-9a-f][0-9a-f]*$/p' | tail -n 1)
         if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
             settings_set last_known_latest "$found" >/dev/null 2>&1 || true
+            settings_set last_check "$(date +%s)" >/dev/null 2>&1 || true
             settings_set last_check_error '' >/dev/null 2>&1 || true
             printf 'ok %s\n' "$found" > "$check_result_file.tmp"
         else
@@ -656,6 +662,7 @@ start_port_lookup() {
     now=$(date +%s)
     due=$(python3 "$HELPER" due "$DATA" "$now" port_last_check 2>/dev/null || echo 1)
     [ "$due" = 1 ] || return 0
+    settings_set port_last_attempt "$now" >/dev/null 2>&1 || true
     PORT_LOOKUP_FILE=$DATA/.port-check.$$
     rm -f -- "$PORT_LOOKUP_FILE" "$PORT_LOOKUP_FILE.tmp" "$PORT_LOOKUP_FILE.abandoned"
     lookup_deadline >/dev/null

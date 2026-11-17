@@ -374,24 +374,33 @@ def check_launch_window_keeps_its_size(display, binary, tmp):
         # On KDE Wayland the window takes the width it asks for; broadway
         # does not, so the wanted width is the one to hold steady.
         return max(window["width"], window["wanted_width"]), window["height"]
-    def settled(ui, test, timeout=3.0):
+    expected = {}
+    def settled(ui, test, step, timeout=3.0):
         deadline = time.monotonic() + timeout
+        seen = []
         while time.monotonic() < deadline:
             current = size(ui)
             time.sleep(0.4)  # longer than the slide animations
+            seen.append(current)
             if size(ui) == current and test(current):
                 return current
-        raise AssertionError(f"size did not settle as expected: {size(ui)}")
+        windows = ui.dump(); window = windows[0]
+        widest = sorted(Window.widgets(windows), key=lambda w: w.get("wanted_width", 0), reverse=True)[:6]
+        widest = [(w.get("type"), w.get("wanted_width"), w.get("allocated_width"), (w.get("text") or "")[:40]) for w in widest]
+        raise AssertionError(f"{step}: size did not settle as expected; expected width/compact {expected}, "
+                             f"last sizes {seen[-6:]}, window width {window['width']} wanted {window['wanted_width']}; "
+                             f"widest widgets (type, wanted, allocated, text): {widest}")
     with Progress(display, binary, tmp, state="committing") as progress:
         progress.ui.wait(lambda w: Window.widgets(w, "progress"))
         progress.send("installing", 90, "Replacing the client with the new version")
         progress.ui.wait(lambda w: "Replacing the client with the new version" in Window.texts(w))
-        width, compact = settled(progress.ui, lambda s: True)
+        width, compact = settled(progress.ui, lambda s: True, "compact")
+        expected.update(width=width, compact=compact)
         assert compact < 200, f"the launch window is not compact any more: {compact} px high"
         assert progress.ui.send("close") == {"ok": True}  # the refusal note slides in
-        settled(progress.ui, lambda s: s[0] == width and s[1] > compact)
+        settled(progress.ui, lambda s: s[0] == width and s[1] > compact, "refusal note")
         progress.send("verifying", 95, "Verifying the installed client")  # the note goes with the phase
-        settled(progress.ui, lambda s: s == (width, compact))
+        settled(progress.ui, lambda s: s == (width, compact), "note gone")
         long_reason = "Could not resolve host: setup.rbxcdn.com " + "(a long explanation that has to wrap) " * 4
         os.write(progress.write, (json.dumps({
             "phase": "failed", "percent": 0, "message": "Roblox update failed: " + long_reason,
@@ -399,10 +408,10 @@ def check_launch_window_keeps_its_size(display, binary, tmp):
             "hint": "The installed client was kept. Check your internet connection and try again later. " * 3,
             "log": "/home/someone-with-a-long-name/.local/opt/roblox-mac-linux-port/a/very/deep/folder/that/goes/on/DO_NOT_SHARE/launcher.log"}) + "\n").encode())
         progress.ui.wait(lambda w: Window.button(w, "Close") is not None)
-        settled(progress.ui, lambda s: s[0] == width)
+        settled(progress.ui, lambda s: s[0] == width, "red box")
         # The longest single line the window may hold: no text may widen it.
         progress.send("checking", -1, "Checking " + "a-very-long-word-without-spaces-" * 6)
-        settled(progress.ui, lambda s: s[0] == width)
+        settled(progress.ui, lambda s: s[0] == width, "long word")
 
 
 def check_windows_ask_for_no_more_than_their_size(display, binary, tmp):
@@ -493,6 +502,9 @@ CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harn
 def main():
     with tempfile.TemporaryDirectory(prefix="bootstrapper-windows ") as tmp:
         binary = build(tmp)
+        # Layout depends on these; machines that disagree on a size differ here first.
+        versions = subprocess.run(["pkg-config", "--modversion", "gtk+-3.0", "pango"], capture_output=True, text=True).stdout.split()
+        print(f"built against GTK {versions[0] if versions else '?'}, Pango {versions[1] if len(versions) > 1 else '?'}")
         try:
             display = Display().__enter__()
         except Unavailable as error:

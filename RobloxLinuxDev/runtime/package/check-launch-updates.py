@@ -325,8 +325,59 @@ def check_failed_checks_retry_after_an_hour(tmp):
     assert json.loads(checked.stdout)["latest_known"] == "version-0000cc", checked.stdout
 
 
+def check_no_client_is_installed_or_not_started(tmp):
+    """George (2026-11-15): with no Roblox client installed the launch asks
+    only to install it (Install / Cancel), whatever the update mode or a
+    skipped version, and never starts a client that is not there."""
+    def no_client(settings):
+        release = make_release(tmp, settings)
+        (release / "RobloxVersion/.version").unlink()
+        return release
+    def prompts(trace):
+        return [line for line in trace if line.startswith("prompt")]
+    # Ask, Off and a skipped version all show the install prompt; Install installs and plays.
+    for settings in ({"auto_update": "ask"}, {"auto_update": "off"},
+                     {"auto_update": "ask", "skipped_version": "version-0000bb"}):
+        release = no_client(settings)
+        result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", PROMPT_ANSWER="0")
+        assert prompts(trace) == ["prompt client=/0.748.0.7480000 port=/"], (settings, trace)
+        assert "client-update" in trace, (settings, trace)
+        expect_game(games, "place", "v1.1.1", "version-0000bb")
+    # Auto installs without asking.
+    release = no_client({"auto_update": "auto"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1")
+    assert not prompts(trace) and "client-update" in trace, trace
+    expect_game(games, "place", "v1.1.1", "version-0000bb")
+    # The lookup runs even when no check is due.
+    release = no_client({"auto_update": "ask", "check_interval_hours": 24, "last_check": int(time.time()),
+                         "last_known_latest": "version-0000aa"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", PROMPT_ANSWER="0")
+    assert "client-check" in trace and prompts(trace) == ["prompt client=/0.748.0.7480000 port=/"], trace
+    # Cancel, or any answer but Install, starts nothing.
+    for answer in ("4", "1", "2"):
+        release = no_client({"auto_update": "ask"})
+        result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", PROMPT_ANSWER=answer)
+        assert result.returncode == 125 and not games and "client-update" not in trace, (answer, trace)
+        settings = json.loads((release / "DO_NOT_SHARE/bootstrapper.json").read_text())
+        assert settings["skipped_version"] == "", (answer, settings)
+    # A failed install says so; nothing starts.
+    release = no_client({"auto_update": "auto"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1",
+                                  CLIENT_UPDATE_ERROR="curl: (6) Could not resolve host: setup.rbxcdn.com")
+    assert result.returncode == 1 and not games, trace
+    sent = [line for line in notifications(release) if "Roblox install failed" in line]
+    assert sent and "Could not resolve host: setup.rbxcdn.com" in sent[-1] and "was kept" not in sent[-1], notifications(release)
+    # A failed lookup says Roblox is not installed and why; nothing starts.
+    release = no_client({"auto_update": "ask"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", CHECK_ERROR="curl: (6) Could not resolve host (test)")
+    assert result.returncode == 1 and not games and not prompts(trace), trace
+    sent = [line for line in notifications(release) if "Roblox is not installed" in line]
+    assert sent and "Could not resolve host (test)" in sent[-1], notifications(release)
+
+
 CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off, check_failures_say_what_why_and_where,
-          check_port_offer_only_when_newer, check_failed_checks_retry_after_an_hour]
+          check_port_offer_only_when_newer, check_failed_checks_retry_after_an_hour,
+          check_no_client_is_installed_or_not_started]
 
 
 def main():

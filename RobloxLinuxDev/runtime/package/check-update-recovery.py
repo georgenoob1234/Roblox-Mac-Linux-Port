@@ -26,6 +26,7 @@ network, Darling runtime or real client is needed:
   16c. staged bundle symlinks are handled deliberately and persisted without error
 """
 import fcntl
+import json
 import os
 import shutil
 import subprocess
@@ -401,8 +402,17 @@ with tempfile.TemporaryDirectory(prefix="roblox recovery ") as tmpdir:
     assert (release / "launched").exists(), "S7: launcher did not reach its download/check path"
     assert not (release / ".update-work").exists(), "S7: stale staging not removed"
     assert lock_free(private), "S7: the launch stranded the instance lock"
-    assert_intact(private, before, "S7")
-    print("  PASS 7: a missing client with stale staging continues to the download/check path.")
+    # With no client the launch looks up the latest version even when no check
+    # is due, and installs it, so its settings record the lookup; the rest of
+    # DO_NOT_SHARE, and the user's own choices in the settings, are unchanged.
+    settings = json.loads((private / "bootstrapper.json").read_text())
+    assert (settings["auto_update"], settings["check_interval_hours"]) == ("off", 24), settings
+    assert (release / "RobloxVersion/.version").read_text().strip() == settings["last_known_latest"], settings
+    settings_files = ("bootstrapper.json", "bootstrapper.json.lock")
+    unchanged = {k: v for k, v in before.items() if k not in settings_files}
+    assert {k: v for k, v in snapshot(private).items() if k not in settings_files} == unchanged, "S7: DO_NOT_SHARE changed"
+    assert not list(private.glob(".update.*")), "S7: staging leaked into DO_NOT_SHARE"
+    print("  PASS 7: a missing client with stale staging is installed and started.")
 
     # 8. Crash after the install rename but before cleanup: keep the new client.
     release, private = make_release(tmp / "s8")

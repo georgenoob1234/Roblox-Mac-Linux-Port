@@ -279,6 +279,26 @@ def check_prompt_lists_client_and_port_updates(display, binary, tmp):
             assert ui.exited(3) == 2
 
 
+def check_prompt_without_client_offers_only_install(display, binary, tmp):
+    """George (2026-11-15): with no Roblox client installed, the prompt offers
+    only Install and Cancel: skipping or launching without it cannot work."""
+    for args in (("0.748.0.7480000", ""), ("0.748.0.7480000", "", "v2026.11.20", "v2026.11.15")):
+        with display.open(binary, "--dialog", *args) as ui:
+            windows = ui.wait(lambda w: Window.button(w, "Install") is not None)
+            texts = Window.texts(windows)
+            assert "Roblox is not installed yet" in texts, texts
+            assert "not installed → 0.748.0.7480000" in texts, texts
+            for absent in ("Update now", "Skip this version", "Launch without updating"):
+                assert Window.button(windows, absent) is None, (absent, texts)
+            assert Window.button(windows, "Cancel"), texts
+            assert ui.send("click Install") == {"ok": True}
+            assert ui.exited(3) == 0
+    with display.open(binary, "--dialog", "0.748.0.7480000", "") as ui:
+        ui.wait(lambda w: Window.button(w, "Install") is not None)
+        assert ui.send("click Cancel") == {"ok": True}
+        assert ui.exited(3) == 4
+
+
 def check_failed_update_check_says_why(display, binary, tmp):
     """B10 defect 2: Settings → Check for updates must say why it failed and
     where the log is (the launcher keeps the reason as last_check_error)."""
@@ -391,7 +411,8 @@ def check_windows_ask_for_no_more_than_their_size(display, binary, tmp):
     size: the prompt asked for 1006 px, the settings window for 925 px."""
     root = fake_root(tmp)
     for args in (["--dialog", "0.748.0.7480000", "0.747.0.7471481", "v2026.11.20", "v2026.11.15"],
-                 ["--dialog", "0.748.0.7480000", "0.747.0.7471481"], ["--settings", root], ["--launcher", root]):
+                 ["--dialog", "0.748.0.7480000", "0.747.0.7471481"], ["--dialog", "0.748.0.7480000", ""],
+                 ["--settings", root], ["--launcher", root]):
         with display.open(binary, *args) as ui:
             ui.wait(lambda w: w)
             time.sleep(0.5)
@@ -465,7 +486,8 @@ CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harn
           check_failed_update_check_says_why, check_progress_failure_stays_until_closed,
           check_pending_cancel_stays_visible, check_launch_window_keeps_its_size,
           check_windows_ask_for_no_more_than_their_size, check_dropdowns_open_below_and_pick,
-          check_card_controls_line_up, check_settings_port_update_only_when_newer]
+          check_card_controls_line_up, check_settings_port_update_only_when_newer,
+          check_prompt_without_client_offers_only_install]
 
 
 def main():

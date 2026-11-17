@@ -440,6 +440,9 @@ ask_update() {
     client_installed=$2
     port_latest=$3
     port_installed=$4
+    # No client installed: the only answers are install (0) and cancel (125).
+    installing=0
+    [ -n "$client_latest" ] && [ -z "$client_installed" ] && installing=1
     if [ -n "$UI_APP" ]; then
         # Readable client versions where they are known.
         client_shown=$client_latest
@@ -465,6 +468,9 @@ print(status.get("installed_display_version") or installed)' "$client_latest" "$
         choice=$?
         case "$choice" in
             0) return 0;;
+            1|2) [ "$installing" = 0 ] || return 125;;
+        esac
+        case "$choice" in
             1) return 1;;
             2)
                 [ -z "$client_latest" ] || settings_set skipped_version "$client_latest" >/dev/null 2>&1 || true
@@ -472,6 +478,10 @@ print(status.get("installed_display_version") or installed)' "$client_latest" "$
                 return 1;;
             4) return 125;;
         esac
+        if [ "$installing" = 1 ]; then
+            notify "The install prompt failed (status $choice); installing Roblox." 'Roblox install'
+            return 0
+        fi
         notify "The update prompt failed (status $choice); launching without updating." 'Roblox update'
         return 1
     fi
@@ -480,6 +490,26 @@ print(status.get("installed_display_version") or installed)' "$client_latest" "$
     if [ -n "$port_latest" ]; then
         [ -z "$what" ] || what="$what and "
         what="${what}the port $port_latest (installed: ${port_installed:-unknown})"
+    fi
+    if [ "$installing" = 1 ]; then
+        if [ -t 0 ] && [ -t 1 ]; then
+            say "Roblox is not installed yet. Install $what?"
+            say 'Choose: 1) Install  2) Cancel  [Enter = 1]'
+            if ! IFS= read -r answer </dev/tty 2>/dev/null; then return 125; fi
+            case "$answer" in ''|1) return 0;; *) return 125;; esac
+        fi
+        if command -v kdialog >/dev/null 2>&1; then
+            kdialog --title 'Install Roblox' --yes-label 'Install' --no-label 'Cancel' \
+                --yesno "Roblox is not installed yet. Install $what?" >/dev/null 2>&1
+            case $? in 0) return 0;; *) return 125;; esac
+        fi
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --question --title='Install Roblox' --ok-label='Install' --cancel-label='Cancel' \
+                --text="Roblox is not installed yet. Install $what?" >/dev/null 2>&1
+            case $? in 0) return 0;; *) return 125;; esac
+        fi
+        # Nobody to ask: Roblox was started, and it cannot start without the client.
+        return 0
     fi
     if [ -t 0 ] && [ -t 1 ]; then
         say "An update is available: $what."
@@ -748,7 +778,11 @@ do_update() {
             [ -n "$why" ] || why="the updater ended with status $update_status"
         fi
         rm -f -- "$update_errors"
-        report_failure 'Roblox update failed' "$why" 'The installed client was kept. Check your internet connection and try again later.'
+        if [ -n "$(installed_version)" ]; then
+            report_failure 'Roblox update failed' "$why" 'The installed client was kept. Check your internet connection and try again later.'
+        else
+            report_failure 'Roblox install failed' "$why" 'Roblox was not started. Check your internet connection and start Roblox again.'
+        fi
         return 1
     fi
     rm -f -- "$update_errors"
@@ -899,13 +933,18 @@ recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
 start_progress || { exec 9>&-; exit 1; }
 first_run || { exec 9>&-; finish_progress; exit 1; }
 installed=$(installed_version)
+# No client installed (George, 2026-11-15): look up the latest version even
+# when no check is due or updates are off, offer only Install (also over a
+# skipped version), and never start a client that is not there.
+client_missing=0
+[ -n "$installed" ] || client_missing=1
 event checking 25 'Checking for updates'
 mode=$(settings_get auto_update 2>/dev/null || printf 'ask')
 # A launch restarted after a port update already decided about updates.
 restarted=${ROBLOX_MAC_PORT_RESTARTED:-0}
 unset ROBLOX_MAC_PORT_RESTARTED
 [ "$mode" = off ] || [ "$restarted" = 1 ] || start_port_lookup
-latest=$(check_latest)
+if [ "$client_missing" = 1 ]; then latest=$(check_latest wait); else latest=$(check_latest); fi
 check_result=$?
 port_latest=$(finish_port_lookup)
 if [ "$check_result" -eq 125 ] || [ "$UI_CANCELLED" -eq 1 ]; then
@@ -913,10 +952,17 @@ if [ "$check_result" -eq 125 ] || [ "$UI_CANCELLED" -eq 1 ]; then
     notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
     exit 125
 fi
+if [ "$client_missing" = 1 ] && [ -z "$latest" ]; then
+    report_failure 'Roblox is not installed' "could not look up the latest version ($(settings_get last_check_error 2>/dev/null || true))" \
+        'Roblox was not started. Check your internet connection and start Roblox again.'
+    exec 9>&-; finish_progress; exit 1
+fi
 client_offer=
 port_offer=
 port_installed=
-if [ -n "$latest" ] && [ "$latest" != "$installed" ] && [ "$(settings_get skipped_version 2>/dev/null || true)" != "$latest" ]; then
+if [ "$client_missing" = 1 ]; then
+    client_offer=$latest
+elif [ -n "$latest" ] && [ "$latest" != "$installed" ] && [ "$(settings_get skipped_version 2>/dev/null || true)" != "$latest" ]; then
     client_offer=$latest
 fi
 if [ "$restarted" != 1 ] && [ -f "$HERE/installer.py" ] && [ -n "$port_latest" ]; then
@@ -932,8 +978,11 @@ if [ -n "$client_offer$port_offer" ]; then
     case "$mode" in
         auto) answer=0;;
         ask) ask_update "$client_offer" "$installed" "$port_offer" "$port_installed"; answer=$?;;
+        off) [ "$client_missing" = 0 ] || { ask_update "$client_offer" "$installed" "$port_offer" "$port_installed"; answer=$?; };;
     esac
 fi
+# Without a client, anything but Install ends the launch.
+[ "$client_missing" = 0 ] || [ "$answer" -eq 0 ] || answer=125
 if [ "$answer" -eq 125 ]; then
     event cancelled 0 'Launch cancelled' 0 0 false
     finish_progress
@@ -943,6 +992,8 @@ fi
 if [ "$answer" -eq 0 ] && [ -n "$client_offer" ]; then
     do_update; result=$?
     [ "$result" -eq 125 ] && { finish_progress; notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'; exit 125; }
+    # A failed install has nothing to start; do_update has said why.
+    [ -n "$(installed_version)" ] || { exec 9>&-; finish_progress; exit 1; }
 fi
 if [ "$answer" -eq 0 ] && [ -n "$port_offer" ]; then
     do_port_update; result=$?

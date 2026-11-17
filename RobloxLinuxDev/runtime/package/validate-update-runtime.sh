@@ -119,7 +119,7 @@ fail() { printf 'FAIL  %s\n' "$1" >&2; FAILED=1; }
 # (locks, temp downloads, uruntime extraction, --debug diagnostics).
 dns_snapshot() {
     (cd "$DNS" && find . -type f \
-        ! -name instance.lock ! -name bootstrapper.json \
+        ! -name instance.lock ! -name bootstrapper.json ! -name bootstrapper.json.lock \
         ! -path './tmp/*' ! -path './diagnostics/*' \
         ! -name '.version-query.*' ! -name '.check.*' ! -name '.bootstrap-*' \
         -exec md5sum {} \;) | sort

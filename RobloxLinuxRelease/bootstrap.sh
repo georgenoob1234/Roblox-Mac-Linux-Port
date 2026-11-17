@@ -615,8 +615,12 @@ check_latest() {
     (
         exec 8>&- 9>&-
         check_timeout=${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}
-        check_output=$(timeout "$check_timeout" "$APP" --client-version 2>"$check_result_file.err")
+        # Read the answer from a file, not a pipe: the AppImage runtime's FUSE
+        # daemon outlives the call and holds its stdout open for about 6 s.
+        timeout "$check_timeout" "$APP" --client-version >"$check_result_file.out" 2>"$check_result_file.err"
         check_status=$?
+        check_output=$(cat "$check_result_file.out" 2>/dev/null)
+        rm -f -- "$check_result_file.out"
         found=$(printf '%s\n' "$check_output" | sed -n '/^version-[0-9a-f][0-9a-f]*$/p' | tail -n 1)
         if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
             settings_set last_known_latest "$found" >/dev/null 2>&1 || true
@@ -639,7 +643,9 @@ check_latest() {
         rm -f -- "$check_result_file.err"
         mv -f -- "$check_result_file.tmp" "$check_result_file"
         if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
-            display=$(timeout "$check_timeout" "$APP" --client-version-display 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
+            timeout "$check_timeout" "$APP" --client-version-display >"$check_result_file.display" 2>/dev/null || true
+            display=$(sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' "$check_result_file.display" 2>/dev/null | tail -n 1)
+            rm -f -- "$check_result_file.display"
             [ -z "$display" ] || settings_set last_known_latest_display "$display" >/dev/null 2>&1 || true
         fi
         # Nobody will read an answer the launch stopped waiting for.
@@ -752,6 +758,10 @@ finish_port_lookup() {
     settings_get port_latest
 }
 
+# progress_fd: the descriptor children may report progress on, only while the
+# window's pipe is open on FD 8. Otherwise 8 is free and a child would write
+# into a pipe, socket or file of its own that landed there.
+progress_fd() { if [ "$UI_FD" = 1 ]; then printf 8; fi; }
 do_update() {
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
     event downloading 25 'Downloading Roblox' 0 0 true
@@ -759,7 +769,7 @@ do_update() {
     update_errors=$DATA/.update-errors.$$
     timeout --foreground --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
         'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 \
-            ROBLOX_MAC_PROGRESS_FD=8 ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
+            ROBLOX_MAC_PROGRESS_FD="$(progress_fd)" ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
             sh "$HERE/update-roblox.sh" 2>"$update_errors"
     update_status=$?
     keep_errors "$update_errors" update
@@ -787,8 +797,7 @@ do_update() {
     fi
     rm -f -- "$update_errors"
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
-    event verifying 78 'Verifying the downloaded client' 0 0 true
-    event preparing 90 'Preparing shaders' 0 0 true
+    # update-roblox.sh reported its own steps; do not wind the bar back.
     event update 100 'Update complete' 0 0 false
 }
 
@@ -815,7 +824,7 @@ do_port_update() {
     # interruption of the commit itself is repaired by the launcher's
     # recovery entry point on the next start.
     port_errors=$DATA/.port-update-errors.$$
-    env ROBLOX_MAC_PROGRESS_FD=8 \
+    env ROBLOX_MAC_PROGRESS_FD="$(progress_fd)" \
         ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
         ROBLOX_MAC_CANCEL_STATE_FILE="${ROBLOX_MAC_CANCEL_STATE_FILE:-}" \
         ROBLOX_MAC_LOCK_HELD=1 \

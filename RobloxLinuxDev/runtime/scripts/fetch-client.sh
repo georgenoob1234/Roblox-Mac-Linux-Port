@@ -15,7 +15,7 @@ case "$STALL" in ''|*[!0-9]*|0) STALL=60;; esac
 progress() {
     fd=${ROBLOX_MAC_PROGRESS_FD:-}
     case "$fd" in ''|*[!0-9]*) return 0;; esac
-    python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" <<'PY' >&$fd 2>/dev/null || true
+    python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" <<'PY' 2>/dev/null >&"$fd" || true
 import json, sys
 print(json.dumps({"phase": sys.argv[1], "percent": int(sys.argv[2]),
                   "message": sys.argv[3], "bytes_done": int(sys.argv[4]),

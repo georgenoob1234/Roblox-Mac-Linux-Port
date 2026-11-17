@@ -84,12 +84,22 @@ def prepare(item):
         return index,None,f'spirv-val rejected the adapted module: {detail or e}'
     except (ValueError,KeyError,OSError) as e:return index,None,str(e)
 
-def progress_reporter(total):
-    """With the updater's progress channel (ROBLOX_MAC_PROGRESS_FD), report the
-    validation as "Checking shaders (N of M)" from 86 to 90 %."""
+def claim_progress_fd():
+    """The updater's progress pipe is the descriptor ROBLOX_MAC_PROGRESS_FD
+    names only if it is open at startup; keep a private copy then. A number
+    that is not open is free, and subprocess's own pipes land on it later
+    (writing there aborted shader preparation once), so never write to it."""
     raw=os.environ.get('ROBLOX_MAC_PROGRESS_FD','')
-    if not raw.isdigit() or not total:return lambda done:None
-    fd=int(raw);step=max(1,total//100)
+    if not raw.isdigit():return None
+    try:os.fstat(int(raw));return os.dup(int(raw))
+    except OSError:return None
+PROGRESS_FD=claim_progress_fd()
+
+def progress_reporter(total):
+    """With the updater's progress channel, report the validation as
+    "Checking shaders (N of M)" from 86 to 90 %."""
+    if PROGRESS_FD is None or not total:return lambda done:None
+    fd=PROGRESS_FD;step=max(1,total//100)
     def report(done):
         if done%step and done!=total:return
         percent=86+done*4//total

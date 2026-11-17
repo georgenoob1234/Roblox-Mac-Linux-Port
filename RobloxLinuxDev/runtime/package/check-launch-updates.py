@@ -28,8 +28,10 @@ APPIMAGE = r'''#!/bin/sh
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 case "${1:-}" in
   --shell) [ -z "${FIRST_RUN_ERROR:-}" ] || { echo "$FIRST_RUN_ERROR" >&2; exit 1; }; exit 0;;
-  --client-version) echo client-check >> "$HERE/trace"; [ -z "${CHECK_ERROR:-}" ] || { echo "$CHECK_ERROR" >&2; exit 6; }; echo "${CLIENT_LATEST:-version-0000bb}"; exit 0;;
-  --client-version-display) echo 0.748.0.7480000; exit 0;;
+  --client-version) [ -z "${LINGER:-}" ] || sleep "$LINGER" &
+    echo client-check >> "$HERE/trace"; [ -z "${CHECK_ERROR:-}" ] || { echo "$CHECK_ERROR" >&2; exit 6; }; echo "${CLIENT_LATEST:-version-0000bb}"; exit 0;;
+  --client-version-display) [ -z "${LINGER:-}" ] || sleep "$LINGER" &
+    echo 0.748.0.7480000; exit 0;;
   --uri) shift; printf 'game port=%s client=%s uri=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$(cat "$HERE/RobloxVersion/.version")" "$1" "$*" >> "$HERE/trace"; exit 0;;
   *) printf 'game port=%s client=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$(cat "$HERE/RobloxVersion/.version")" "$*" >> "$HERE/trace"; exit 0;;
 esac
@@ -47,6 +49,7 @@ printf 'run.sh port=%s args=%s\n' "$(cat "$HERE/.roblox-mac-port-version")" "$*"
 UPDATER = r'''#!/bin/sh
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 echo 'client-update' >> "$HERE/trace"
+printf 'progress-fd=%s\n' "${ROBLOX_MAC_PROGRESS_FD:-}" >> "$HERE/trace"
 [ -z "${CLIENT_UPDATE_ERROR:-}" ] || { echo 'fetching client version-0000bb' >&2; echo "$CLIENT_UPDATE_ERROR" >&2; exit 1; }
 printf '%s\n' "${CLIENT_LATEST:-version-0000bb}" > "$HERE/RobloxVersion/.version"
 '''
@@ -375,9 +378,38 @@ def check_no_client_is_installed_or_not_started(tmp):
     assert sent and "Could not resolve host (test)" in sent[-1], notifications(release)
 
 
+def check_progress_fd_only_with_a_window(tmp):
+    """The updater is told about the progress pipe (FD 8) only when the window's
+    pipe is open. Without a window the number is free, and a child that wrote
+    to it would write into a pipe, socket or file of its own (2026-11-17)."""
+    release = make_release(tmp, {"auto_update": "auto"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1")
+    assert "progress-fd=8" in trace, trace
+    release = make_release(tmp, {"auto_update": "auto"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", ROBLOX_MAC_UI_APP="")
+    assert "client-update" in trace and "progress-fd=" in trace, trace
+    expect_game(games, "place", "v1.1.1", "version-0000bb")
+
+
+def check_lingering_appimage_daemon_does_not_delay(tmp):
+    """The AppImage runtime's FUSE daemon outlives each call and keeps the
+    call's stdout open for about 6 s (measured 2026-11-17). Output read through
+    a pipe waited for it: "Checking for updates" took 13.5 s and the 1 s launch
+    grace never got its answer. The fake leaves a child holding stdout 6 s."""
+    release = make_release(tmp, {"auto_update": "ask"})
+    started = time.monotonic()
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", PROMPT_ANSWER="1", LINGER="6",
+                                  ROBLOX_MAC_UPDATE_CHECK_GRACE="2")
+    elapsed = time.monotonic() - started
+    assert [l for l in trace if l.startswith("prompt")], ("the check missed the launch", trace)
+    assert elapsed < 5, f"launch took {elapsed:.1f} s"
+    expect_game(games, "place", "v1.1.1", "version-0000aa")
+
+
 CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off, check_failures_say_what_why_and_where,
           check_port_offer_only_when_newer, check_failed_checks_retry_after_an_hour,
-          check_no_client_is_installed_or_not_started]
+          check_no_client_is_installed_or_not_started, check_progress_fd_only_with_a_window,
+          check_lingering_appimage_daemon_does_not_delay]
 
 
 def main():

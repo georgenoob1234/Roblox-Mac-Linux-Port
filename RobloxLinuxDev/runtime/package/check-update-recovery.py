@@ -64,7 +64,7 @@ assert "trap 'exit 130' INT" in UPDATE and "trap 'exit 143' TERM HUP" in UPDATE
 assert 'exec 7<"$HERE"' in UPDATE
 assert 'flock -n -E 74 7' in UPDATE
 assert 'exec 8<"$HERE"' not in UPDATE
-assert '--client-version 7>&- 8>&- 9>&-' in UPDATE
+assert '--client-version >"$version_file" 7>&- 8>&- 9>&-' in UPDATE
 assert '--download-client 7>&- 9>&-' in UPDATE
 # Shader preparation keeps FD 8 too: it reports its progress there.
 assert '--prepare-shaders 7>&- 9>&-' in UPDATE

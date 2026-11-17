@@ -124,16 +124,34 @@ TXN_OUTCOME_CLEANUP_PENDING = "cleanup-pending"
 TXN_OUTCOME_DURABILITY_PENDING = "durability-pending"
 
 
-def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
-                   bytes_total: int = 0, cancellable: bool = True) -> None:
+def _claim_progress_fd() -> int | None:
+    """ROBLOX_MAC_PROGRESS_FD names the launcher's progress pipe. Only a
+    descriptor that is open now, before this process has opened anything of
+    its own, is that pipe; keep a private copy of it. When the number is not
+    open it is free, and a later socket or file of ours could land on it, so
+    never write to it then."""
     raw_fd = os.environ.get("ROBLOX_MAC_PROGRESS_FD", "")
     if not raw_fd.isdigit():
+        return None
+    try:
+        os.fstat(int(raw_fd))
+        return os.dup(int(raw_fd))
+    except OSError:
+        return None
+
+
+_PROGRESS_FD = _claim_progress_fd()
+
+
+def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
+                   bytes_total: int = 0, cancellable: bool = True) -> None:
+    if _PROGRESS_FD is None:
         return
     payload = json.dumps({"phase": phase, "percent": percent, "message": message,
                           "bytes_done": bytes_done, "bytes_total": bytes_total,
                           "cancellable": bool(cancellable)}, separators=(",", ":"))
     try:
-        os.write(int(raw_fd), (payload + "\n").encode())
+        os.write(_PROGRESS_FD, (payload + "\n").encode())
     except (OSError, ValueError):
         pass
 

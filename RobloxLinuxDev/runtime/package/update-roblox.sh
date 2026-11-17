@@ -15,7 +15,7 @@ mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 progress() {
     fd=${ROBLOX_MAC_PROGRESS_FD:-}
     case "$fd" in ''|*[!0-9]*) return 0;; esac
-    python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" <<'PY' >&$fd 2>/dev/null || true
+    python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" <<'PY' 2>/dev/null >&"$fd" || true
 import json, sys
 print(json.dumps({"phase": sys.argv[1], "percent": int(sys.argv[2]),
                   "message": sys.argv[3], "bytes_done": int(sys.argv[4]),
@@ -42,7 +42,14 @@ fi
 # AppImage runtime's FUSE daemon outlives its command (it keeps the mount for
 # reuse) and would strand the instance lock and the update lock until it
 # exits. bootstrap.sh defends its updater children the same way.
-version=$(sh "$HERE/run.sh" --client-version 7>&- 8>&- 9>&-)
+# Read the answer from a file, not a pipe: the AppImage runtime's FUSE daemon
+# outlives the call and holds its stdout open for about 6 s.
+version_file=$(mktemp "${TMPDIR:-/tmp}/roblox-version.XXXXXX")
+if ! sh "$HERE/run.sh" --client-version >"$version_file" 7>&- 8>&- 9>&-; then
+    # The lookup's own error (curl's reason) is the last line on stderr.
+    rm -f -- "$version_file"; exit 1
+fi
+version=$(cat "$version_file"); rm -f -- "$version_file"
 # Extract-and-run may print filesystem progress before the application's output.
 version=$(printf '%s\n' "$version" | sed -n '/^version-[0-9a-f][0-9a-f]*$/p')
 [ -n "$version" ] || { echo 'Could not read the current Roblox version.' >&2; exit 1; }
@@ -71,9 +78,26 @@ PY
 }
 sync_tree() {
     # Sync every file of the staged client and every directory, bottom-up, so
-    # a directory entry is only durable after the content it names.
+    # a directory entry is only durable after the content it names. One
+    # syncfs first writes everything out in one go: straight after unpacking
+    # and preparing shaders, thousands of single fsyncs took 16 s on btrfs
+    # (e2e 2026-11-17); after it they find nothing left and only check.
     python3 - "$1" <<'PY'
-import os, stat, sys
+import ctypes, os, stat, sys
+
+try:
+    syncfs = ctypes.CDLL(None, use_errno=True).syncfs
+except (AttributeError, OSError):
+    syncfs = None
+if syncfs is not None:
+    fd = os.open(sys.argv[1], os.O_RDONLY)
+    try:
+        if syncfs(fd) != 0:
+            err = ctypes.get_errno()
+            sys.stderr.write(f"roblox: could not write the staged client to disk: {os.strerror(err)}\n")
+            sys.exit(1)
+    finally:
+        os.close(fd)
 
 def on_error(err):
     sys.stderr.write(f"roblox: could not read staged directory {err.filename or sys.argv[1]}: {err}\n")
@@ -207,6 +231,7 @@ fi
 # Make the staged client's contents durable before recording the commit: the
 # marker must never promise a client whose files could still read back as
 # zero-length after power loss.
+progress installing 92 'Saving the new client to disk' 0 0 false
 sync_tree "$WORK/next"
 # Commit point: durably record the swap before the renames so a crash between
 # them is recoverable. The marker's existence is the commit signal — its text
@@ -224,6 +249,7 @@ for path in (os.path.dirname(marker), os.path.dirname(os.path.dirname(marker))):
     os.fsync(fd)
     os.close(fd)
 PY
+progress installing 97 'Installing the new client' 0 0 false
 [ ! -e "$HERE/RobloxVersion" ] || mv "$HERE/RobloxVersion" "$WORK/previous"
 # Sync both sides of the rename: the client leaving $HERE and the backup
 # appearing in $WORK. From here on, every crash lands inside the window the

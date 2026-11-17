@@ -59,6 +59,9 @@ jobs:
       - name: Run launcher entry failure tests
         run: python3 -B RobloxLinuxDev/runtime/package/check-run-failures.py
 
+      - name: Run progress descriptor tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-progress-fd.py
+
       - name: Run bootstrapper window tests
         env:
           ROBLOX_MAC_REQUIRE_UI_CHECK: "1"

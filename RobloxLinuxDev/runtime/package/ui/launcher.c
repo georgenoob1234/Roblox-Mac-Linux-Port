@@ -56,6 +56,27 @@ static void interval_select(LauncherState *state, gint64 hours) {
         dropdown_set_active(state->interval, id);
     }
 }
+/* A release version is v1.2.3 (the "v" optional); anything else (a commit id,
+ * "dev") is a custom build. Same rule as port_is_newer in bootstrap.sh. */
+static gboolean release_parts(const char *value, guint64 parts[8], int *count) {
+    if (!value) return FALSE;
+    if (*value == 'v') value++;
+    *count = 0;
+    for (;;) {
+        if (!g_ascii_isdigit(*value) || *count == 8) return FALSE;
+        char *end = NULL; parts[(*count)++] = g_ascii_strtoull(value, &end, 10); value = end;
+        if (!*value) return TRUE;
+        if (*value++ != '.') return FALSE;
+    }
+}
+/* <0, 0, >0 like strcmp; missing trailing parts count as 0 (v1.2 == v1.2.0). */
+static int release_compare(const guint64 *a, int a_count, const guint64 *b, int b_count) {
+    for (int i = 0; i < MAX(a_count, b_count); i++) {
+        guint64 x = i < a_count ? a[i] : 0, y = i < b_count ? b[i] : 0;
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return 0;
+}
 static void settings_refresh(LauncherState *state) {
     state->refreshing = TRUE;
     JsonObject *object = settings_status(state);
@@ -106,15 +127,23 @@ static void settings_refresh(LauncherState *state) {
     run_release(state->root, "port-version", NULL, NULL, &port_version);
     if (port_version) g_strstrip(port_version);
     const char *port_latest = settings ? json_string(settings, "port_latest") : "";
-    state->port_update_available = port_version && *port_version && *port_latest && g_strcmp0(port_version, port_latest);
+    guint64 installed_parts[8], latest_parts[8]; int installed_count = 0, latest_count = 0;
+    gboolean installed_release = release_parts(port_version, installed_parts, &installed_count);
+    gboolean latest_release = release_parts(port_latest, latest_parts, &latest_count);
+    gboolean custom_build = port_version && *port_version && !installed_release;
+    state->port_update_available = installed_release && latest_release
+        && release_compare(installed_parts, installed_count, latest_parts, latest_count) < 0;
     char *port_checked = when_text(settings ? json_int(settings, "port_last_check") : 0);
     char *port_line = g_strdup_printf("Installed %s · newest %s · checked %s", port_version && *port_version ? port_version : "unknown",
                                       *port_latest ? port_latest : "not known yet", port_checked);
     label_text(state->port_sub, port_line); g_free(port_line); g_free(port_checked);
-    pill_set(state->port_pill, state->port_update_available ? "Update available" : "Up to date", state->port_update_available);
-    gtk_widget_set_visible(state->port_pill, *port_latest != '\0');
+    pill_set(state->port_pill, custom_build ? "Custom build" : (state->port_update_available ? "Update available" : "Up to date"), state->port_update_available);
+    gtk_widget_set_visible(state->port_pill, custom_build || *port_latest != '\0');
     gtk_widget_set_sensitive(state->port_update, !state->port_check_in_progress && !state->port_handoff && !state->running && state->port_update_available);
-    gtk_widget_set_tooltip_text(state->port_update, state->running ? "Close Roblox before updating the port." : (state->port_update_available ? "Install the latest port release." : "No port update is available."));
+    gtk_widget_set_tooltip_text(state->port_update, state->running ? "Close Roblox before updating the port."
+        : state->port_update_available ? "Install the latest port release."
+        : custom_build ? "This is a custom build; releases are not offered as updates to it."
+        : "No port update is available.");
     gtk_widget_set_sensitive(state->port_check, !state->port_check_in_progress && !state->port_handoff);
     if (!state->port_check_in_progress && !state->port_handoff) {
         if (state->running) port_message(state, "Close Roblox before updating the port.");
@@ -124,7 +153,7 @@ static void settings_refresh(LauncherState *state) {
     /* About and the status bar. */
     char *versions = g_strdup_printf("Port %s · client %s", port_version && *port_version ? port_version : "unknown", *current ? current : "not installed");
     label_text(state->about_versions, versions); label_text(state->status_versions, versions); g_free(versions);
-    label_text(state->status_port, !*port_latest ? "" : (state->port_update_available ? "● Port update available" : "● Port up to date"));
+    label_text(state->status_port, custom_build ? "● Custom build" : !*port_latest ? "" : (state->port_update_available ? "● Port update available" : "● Port up to date"));
     GtkStyleContext *status_context = gtk_widget_get_style_context(state->status_port);
     gtk_style_context_remove_class(status_context, state->port_update_available ? "ok" : "new");
     gtk_style_context_add_class(status_context, state->port_update_available ? "new" : "ok");

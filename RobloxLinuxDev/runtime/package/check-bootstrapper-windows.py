@@ -443,6 +443,20 @@ def check_card_controls_line_up(display, binary, tmp):
                 assert width - right <= 60, (width, page, f"controls end at {right}, {width - right} px from the right edge")
 
 
+def check_settings_port_update_only_when_newer(display, binary, tmp):
+    """Settings offers "Update port" only when the latest release is newer
+    than a release-style installed version; a custom build is told so."""
+    for installed, latest, offered, pill in (("v1.1.1", "v1.2.0", True, "Update available"),
+                                             ("v1.2.0", "v1.2.0", False, "Up to date"),
+                                             ("v1.3.0", "v1.2.0", False, "Up to date"),
+                                             ("fc2ec72", "v1.2.0", False, "Custom build")):
+        status = json.loads(json.dumps(STATUS)); status["settings"]["port_latest"] = latest
+        root = fake_root(tmp, status=status, port_version=installed)
+        with display.open(binary, "--settings", root) as ui:
+            windows = ui.wait(lambda w: Window.button(w, "Update port") is not None and pill in Window.texts(w))
+            assert Window.button(windows, "Update port")["sensitive"] == offered, (installed, latest)
+
+
 CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harness_reads_prompt,
           check_settings_opens_on_settings_page, check_progress_shows_events_sent_before_it_appears,
           check_progress_close_while_cancellable_cancels, check_progress_refused_close_says_why,
@@ -451,7 +465,7 @@ CHECKS = [check_harness_reads_launcher, check_harness_reads_progress, check_harn
           check_failed_update_check_says_why, check_progress_failure_stays_until_closed,
           check_pending_cancel_stays_visible, check_launch_window_keeps_its_size,
           check_windows_ask_for_no_more_than_their_size, check_dropdowns_open_below_and_pick,
-          check_card_controls_line_up]
+          check_card_controls_line_up, check_settings_port_update_only_when_newer]
 
 
 def main():

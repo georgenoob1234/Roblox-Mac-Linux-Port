@@ -53,6 +53,12 @@ jobs:
       - name: Run launch-with-updates tests
         run: python3 -B RobloxLinuxDev/runtime/package/check-launch-updates.py
 
+      - name: Run client download failure tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-client-download.py
+
+      - name: Run launcher entry failure tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-run-failures.py
+
       - name: Run bootstrapper window tests
         env:
           ROBLOX_MAC_REQUIRE_UI_CHECK: "1"

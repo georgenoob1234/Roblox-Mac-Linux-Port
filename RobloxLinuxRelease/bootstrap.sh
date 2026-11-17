@@ -821,7 +821,7 @@ do_update() {
     if [ "$update_final" = 1 ]; then
         event update 100 'Update complete' 0 0 false
     else
-        event complete 100 'Roblox updated' 0 0 true
+        event complete 100 'Roblox updated' 0 0 false
     fi
 }
 

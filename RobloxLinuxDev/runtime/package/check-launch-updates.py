@@ -440,6 +440,8 @@ def check_window_stays_until_the_last_step(tmp):
         events = events_of(release)
         phases = [e["phase"] for e in events]
         done = phases.index("complete")
+        # The update is installed by then: Cancel must not be offered (review 2026-11-17).
+        assert events[done]["cancellable"] is False, events[done]
         assert "update" not in phases[:done], (port_latest, phases)
         if port_latest == "v1.1.1":
             assert "update" not in phases and phases[-1] == "launching", phases

@@ -267,7 +267,7 @@ fsync_dir "$HERE" "$WORK"
 # "update" closes the window; when the launcher has more to do in it (the
 # launch, a port update) it asks for a step that keeps the window open.
 if [ "${ROBLOX_MAC_UPDATE_FINAL:-1}" = 0 ]; then
-    progress complete 100 'Roblox updated' 0 0 true
+    progress complete 100 'Roblox updated' 0 0 false
 else
     progress update 100 'Update complete' 0 0 false
 fi

@@ -170,10 +170,13 @@ esac
     with zipfile.ZipFile(archive, 'w') as z:
         z.writestr('../escaped', 'bad')
     curl = fakebin / 'curl'
+    # The fake writes where -o says, wherever the real options put it.
     curl.write_text('''#!/bin/sh
+case "$1" in *I*) exit 0;; esac
+out=; prev=; for arg in "$@"; do [ "$prev" = -o ] && out=$arg; prev=$arg; done
 case "$*" in
 *client-version*) echo '{"clientVersionUpload":"version-abcd"}';;
-*) cp "$TEST_ARCHIVE" "$3";;
+*) cp "$TEST_ARCHIVE" "$out";;
 esac
 ''')
     curl.chmod(0o755)
@@ -182,7 +185,7 @@ esac
     (version / '.version').write_text('version-old')
     result = subprocess.run([root / 'scripts/fetch-client.sh'], capture_output=True,
         env={**env, 'PATH': str(fakebin) + ':' + env['PATH'], 'TEST_ARCHIVE': str(archive), 'ROBLOX_MAC_DATA': str(version)})
-    assert result.returncode and b'Unsafe client archive' in result.stderr
+    assert result.returncode and b'unsafe file path' in result.stderr
     assert original.read_bytes() == before and not (folder / 'escaped').exists()
 
     # Real downloader: a CDN connection reset must be retried, not fatal.
@@ -195,6 +198,7 @@ esac
     state = folder / 'curl-state'
     curl.write_text('''#!/bin/sh
 case "$1" in *I*) exit 0;; esac
+out=; prev=; for arg in "$@"; do [ "$prev" = -o ] && out=$arg; prev=$arg; done
 case "$*" in
 *client-version*) echo '{"clientVersionUpload":"version-abcd"}';;
 *)
@@ -205,7 +209,7 @@ case "$*" in
         echo 'curl: (35) Recv failure: Connection reset by peer' >&2
         exit 35
     fi
-    cp "$TEST_ARCHIVE" "$3"
+    cp "$TEST_ARCHIVE" "$out"
     ;;
 esac
 ''')

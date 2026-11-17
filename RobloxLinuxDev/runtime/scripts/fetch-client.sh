@@ -4,6 +4,13 @@
 set -eu
 DATA=${ROBLOX_MAC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/roblox-mac}
 CHANNEL=${ROBLOX_CHANNEL:-MacPlayer}
+# Overridable for check-client-download.py's local fake server only.
+VERSION_URL=${ROBLOX_MAC_CLIENT_VERSION_URL:-https://clientsettingscdn.roblox.com/v2/client-version/$CHANNEL}
+CDN=${ROBLOX_MAC_CLIENT_CDN:-https://setup.rbxcdn.com}
+# A connection that sends nothing for this long has stalled: give up on it
+# (and retry the download) instead of waiting for the 30 minute update timeout.
+STALL=${ROBLOX_MAC_DOWNLOAD_STALL_SECONDS:-60}
+case "$STALL" in ''|*[!0-9]*|0) STALL=60;; esac
 
 progress() {
     fd=${ROBLOX_MAC_PROGRESS_FD:-}
@@ -25,13 +32,16 @@ query=$(mktemp "$DATA/.version-query.XXXXXX")
 query_cleanup() { rm -f -- "$query"; }
 trap query_cleanup EXIT
 
-curl -fsSL "https://clientsettingscdn.roblox.com/v2/client-version/$CHANNEL" > "$query"
+curl -fsSL --connect-timeout "$STALL" --max-time "$STALL" "$VERSION_URL" > "$query"
 metadata=$(python3 - "$query" <<'PY'
 import json, re, sys
-raw = json.loads(open(sys.argv[1], encoding="utf-8").read())
-version = raw.get("clientVersionUpload", "")
-if not re.fullmatch(r"version-[0-9a-f]+", version):
-    raise SystemExit("Invalid client version")
+try:
+    raw = json.loads(open(sys.argv[1], encoding="utf-8").read())
+    version = raw.get("clientVersionUpload", "")
+except (OSError, ValueError, AttributeError):
+    version = ""
+if not isinstance(version, str) or not re.fullmatch(r"version-[0-9a-f]+", version):
+    raise SystemExit("Roblox's version service gave an unexpected answer")
 display = ""
 for key in ("version", "clientVersion", "versionString", "displayVersion", "clientVersionString"):
     value = raw.get(key)
@@ -66,8 +76,8 @@ cleanup() {
 trap 'query_cleanup; cleanup' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-URL="https://setup.rbxcdn.com/mac/$V-RobloxPlayer.zip"
-total=$(curl -fsSLI "$URL" 2>/dev/null | awk 'tolower($1) == "content-length:" {gsub("\r", "", $2); print $2; exit}') || total=
+URL="$CDN/mac/$V-RobloxPlayer.zip"
+total=$(curl -fsSLI --connect-timeout "$STALL" --max-time "$STALL" "$URL" 2>/dev/null | awk 'tolower($1) == "content-length:" {gsub("\r", "", $2); print $2; exit}') || total=
 case "$total" in ''|*[!0-9]*) total=0;; esac
 progress downloading 25 "Downloading Roblox" 0 "$total"
 # A CDN connection reset must not fail the whole update: retry the fetch a
@@ -75,7 +85,8 @@ progress downloading 25 "Downloading Roblox" 0 "$total"
 attempt=1
 max_attempts=3
 while :; do
-    curl -fsSL -o "$tmp/c.zip" "$URL" &
+    curl -fsSL --connect-timeout "$STALL" --speed-limit 1024 --speed-time "$STALL" \
+        -o "$tmp/c.zip" "$URL" 2>"$tmp/curl.err" &
     curl_pid=$!
     while kill -0 "$curl_pid" 2>/dev/null; do
         if cancelled; then
@@ -95,11 +106,17 @@ while :; do
         progress downloading "$percent" "Downloading Roblox" "$done_bytes" "$total"
         sleep 0.25
     done
-    if wait "$curl_pid"; then
-        break
-    fi
+    curl_status=0
+    wait "$curl_pid" || curl_status=$?
+    [ "$curl_status" -ne 0 ] || break
+    cat "$tmp/curl.err" >&2
     if [ "$attempt" -ge "$max_attempts" ]; then
         progress failed 0 "Download failed" 0 "$total" false
+        # The last line is the reason the launcher shows.
+        case "$curl_status" in
+            28) echo "The Roblox download stalled: no data arrived for $STALL seconds ($max_attempts tries)." >&2;;
+            18) echo "The Roblox download was cut short: the connection closed before the end ($max_attempts tries)." >&2;;
+        esac
         exit 1
     fi
     attempt=$(( attempt + 1 ))
@@ -111,13 +128,27 @@ done_bytes=$(wc -c 2>/dev/null < "$tmp/c.zip" || echo 0)
 progress downloading 70 "Download complete" "$done_bytes" "$total"
 python3 - "$tmp/c.zip" <<'PY'
 import pathlib, stat, sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as archive:
+try:
+    archive = zipfile.ZipFile(sys.argv[1])
+except (OSError, zipfile.BadZipFile):
+    raise SystemExit('The Roblox download is damaged: it is not a valid zip archive.')
+with archive:
     for entry in archive.infolist():
         path = pathlib.PurePosixPath(entry.filename)
         if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0] != 'RobloxPlayer.app' or stat.S_ISLNK(entry.external_attr >> 16):
-            raise SystemExit('Unsafe client archive entry')
+            raise SystemExit('The Roblox download holds an unsafe file path; it was not installed.')
 PY
-unzip -qo "$tmp/c.zip" -d "$tmp"
+if ! unzip -qo "$tmp/c.zip" -d "$tmp" 2>"$tmp/unzip.err"; then
+    cat "$tmp/unzip.err" >&2
+    if grep -qi 'disk full\|no space' "$tmp/unzip.err"; then
+        echo 'Could not unpack the Roblox download: the disk is full.' >&2
+    elif grep -qi 'bad CRC\|invalid compressed data' "$tmp/unzip.err"; then
+        echo 'The Roblox download is damaged: its files do not match their checksums.' >&2
+    else
+        echo "Could not unpack the Roblox download: $(sed -n '/[^[:space:]]/p' "$tmp/unzip.err" | tail -n 1)" >&2
+    fi
+    exit 1
+fi
 [ -x "$tmp/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] || { echo 'Client archive has no executable' >&2; exit 1; }
 [ ! -e "$DATA/RobloxPlayer.app" ] || mv "$DATA/RobloxPlayer.app" "$tmp/previous.app"
 if ! mv "$tmp/RobloxPlayer.app" "$DATA/RobloxPlayer.app"; then

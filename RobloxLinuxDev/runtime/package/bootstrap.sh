@@ -127,13 +127,53 @@ PY
     return $?
 }
 
-say() { echo "roblox: $*" >&2; }
+# The launcher's own log. What the user is told about a failure points here.
+LOG=$DATA/launcher.log
+log_line() {
+    [ -d "$DATA" ] || return 0
+    if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+        mv -f -- "$LOG" "$LOG.1" 2>/dev/null || true
+    fi
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || true
+}
+say() { echo "roblox: $*" >&2; log_line "$*"; }
+# keep_errors FILE STEP: pass a step's captured error output on to stderr and
+# into the log.
+keep_errors() {
+    [ -s "$1" ] || return 0
+    cat -- "$1" >&2
+    while IFS= read -r _line || [ -n "$_line" ]; do log_line "$2: $_line"; done < "$1"
+}
+# reason_from FILE: the step's last error line, without tool prefixes.
+reason_from() {
+    sed -n '/[^[:space:]]/p' "$1" 2>/dev/null | tail -n 1 |
+        sed -e 's/^roblox: //' -e 's/^! //' -e 's/^curl: ([0-9]*) //' -e 's/[.]$//'
+}
+# report_failure WHAT WHY TODO: what failed, why, what the user can do, and
+# where the details are (B10 defect 2).
+report_failure() {
+    event failed 0 "$1: $2" 0 0 false false "$3" "$LOG"
+    say "$1: $2. $3"
+    notify "$1: $2. $3 Details: $LOG" "$1"
+}
+# event PHASE PERCENT MESSAGE [DONE] [TOTAL] [CANCELLABLE] [HIDDEN] [HINT] [LOG]
+# HIDDEN=true asks the progress window to stay off screen until the next event
+# (sent while the update prompt is open, so the prompt is never covered).
+# HINT and LOG go with a failure: what the user can do, and the log's path;
+# the window keeps a failure on screen until the user closes it.
 event() {
-    payload=$(python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" <<'PY'
+    payload=$(python3 - "$1" "$2" "$3" "${4:-0}" "${5:-0}" "${6:-true}" "${7:-false}" "${8:-}" "${9:-}" <<'PY'
 import json, sys
-print(json.dumps({"phase": sys.argv[1], "percent": int(sys.argv[2]), "message": sys.argv[3],
-                  "bytes_done": int(sys.argv[4]), "bytes_total": int(sys.argv[5]),
-                  "cancellable": sys.argv[6].lower() == "true"}, separators=(",", ":")))
+payload = {"phase": sys.argv[1], "percent": int(sys.argv[2]), "message": sys.argv[3],
+           "bytes_done": int(sys.argv[4]), "bytes_total": int(sys.argv[5]),
+           "cancellable": sys.argv[6].lower() == "true"}
+if sys.argv[7].lower() == "true":
+    payload["hidden"] = True
+if sys.argv[8]:
+    payload["hint"] = sys.argv[8]
+if sys.argv[9]:
+    payload["log"] = sys.argv[9]
+print(json.dumps(payload, separators=(",", ":")))
 PY
     )
     if [ "$EVENTS" = 1 ]; then
@@ -390,32 +430,116 @@ launch() {
     exit $_status
 }
 
+# ask_update CLIENT_LATEST CLIENT_INSTALLED PORT_LATEST PORT_INSTALLED: one
+# prompt for every update that is ready (an empty LATEST means none of that
+# kind). Returns 0 update now, 1 launch without updating, 125 cancel the
+# launch (nothing is updated, no game starts). "Skip this version" skips
+# every listed update. The prompt has no timer (B10 flow 7, 8 and 9).
 ask_update() {
-    latest=$1
-    installed=$2
+    client_latest=$1
+    client_installed=$2
+    port_latest=$3
+    port_installed=$4
+    # No client installed: the only answers are install (0) and cancel (125).
+    installing=0
+    [ -n "$client_latest" ] && [ -z "$client_installed" ] && installing=1
     if [ -n "$UI_APP" ]; then
-        choice=$(timeout 31 "$UI_APP" --bootstrapper-ui --dialog "$latest" "$installed" 9>&- >/dev/null 2>&1; printf '%s' "$?" )
+        # Readable client versions where they are known.
+        client_shown=$client_latest
+        installed_shown=$client_installed
+        if [ -n "$client_latest" ]; then
+            shown=$(status_json 2>/dev/null | python3 -c 'import json, sys
+latest, installed = sys.argv[1], sys.argv[2]
+try:
+    status = json.load(sys.stdin)
+except Exception:
+    status = {}
+print(status.get("latest_display_version") if status.get("latest_known") == latest and status.get("latest_display_version") else latest)
+print(status.get("installed_display_version") or installed)' "$client_latest" "$client_installed" 2>/dev/null)
+            if [ -n "$shown" ]; then
+                client_shown=$(printf '%s\n' "$shown" | sed -n 1p)
+                installed_shown=$(printf '%s\n' "$shown" | sed -n 2p)
+            fi
+            # No client installed: an old readable version (a leftover
+            # .display-version, old diagnostics) must not turn the Install
+            # prompt back into an update prompt.
+            [ -n "$client_installed" ] || installed_shown=
+        else
+            installed_shown=
+        fi
+        event prompt 25 'Waiting for an answer to the update prompt' 0 0 false true
+        "$UI_APP" --bootstrapper-ui --dialog "$client_shown" "$installed_shown" "$port_latest" "$port_installed" 9>&- >/dev/null 2>&1
+        choice=$?
         case "$choice" in
             0) return 0;;
-            2) settings_set skipped_version "$latest" >/dev/null 2>&1 || true;;
+            1|2) [ "$installing" = 0 ] || return 125;;
         esac
-        if [ "$choice" -gt 2 ] 2>/dev/null; then notify 'Update prompt failed; launching without updating.' 'Roblox update'; fi
+        case "$choice" in
+            1) return 1;;
+            2)
+                [ -z "$client_latest" ] || settings_set skipped_version "$client_latest" >/dev/null 2>&1 || true
+                [ -z "$port_latest" ] || settings_set skipped_port_version "$port_latest" >/dev/null 2>&1 || true
+                return 1;;
+            4) return 125;;
+        esac
+        if [ "$installing" = 1 ]; then
+            notify "The install prompt failed (status $choice); installing Roblox." 'Roblox install'
+            return 0
+        fi
+        notify "The update prompt failed (status $choice); launching without updating." 'Roblox update'
         return 1
     fi
+    what=
+    [ -z "$client_latest" ] || what="Roblox $client_latest (installed: ${client_installed:-none})"
+    if [ -n "$port_latest" ]; then
+        [ -z "$what" ] || what="$what and "
+        what="${what}the port $port_latest (installed: ${port_installed:-unknown})"
+    fi
+    if [ "$installing" = 1 ]; then
+        if [ -t 0 ] && [ -t 1 ]; then
+            say "Roblox is not installed yet. Install $what?"
+            say 'Choose: 1) Install  2) Cancel  [Enter = 1]'
+            if ! IFS= read -r answer </dev/tty 2>/dev/null; then return 125; fi
+            case "$answer" in ''|1) return 0;; *) return 125;; esac
+        fi
+        if command -v kdialog >/dev/null 2>&1; then
+            kdialog --title 'Install Roblox' --yes-label 'Install' --no-label 'Cancel' \
+                --yesno "Roblox is not installed yet. Install $what?" >/dev/null 2>&1
+            case $? in 0) return 0;; *) return 125;; esac
+        fi
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --question --title='Install Roblox' --ok-label='Install' --cancel-label='Cancel' \
+                --text="Roblox is not installed yet. Install $what?" >/dev/null 2>&1
+            case $? in 0) return 0;; *) return 125;; esac
+        fi
+        # Nobody to ask: Roblox was started, and it cannot start without the client.
+        return 0
+    fi
     if [ -t 0 ] && [ -t 1 ]; then
-        say "Roblox $latest is available (installed: ${installed:-none})."
-        say 'Choose: 1) Update now  2) Launch without updating [2 in 30s]'
-        answer=$(timeout 30 sh -c 'IFS= read -r value; printf "%s" "$value"' </dev/tty 2>/dev/null || true)
-        [ "$answer" = 1 ]
-        return
+        say "An update is available: $what."
+        say 'Choose: 1) Update now  2) Launch without updating  3) Cancel  [Enter = 2]'
+        if ! IFS= read -r answer </dev/tty 2>/dev/null; then return 125; fi
+        case "$answer" in
+            1) return 0;;
+            ''|2) return 1;;
+            *) return 125;;
+        esac
     fi
     if command -v kdialog >/dev/null 2>&1; then
-        timeout 30 kdialog --title 'Roblox update available' --yesno "Roblox $latest is available. Update now?" >/dev/null 2>&1
-        return
+        kdialog --title 'Roblox update available' \
+            --yes-label 'Update now' --no-label 'Launch without updating' --cancel-label 'Cancel' \
+            --yesnocancel "An update is available: $what. Update now?" >/dev/null 2>&1
+        case $? in 0) return 0;; 1) return 1;; *) return 125;; esac
     fi
     if command -v zenity >/dev/null 2>&1; then
-        timeout 30 zenity --question --title='Roblox update available' --text="Roblox $latest is available. Update now?" >/dev/null 2>&1
-        return
+        # The extra button prints its label; Cancel and closing print nothing.
+        zenity_answer=$(zenity --question --title='Roblox update available' \
+            --ok-label='Update now' --cancel-label='Cancel' --extra-button='Launch without updating' \
+            --text="An update is available: $what. Update now?" 2>/dev/null)
+        case $? in
+            0) return 0;;
+            *) [ "$zenity_answer" = 'Launch without updating' ] && return 1; return 125;;
+        esac
     fi
     return 1
 }
@@ -429,13 +553,24 @@ first_run() {
     # the alias that the actual game launch will receive from run.sh.
     # The warm-up does not own the instance lock. Close FD 9 before exec so a
     # Darling/AppImage child cannot strand the lock if timeout has to kill it.
-    if ! (unset ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA
-          timeout --foreground --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
-        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true); then
-        say 'First-run setup failed or timed out; the client was not launched.'
-        notify 'Roblox first-run setup failed; the client was not launched.' 'Roblox setup failed'
+    first_errors=$DATA/.first-run-errors.$$
+    (unset ROBLOX_MAC_ALIAS_DIR ROBLOX_MAC_STAGE ROBLOX_MAC_REAL_DATA
+     timeout --foreground --kill-after=5s "${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120}" sh -c \
+        'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 sh "$HERE/run.sh" --shell true) 2>"$first_errors"
+    first_status=$?
+    keep_errors "$first_errors" first-run
+    if [ "$first_status" -ne 0 ]; then
+        if [ "$first_status" -eq 124 ]; then
+            why="it did not finish within ${ROBLOX_MAC_FIRST_RUN_TIMEOUT:-120} seconds"
+        else
+            why=$(reason_from "$first_errors")
+            [ -n "$why" ] || why="it ended with status $first_status"
+        fi
+        rm -f -- "$first_errors"
+        report_failure 'Roblox first-run setup failed' "$why" 'Roblox was not started. Start Roblox again.'
         return 1
     fi
+    rm -f -- "$first_errors"
     tmp=$DATA/.first-run.initialized.$$
     printf 'initialized\n' > "$tmp"
     chmod 600 "$tmp"
@@ -443,71 +578,256 @@ first_run() {
     event first-run 15 'First-run setup complete' 0 0 false
 }
 
+now_ms() {
+    _ms=$(date +%s%3N 2>/dev/null)
+    case "$_ms" in ''|*[!0-9]*) echo $(( $(date +%s) * 1000 ));; *) echo "$_ms";; esac
+}
+# The launch waits for its update lookups until this moment at most.
+lookup_deadline() {
+    if [ -z "${LOOKUP_DEADLINE_MS:-}" ]; then
+        _grace_ms=$(awk -v grace="${ROBLOX_MAC_UPDATE_CHECK_GRACE:-1}" 'BEGIN { t = int(grace * 1000); print (t > 0 ? t : 0) }' 2>/dev/null || echo 1000)
+        LOOKUP_DEADLINE_MS=$(( $(now_ms) + _grace_ms ))
+    fi
+    echo "$LOOKUP_DEADLINE_MS"
+}
+
+# check_latest [wait]: print the latest client version known after this call.
+# The lookup runs in the background. With "wait" (Settings' "Check for
+# updates", an explicit update) the answer is awaited; otherwise (a launch)
+# it is awaited for at most ROBLOX_MAC_UPDATE_CHECK_GRACE seconds (default 1)
+# and the launch goes on: the background lookup still records its answer, so
+# the update is offered at the next start (B10 flow 6). A launch looks only
+# when a check is due (a failed one is retried an hour later); "wait" always
+# looks. Returns 0 with a fresh or not-yet-due answer, 1 when the lookup
+# failed, 125 when cancelled.
 check_latest() {
     if cancelled; then return 125; fi
     now=$(date +%s)
-    due=$(python3 "$HELPER" due "$DATA" "$now" 2>/dev/null || echo 1)
-    if [ "$due" != 1 ]; then
-        settings_get last_known_latest
-        return 0
+    if [ "${1:-}" != wait ]; then
+        due=$(python3 "$HELPER" due "$DATA" "$now" 2>/dev/null || echo 1)
+        if [ "$due" != 1 ]; then
+            settings_get last_known_latest
+            return 0
+        fi
     fi
-    check_output=$DATA/.check.$$
-    rm -f -- "$check_output"
-    timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version 9>&- >"$check_output" 2>/dev/null &
+    # The attempt time also keeps launches meanwhile from starting a second lookup.
+    settings_set last_attempt "$now" >/dev/null 2>&1 || true
+    check_result_file=$DATA/.check.$$
+    rm -f -- "$check_result_file" "$check_result_file.tmp" "$check_result_file.abandoned"
+    # The lookup must not keep the instance lock (9) or the progress pipe (8)
+    # open, and must not hold this script's output open after a launch.
+    (
+        exec 8>&- 9>&-
+        check_timeout=${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}
+        # Read the answer from a file, not a pipe: the AppImage runtime's FUSE
+        # daemon outlives the call and holds its stdout open for about 6 s.
+        timeout "$check_timeout" "$APP" --client-version >"$check_result_file.out" 2>"$check_result_file.err"
+        check_status=$?
+        check_output=$(cat "$check_result_file.out" 2>/dev/null)
+        rm -f -- "$check_result_file.out"
+        found=$(printf '%s\n' "$check_output" | sed -n '/^version-[0-9a-f][0-9a-f]*$/p' | tail -n 1)
+        if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
+            settings_set last_known_latest "$found" >/dev/null 2>&1 || true
+            settings_set last_check "$(date +%s)" >/dev/null 2>&1 || true
+            settings_set last_check_error '' >/dev/null 2>&1 || true
+            printf 'ok %s\n' "$found" > "$check_result_file.tmp"
+        else
+            # Keep the reason for the Settings page and the log (B10 defect 2).
+            if [ "$check_status" -eq 124 ]; then
+                why="Roblox's version service did not answer within $check_timeout seconds"
+            else
+                why=$(reason_from "$check_result_file.err")
+                [ -n "$why" ] || why="the version lookup ended with status $check_status"
+            fi
+            settings_set last_check_error "$why" >/dev/null 2>&1 || true
+            while IFS= read -r _line || [ -n "$_line" ]; do log_line "update check: $_line"; done < "$check_result_file.err"
+            log_line "Could not check for Roblox updates: $why"
+            printf 'failed %s\n' "$found" > "$check_result_file.tmp"
+        fi
+        rm -f -- "$check_result_file.err"
+        mv -f -- "$check_result_file.tmp" "$check_result_file"
+        if [ "$check_status" -eq 0 ] && [ -n "$found" ]; then
+            timeout "$check_timeout" "$APP" --client-version-display >"$check_result_file.display" 2>/dev/null || true
+            display=$(sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' "$check_result_file.display" 2>/dev/null | tail -n 1)
+            rm -f -- "$check_result_file.display"
+            [ -z "$display" ] || settings_set last_known_latest_display "$display" >/dev/null 2>&1 || true
+        fi
+        # Nobody will read an answer the launch stopped waiting for.
+        [ -e "$check_result_file.abandoned" ] && rm -f -- "$check_result_file" "$check_result_file.abandoned"
+        exit 0
+    ) </dev/null >/dev/null 2>&1 &
     check_pid=$!
-    while kill -0 "$check_pid" 2>/dev/null; do
-        if cancelled; then kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true; rm -f -- "$check_output"; return 125; fi
-        sleep 0.1
+    deadline=$(lookup_deadline)
+    while :; do
+        if cancelled; then
+            kill "$check_pid" 2>/dev/null || true; wait "$check_pid" 2>/dev/null || true
+            rm -f -- "$check_result_file" "$check_result_file.tmp" "$check_result_file.abandoned"
+            return 125
+        fi
+        if [ "${1:-}" = wait ]; then
+            kill -0 "$check_pid" 2>/dev/null || break
+        else
+            [ -e "$check_result_file" ] && break
+            kill -0 "$check_pid" 2>/dev/null || break
+            if [ "$(now_ms)" -ge "$deadline" ]; then
+                # Not answered in time: launch now, offer the update next start.
+                : > "$check_result_file.abandoned"
+                [ -e "$check_result_file" ] && rm -f -- "$check_result_file" "$check_result_file.abandoned"
+                settings_get last_known_latest
+                return 0
+            fi
+        fi
+        sleep 0.05
     done
-    wait "$check_pid" 2>/dev/null
-    check_status=$?
-    latest=$(sed -n '/^version-[0-9a-f][0-9a-f]*$/p' "$check_output" 2>/dev/null | tail -n 1 || true)
-    rm -f -- "$check_output"
-    settings_set last_check "$now" >/dev/null 2>&1 || true
-    if [ "$check_status" -ne 0 ]; then
-        [ -n "$latest" ] && printf '%s\n' "$latest"
-        return 1
-    fi
-    if [ -n "$latest" ]; then
-        settings_set last_known_latest "$latest" >/dev/null 2>&1 || true
-        display=$(timeout "${ROBLOX_MAC_UPDATE_CHECK_TIMEOUT:-8}" "$APP" --client-version-display 9>&- 2>/dev/null | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/p' | tail -n 1 || true)
-        [ -z "$display" ] || settings_set last_known_latest_display "$display" >/dev/null 2>&1 || true
-        printf '%s\n' "$latest"
-    else
-        settings_get last_known_latest
-        return 1
-    fi
+    [ "${1:-}" = wait ] && wait "$check_pid" 2>/dev/null
+    answer=$(cat "$check_result_file" 2>/dev/null || true)
+    rm -f -- "$check_result_file" "$check_result_file.abandoned"
+    case "$answer" in
+        "ok "*) printf '%s\n' "${answer#ok }"; return 0;;
+    esac
+    found=${answer#failed}; found=${found# }
+    if [ -n "$found" ]; then printf '%s\n' "$found"; else settings_get last_known_latest; fi
+    return 1
 }
 
+# Port releases are offered at launch like client updates (B10 flow 9).
+# start_port_lookup begins the background release query when it is due;
+# finish_port_lookup prints the latest known port release, waiting for the
+# query no longer than the launch's lookup deadline. A late answer is still
+# recorded (port_latest), so it is offered at the next start.
+PORT_LOOKUP_PID=
+PORT_LOOKUP_FILE=
+start_port_lookup() {
+    [ -f "$HERE/installer.py" ] || return 0
+    now=$(date +%s)
+    due=$(python3 "$HELPER" due "$DATA" "$now" port_last_check 2>/dev/null || echo 1)
+    [ "$due" = 1 ] || return 0
+    settings_set port_last_attempt "$now" >/dev/null 2>&1 || true
+    PORT_LOOKUP_FILE=$DATA/.port-check.$$
+    rm -f -- "$PORT_LOOKUP_FILE" "$PORT_LOOKUP_FILE.tmp" "$PORT_LOOKUP_FILE.abandoned"
+    lookup_deadline >/dev/null
+    (
+        exec 8>&- 9>&-
+        found=$(python3 "$HERE/installer.py" release-status --prefix "$HERE" 2>"$PORT_LOOKUP_FILE.err" |
+            python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("latest_version") or "")
+except Exception:
+    pass' 2>/dev/null)
+        if [ -n "$found" ]; then
+            settings_set port_latest "$found" >/dev/null 2>&1 || true
+            settings_set port_last_check "$(date +%s)" >/dev/null 2>&1 || true
+            printf 'ok %s\n' "$found" > "$PORT_LOOKUP_FILE.tmp"
+        else
+            # Why, for the log (the client check logs its reason the same way).
+            why=$(reason_from "$PORT_LOOKUP_FILE.err" | sed 's/^Could not query the latest GitHub release: //')
+            log_line "Could not check for port updates: ${why:-the installer gave no reason}"
+            printf 'failed\n' > "$PORT_LOOKUP_FILE.tmp"
+        fi
+        rm -f -- "$PORT_LOOKUP_FILE.err"
+        mv -f -- "$PORT_LOOKUP_FILE.tmp" "$PORT_LOOKUP_FILE"
+        [ -e "$PORT_LOOKUP_FILE.abandoned" ] && rm -f -- "$PORT_LOOKUP_FILE" "$PORT_LOOKUP_FILE.abandoned"
+        exit 0
+    ) </dev/null >/dev/null 2>&1 &
+    PORT_LOOKUP_PID=$!
+}
+# port_is_newer INSTALLED LATEST: true when both are release versions (v1.2.3)
+# and LATEST is newer. A custom or development build (a commit id, "dev")
+# is never offered a release at launch: that could be a downgrade.
+port_is_newer() {
+    python3 - "$1" "$2" <<'PY'
+import re, sys
+def parse(value):
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", value.strip())
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+installed, latest = parse(sys.argv[1]), parse(sys.argv[2])
+if installed and latest:
+    # Missing parts count as 0 (v1.2 == v1.2.0), as in Settings (launcher.c).
+    width = max(len(installed), len(latest))
+    installed, latest = installed + (0,) * (width - len(installed)), latest + (0,) * (width - len(latest))
+sys.exit(0 if installed and latest and latest > installed else 1)
+PY
+}
+finish_port_lookup() {
+    if [ -n "$PORT_LOOKUP_PID" ]; then
+        deadline=$(lookup_deadline)
+        while [ ! -e "$PORT_LOOKUP_FILE" ] && kill -0 "$PORT_LOOKUP_PID" 2>/dev/null; do
+            if cancelled || [ "$(now_ms)" -ge "$deadline" ]; then
+                : > "$PORT_LOOKUP_FILE.abandoned"
+                break
+            fi
+            sleep 0.05
+        done
+        if [ -e "$PORT_LOOKUP_FILE" ]; then
+            rm -f -- "$PORT_LOOKUP_FILE" "$PORT_LOOKUP_FILE.abandoned"
+        fi
+        PORT_LOOKUP_PID=
+    fi
+    settings_get port_latest
+}
+
+# progress_fd: the descriptor children may report progress on, only while the
+# window's pipe is open on FD 8. Otherwise 8 is free and a child would write
+# into a pipe, socket or file of its own that landed there.
+progress_fd() { if [ "$UI_FD" = 1 ]; then printf 8; fi; }
+# do_update [more]: "more" when other steps follow in this window (a port
+# update, the launch); then the update ends with a step that keeps the window
+# open instead of "update", which closes it.
 do_update() {
+    update_final=1
+    [ "${1:-}" != more ] || update_final=0
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
     event downloading 25 'Downloading Roblox' 0 0 true
     # The bootstrapper keeps FD 9; updater children must not inherit it.
-    if ! timeout --foreground --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
+    update_errors=$DATA/.update-errors.$$
+    timeout --foreground --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
         'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 \
-            ROBLOX_MAC_PROGRESS_FD=8 ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
-            sh "$HERE/update-roblox.sh"; then
+            ROBLOX_MAC_PROGRESS_FD="$(progress_fd)" ROBLOX_MAC_UPDATE_FINAL="$update_final" \
+            ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
+            sh "$HERE/update-roblox.sh" 2>"$update_errors"
+    update_status=$?
+    keep_errors "$update_errors" update
+    if [ "$update_status" -ne 0 ]; then
         if cancelled; then
-            event cancelled 0 'Update cancelled; keeping the installed client' 0 0 false
-            say 'Update cancelled; the installed client was kept.'
-            notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
+            rm -f -- "$update_errors"
+            if [ -n "$(installed_version)" ]; then
+                event cancelled 0 'Update cancelled; keeping the installed client' 0 0 false
+                say 'Update cancelled; the installed client was kept.'
+                notify 'Update cancelled; the installed client was kept. Roblox was not started.' 'Roblox update cancelled'
+            else
+                event cancelled 0 'Install cancelled' 0 0 false
+                say 'Install cancelled; nothing was installed.'
+                notify 'Install cancelled; nothing was installed. Roblox was not started.' 'Roblox install cancelled'
+            fi
             return 125
         fi
-        event failed 0 'Update failed; keeping the installed client' 0 0 false
-        say 'Update failed or timed out; the installed client was kept.'
-        notify 'Roblox update failed; the installed client was kept.' 'Roblox update failed'
+        if [ "$update_status" -eq 124 ]; then
+            why="it did not finish within ${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}"
+        else
+            why=$(reason_from "$update_errors")
+            [ -n "$why" ] || why="the updater ended with status $update_status"
+        fi
+        rm -f -- "$update_errors"
+        if [ -n "$(installed_version)" ]; then
+            report_failure 'Roblox update failed' "$why" 'The installed client was kept. Check your internet connection and try again later.'
+        else
+            report_failure 'Roblox install failed' "$why" 'Roblox was not started. Check your internet connection and start Roblox again.'
+        fi
         return 1
     fi
+    rm -f -- "$update_errors"
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
-    event verifying 78 'Verifying the downloaded client' 0 0 true
-    event preparing 90 'Preparing shaders' 0 0 true
-    event update 100 'Update complete' 0 0 false
+    # update-roblox.sh reported its own steps; do not wind the bar back.
+    if [ "$update_final" = 1 ]; then
+        event update 100 'Update complete' 0 0 false
+    else
+        event complete 100 'Roblox updated' 0 0 false
+    fi
 }
 
 do_port_update() {
     if [ ! -f "$HERE/installer.py" ]; then
-        event failed 0 'Port updater is not included in this release' 0 0 false
-        say 'Port updater is unavailable; install a release containing installer.py.'
+        report_failure 'Port update failed' 'this release does not include the port updater (installer.py)' 'Install the latest release from the project page.'
         return 1
     fi
     event checking 5 'Checking the latest port release' 0 0 true
@@ -527,12 +847,16 @@ do_port_update() {
     # default 30m, applied only before the commit boundary), and an
     # interruption of the commit itself is repaired by the launcher's
     # recovery entry point on the next start.
-    env ROBLOX_MAC_PROGRESS_FD=8 \
+    port_errors=$DATA/.port-update-errors.$$
+    env ROBLOX_MAC_PROGRESS_FD="$(progress_fd)" \
         ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
         ROBLOX_MAC_CANCEL_STATE_FILE="${ROBLOX_MAC_CANCEL_STATE_FILE:-}" \
         ROBLOX_MAC_LOCK_HELD=1 \
-        python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop
+        python3 "$HERE/installer.py" update --prefix "$HERE" --yes --no-desktop 2>"$port_errors"
     _port_update_status=$?
+    keep_errors "$port_errors" port-update
+    port_why=$(reason_from "$port_errors")
+    rm -f -- "$port_errors"
     case "$_port_update_status" in
         0)
             event update 100 'Port update complete' 0 0 false
@@ -550,8 +874,8 @@ do_port_update() {
             say 'Port update cancelled; the current release was kept.'
             return 125;;
     esac
-    event failed 0 'Port update failed; the current release was kept' 0 0 false
-    say 'Port update failed; the current release was kept.'
+    [ -n "$port_why" ] || port_why="the installer ended with status $_port_update_status"
+    report_failure 'Port update failed' "$port_why" 'The current release was kept. Check your internet connection and try again later.'
     return 1
 }
 
@@ -576,11 +900,11 @@ case "$command" in
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress || { exec 9>&-; exit 1; }
-        first_run || { finish_progress; exit 1; }
+        first_run || { exec 9>&-; finish_progress; exit 1; }
         event checking 25 'Checking for updates'
-        latest=$(check_latest); check_result=$?
+        latest=$(check_latest wait); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; notify 'Update check cancelled.' 'Roblox'; exit 125; }
-        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; status_json; exit 1; }
+        [ "$check_result" -eq 0 ] || { event failed 0 "Could not check for updates: $(settings_get last_check_error 2>/dev/null || true)" 0 0 false false 'Check your internet connection and try again.' "$LOG"; exec 9>&-; finish_progress; status_json; exit 1; }
         finish_progress
         exec 9>&-
         status_json; exit 0;;
@@ -592,13 +916,13 @@ case "$command" in
         fi
         recover_interrupted_update || { exec 9>&-; exit 1; }
         start_progress || { exec 9>&-; exit 1; }
-        first_run || { finish_progress; exit 1; }
+        first_run || { exec 9>&-; finish_progress; exit 1; }
         event checking 25 'Checking for updates'
-        latest=$(check_latest); check_result=$?
+        latest=$(check_latest wait); check_result=$?
         [ "$check_result" -eq 125 ] && { finish_progress; exit 125; }
-        [ "$check_result" -eq 0 ] || { event failed 0 'Could not check for updates' 0 0 false; finish_progress; exit 1; }
+        [ "$check_result" -eq 0 ] || { event failed 0 "Could not check for updates: $(settings_get last_check_error 2>/dev/null || true)" 0 0 false false 'Check your internet connection and try again.' "$LOG"; exec 9>&-; finish_progress; exit 1; }
         [ -n "$latest" ] || { say 'No latest version is known; update check failed.'; finish_progress; exit 1; }
-        do_update; result=$?; finish_progress; [ "$UI_CANCELLED" -eq 1 ] && result=125; exit "$result";;
+        do_update; result=$?; exec 9>&-; finish_progress; [ "$UI_CANCELLED" -eq 1 ] && result=125; exit "$result";;
     update-settings)
         [ "$#" -eq 1 ] || { echo 'Usage: run.sh update-settings' >&2; exit 2; }
         sh "$HERE/run.sh" update
@@ -615,7 +939,7 @@ case "$command" in
             finish_progress; exit 1
         fi
         start_progress required || { exec 9>&-; exit 1; }
-        do_port_update; result=$?; finish_progress; exec 9>&-
+        do_port_update; result=$?; exec 9>&-; finish_progress
         exit "$result";;
     port-update-settings)
         [ "$#" -eq 1 ] || { echo 'Usage: run.sh port-update-settings' >&2; exit 2; }
@@ -638,24 +962,98 @@ if ! flock -n -E 73 9; then
     notify 'Roblox is already running.' 'Roblox is already running'
     exit 0
 fi
-recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
+recover_interrupted_update || {
+    report_failure 'Roblox could not start' 'an interrupted update left no usable client' \
+        'Reinstall the port with its installer; DO_NOT_SHARE is kept.'
+    exec 9>&-; finish_progress; exit 1; }
 start_progress || { exec 9>&-; exit 1; }
-first_run || { finish_progress; exit 1; }
+first_run || { exec 9>&-; finish_progress; exit 1; }
 installed=$(installed_version)
+# No client installed (George, 2026-11-15): look up the latest version even
+# when no check is due or updates are off, offer only Install (also over a
+# skipped version), and never start a client that is not there.
+client_missing=0
+[ -n "$installed" ] || client_missing=1
 event checking 25 'Checking for updates'
-latest=$(check_latest)
+mode=$(settings_get auto_update 2>/dev/null || printf 'ask')
+# A launch restarted after a port update already decided about updates.
+restarted=${ROBLOX_MAC_PORT_RESTARTED:-0}
+unset ROBLOX_MAC_PORT_RESTARTED
+[ "$mode" = off ] || [ "$restarted" = 1 ] || start_port_lookup
+if [ "$client_missing" = 1 ]; then latest=$(check_latest wait); else latest=$(check_latest); fi
 check_result=$?
-if [ "$check_result" -eq 125 ] || [ "$UI_CANCELLED" -eq 1 ]; then
+port_latest=$(finish_port_lookup)
+if [ "$check_result" -eq 125 ] || cancelled; then
+    event cancelled 0 'Launch cancelled' 0 0 false
     finish_progress
-    notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
+    say 'Launch cancelled while checking for updates; nothing was changed.'
     exit 125
 fi
-mode=$(settings_get auto_update 2>/dev/null || printf 'ask')
-if [ -n "$latest" ] && [ "$latest" != "$installed" ] && [ "$(settings_get skipped_version 2>/dev/null || true)" != "$latest" ]; then
+if [ "$client_missing" = 1 ] && [ -z "$latest" ]; then
+    report_failure 'Roblox is not installed' "could not look up the latest version ($(settings_get last_check_error 2>/dev/null || true))" \
+        'Roblox was not started. Check your internet connection and start Roblox again.'
+    exec 9>&-; finish_progress; exit 1
+fi
+client_offer=
+port_offer=
+port_installed=
+if [ "$client_missing" = 1 ]; then
+    client_offer=$latest
+elif [ -n "$latest" ] && [ "$latest" != "$installed" ] && [ "$(settings_get skipped_version 2>/dev/null || true)" != "$latest" ]; then
+    client_offer=$latest
+fi
+if [ "$restarted" != 1 ] && [ -f "$HERE/installer.py" ] && [ -n "$port_latest" ]; then
+    port_installed=$(python3 "$HELPER" port-version "$HERE" 2>/dev/null || true)
+    if [ -n "$port_installed" ] && port_is_newer "$port_installed" "$port_latest" &&
+       [ "$(settings_get skipped_port_version 2>/dev/null || true)" != "$port_latest" ]; then
+        port_offer=$port_latest
+    fi
+fi
+# Off means no updates: only a missing client is offered (as an install).
+[ "$mode" != off ] || port_offer=
+[ -n "$port_offer" ] || port_installed=
+answer=1
+if [ -n "$client_offer$port_offer" ]; then
     case "$mode" in
-        auto) do_update; result=$?; [ "$result" -eq 125 ] && { finish_progress; notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'; exit 125; };;
-        ask) if ask_update "$latest" "$installed"; then do_update; result=$?; [ "$result" -eq 125 ] && { finish_progress; notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'; exit 125; }; fi;;
-        off) :;;
+        auto) answer=0;;
+        ask) ask_update "$client_offer" "$installed" "$port_offer" "$port_installed"; answer=$?;;
+        off) [ "$client_missing" = 0 ] || { ask_update "$client_offer" "$installed" "$port_offer" "$port_installed"; answer=$?; };;
+    esac
+fi
+# Without a client, anything but Install ends the launch.
+[ "$client_missing" = 0 ] || [ "$answer" -eq 0 ] || answer=125
+if [ "$answer" -eq 125 ]; then
+    event cancelled 0 'Launch cancelled' 0 0 false
+    finish_progress
+    say 'Launch cancelled at the update prompt; nothing was updated.'
+    exit 125
+fi
+if [ "$answer" -eq 0 ] && [ -n "$client_offer" ]; then
+    # The launch (or a port update) follows in the same window.
+    do_update more; result=$?
+    [ "$result" -eq 125 ] && { finish_progress; exit 125; }
+    # A failed install has nothing to start; do_update has said why.
+    [ -n "$(installed_version)" ] || { exec 9>&-; finish_progress; exit 1; }
+fi
+if [ "$answer" -eq 0 ] && [ -n "$port_offer" ]; then
+    do_port_update; result=$?
+    case "$result" in
+        0)
+            # The port update replaced the launcher scripts and the AppImage.
+            # Start again through the new ones with the same place id or link
+            # (B10 flow 10); the instance lock is taken again by the new run.
+            finish_progress
+            say 'Port updated; starting Roblox with the new release.'
+            exec 9>&-
+            ROBLOX_MAC_PORT_RESTARTED=1
+            export ROBLOX_MAC_PORT_RESTARTED
+            exec sh "$HERE/run.sh" "$@";;
+        125)
+            finish_progress
+            notify 'Port update cancelled; the current release was kept. Roblox was not started.' 'Roblox update cancelled'
+            exit 125;;
+        *)
+            say 'Roblox is starting with the current release.';;
     esac
 fi
 if [ -n "${ROBLOX_MAC_URI_RECEIVED_AT:-}" ] && [ -n "${ROBLOX_MAC_LAUNCH_URI:-}" ]; then
@@ -665,6 +1063,13 @@ if [ -n "${ROBLOX_MAC_URI_RECEIVED_AT:-}" ] && [ -n "${ROBLOX_MAC_LAUNCH_URI:-}"
         notify 'The browser link expired; Roblox is launching normally.' 'Roblox link expired'
         unset ROBLOX_MAC_LAUNCH_URI
     fi
+fi
+# Cancel pressed at the last moment (while checking, or between steps).
+if cancelled; then
+    event cancelled 0 'Launch cancelled' 0 0 false
+    finish_progress
+    say 'Launch cancelled; Roblox was not started.'
+    exit 125
 fi
 event launching 100 'Launching Roblox' 0 0 false
 finish_progress

@@ -20,10 +20,35 @@ python3 "$HERE/pack2air.py" "$APP/Contents/Resources/shaders/shaders_metal_osx.p
 export METAL2VULKAN_REPRO_DIR=$OUT/repros
 export TMPDIR=$OUT/tmp
 mkdir -p "$TMPDIR"
+# With the updater's progress channel, report "Translating shaders (N of M)" from
+# 74 to 86 % while the shaders translate (prepare-cache.py goes on to 90 %).
+progress_fd=${ROBLOX_MAC_PROGRESS_FD:-}
+case "$progress_fd" in ''|*[!0-9]*) progress_fd=;; esac
+# Only a descriptor that is open now is the updater's pipe.
+# (`true`, not `:`: a failed redirection on a special builtin ends the script.)
+[ -z "$progress_fd" ] || { true >&"$progress_fd"; } 2>/dev/null || progress_fd=
+poller=
+total=$(find "$OUT/air" -maxdepth 1 -name '*.air' | wc -l)
+if [ -n "$progress_fd" ] && [ "$total" -gt 0 ]; then
+    (
+        last=-1
+        while :; do
+            done_count=$(find "$OUT/spv" -maxdepth 1 -name '*.out' | wc -l)
+            if [ "$done_count" -ne "$last" ]; then
+                printf '{"phase":"preparing","percent":%d,"message":"Translating shaders (%d of %d)","bytes_done":0,"bytes_total":0,"cancellable":true}\n' \
+                    $((74 + done_count * 12 / total)) "$done_count" "$total" >&"$progress_fd" 2>/dev/null || exit 0
+                last=$done_count
+            fi
+            sleep 0.5
+        done
+    ) &
+    poller=$!
+fi
 find "$OUT/air" -maxdepth 1 -name '*.air' -print0 | xargs -0 -P"$(nproc)" -I{} sh -c '
     b=$(basename "$1" .air)
     python3 "$2/translate-one.py" "$3" "$1" "$4/spv/$b"
 ' sh {} "$HERE" "$M2V" "$OUT" | sort | uniq -c
+if [ -n "$poller" ]; then kill "$poller" 2>/dev/null || true; wait "$poller" 2>/dev/null || true; fi
 echo '--- failure reasons:'
 grep -h 'metal2vulkan: ' "$OUT"/spv/*.out | grep -v 'wrote\|PASS\|auto-detected\|FALLBACK' \
     | sed 's/[0-9]\+/N/g; s/;.*//' | sort | uniq -c | sort -rn

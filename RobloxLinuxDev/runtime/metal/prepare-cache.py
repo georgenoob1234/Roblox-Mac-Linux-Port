@@ -84,6 +84,31 @@ def prepare(item):
         return index,None,f'spirv-val rejected the adapted module: {detail or e}'
     except (ValueError,KeyError,OSError) as e:return index,None,str(e)
 
+def claim_progress_fd():
+    """The updater's progress pipe is the descriptor ROBLOX_MAC_PROGRESS_FD
+    names only if it is open at startup; keep a private copy then. A number
+    that is not open is free, and subprocess's own pipes land on it later
+    (writing there aborted shader preparation once), so never write to it."""
+    raw=os.environ.get('ROBLOX_MAC_PROGRESS_FD','')
+    if not raw.isdigit():return None
+    try:os.fstat(int(raw));return os.dup(int(raw))
+    except OSError:return None
+PROGRESS_FD=claim_progress_fd()
+
+def progress_reporter(total):
+    """With the updater's progress channel, report the validation as
+    "Checking shaders (N of M)" from 86 to 90 %."""
+    if PROGRESS_FD is None or not total:return lambda done:None
+    fd=PROGRESS_FD;step=max(1,total//100)
+    def report(done):
+        if done%step and done!=total:return
+        percent=86+done*4//total
+        line=json.dumps({'phase':'preparing','percent':percent,'message':f'Checking shaders ({done} of {total})',
+                         'bytes_done':0,'bytes_total':0,'cancellable':True},separators=(',',':'))+'\n'
+        try:os.write(fd,line.encode())
+        except OSError:pass
+    return report
+
 def main():
     global PACK, OUT, SOURCE
     parser=argparse.ArgumentParser(description=__doc__)
@@ -97,7 +122,9 @@ def main():
     data=PACK.read_bytes();items=[]
     for index,m in enumerate(re.finditer(b'MTLB',data)):
         n=struct.unpack_from('<Q',data,m.start()+16)[0];items.append((index,data[m.start():m.start()+n]))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:results=list(pool.map(prepare,items))
+    results=[];report_progress=progress_reporter(len(items))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for result in pool.map(prepare,items):results.append(result);report_progress(len(results))
     report={'prepared':sum(key is not None for _,key,_ in results),'total':len(items),'pack_sha256':hashlib.sha256(data).hexdigest(),'failures':[(i,e) for i,key,e in results if key is None]}
     if not report['prepared']:raise SystemExit('No shaders prepared; keep the previous client')
     (OUT/'report.json').write_text(json.dumps(report,indent=2));print(report['prepared'],'/',report['total'],'validated shaders prepared')

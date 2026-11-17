@@ -50,6 +50,27 @@ jobs:
       - name: Run bootstrapper tests
         run: python3 -B RobloxLinuxDev/runtime/package/check-bootstrapper.py
 
+      - name: Run launch-with-updates tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-launch-updates.py
+
+      - name: Run client download failure tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-client-download.py
+
+      - name: Run launcher entry failure tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-run-failures.py
+
+      - name: Run progress descriptor tests
+        run: python3 -B RobloxLinuxDev/runtime/package/check-progress-fd.py
+
+      - name: Run bootstrapper window tests
+        env:
+          ROBLOX_MAC_REQUIRE_UI_CHECK: "1"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libgtk-3-dev libgtk-3-bin libjson-glib-dev
+          python3 -B RobloxLinuxDev/runtime/package/make-ui-icons.py --check
+          python3 -B RobloxLinuxDev/runtime/package/check-bootstrapper-windows.py
+
       - name: Run release checks
         run: python3 -B RobloxLinuxDev/runtime/package/check-release.py
 

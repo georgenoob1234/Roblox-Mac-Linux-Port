@@ -325,6 +325,57 @@ def test_symlink_archive_checksum_and_download_failures() -> None:
         assert not list(home.glob("roblox-mac-linux-port-download-*"))
 
 
+def test_release_check_failures_name_the_cause() -> None:
+    """B10 defect 5: a failed port-update check must say why it failed."""
+    import email.message
+    import socket
+    import urllib.error
+
+    def headers(**values: str) -> email.message.Message:
+        message = email.message.Message()
+        for name, value in values.items():
+            message[name.replace("_", "-")] = value
+        return message
+
+    class Answer(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    url = "https://api.github.com/repos/x/y/releases/latest"
+    cases = [
+        (urllib.error.URLError(socket.gaierror(-3, "Temporary failure in name resolution")),
+         ["could not reach GitHub", "Temporary failure in name resolution"]),
+        (urllib.error.HTTPError(url, 403, "Forbidden", headers(X_RateLimit_Remaining="0", X_RateLimit_Reset="4102444800"), None),
+         ["GitHub's limit of requests from this network was reached"]),
+        (urllib.error.HTTPError(url, 404, "Not Found", headers(), None), ["HTTP 404"]),
+        (urllib.error.HTTPError(url, 502, "Bad Gateway", headers(), None), ["HTTP 502", "Bad Gateway"]),
+        (TimeoutError("timed out"), ["GitHub did not answer within 30 seconds"]),
+        (Answer(b"<html>not json</html>"), ["GitHub's answer was not valid JSON"]),
+    ]
+    original = installer.urllib.request.urlopen
+    try:
+        for outcome, expected in cases:
+            def fake(*_args, outcome=outcome, **_kwargs):
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+            installer.urllib.request.urlopen = fake
+            try:
+                installer.fetch_json(url)
+            except installer.InstallerError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError(f"{outcome!r} did not fail")
+            assert message.startswith("Could not query the latest GitHub release: "), message
+            for part in expected:
+                assert part in message, (part, message)
+    finally:
+        installer.urllib.request.urlopen = original
+
+
 def test_desktop_conflicts_and_association_preservation() -> None:
     with tempfile.TemporaryDirectory(prefix="installer-desktop-") as tmp:
         root = Path(tmp)
@@ -353,6 +404,8 @@ def test_desktop_conflicts_and_association_preservation() -> None:
 
 if __name__ == "__main__":
     test_install_update_reinstall_uninstall_and_recovery()
+    test_state_aware_menu_and_desktop_choice()
     test_symlink_archive_checksum_and_download_failures()
+    test_release_check_failures_name_the_cause()
     test_desktop_conflicts_and_association_preservation()
     print("PASS installer regression tests")

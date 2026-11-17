@@ -19,6 +19,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -123,16 +124,34 @@ TXN_OUTCOME_CLEANUP_PENDING = "cleanup-pending"
 TXN_OUTCOME_DURABILITY_PENDING = "durability-pending"
 
 
-def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
-                   bytes_total: int = 0, cancellable: bool = True) -> None:
+def _claim_progress_fd() -> int | None:
+    """ROBLOX_MAC_PROGRESS_FD names the launcher's progress pipe. Only a
+    descriptor that is open now, before this process has opened anything of
+    its own, is that pipe; keep a private copy of it. When the number is not
+    open it is free, and a later socket or file of ours could land on it, so
+    never write to it then."""
     raw_fd = os.environ.get("ROBLOX_MAC_PROGRESS_FD", "")
     if not raw_fd.isdigit():
+        return None
+    try:
+        os.fstat(int(raw_fd))
+        return os.dup(int(raw_fd))
+    except OSError:
+        return None
+
+
+_PROGRESS_FD = _claim_progress_fd()
+
+
+def progress_event(phase: str, percent: int, message: str, bytes_done: int = 0,
+                   bytes_total: int = 0, cancellable: bool = True) -> None:
+    if _PROGRESS_FD is None:
         return
     payload = json.dumps({"phase": phase, "percent": percent, "message": message,
                           "bytes_done": bytes_done, "bytes_total": bytes_total,
                           "cancellable": bool(cancellable)}, separators=(",", ":"))
     try:
-        os.write(int(raw_fd), (payload + "\n").encode())
+        os.write(_PROGRESS_FD, (payload + "\n").encode())
     except (OSError, ValueError):
         pass
 
@@ -2198,13 +2217,37 @@ def remove_full_data(target: Path, manifest: dict[str, Any]) -> list[Path]:
     return removed
 
 
+def describe_http_failure(exc: BaseException, timeout: int) -> str:
+    """One plain sentence naming why a request to GitHub failed."""
+    if isinstance(exc, urllib.error.HTTPError):
+        headers = exc.headers or {}
+        if exc.code in (403, 429) and headers.get("X-RateLimit-Remaining") == "0":
+            reset = headers.get("X-RateLimit-Reset", "")
+            when = ""
+            if reset.isdigit():
+                when = time.strftime(" (it resets at %H:%M)", time.localtime(int(reset)))
+            return f"GitHub's limit of requests from this network was reached{when}"
+        return f"GitHub answered HTTP {exc.code} {exc.reason}".rstrip()
+    if isinstance(exc, (TimeoutError, socket.timeout)) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, (TimeoutError, socket.timeout))):
+        return f"GitHub did not answer within {timeout} seconds"
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, OSError) and reason.strerror:
+            reason = reason.strerror
+        return f"could not reach GitHub ({reason})"
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "GitHub's answer was not valid JSON"
+    return str(exc) or type(exc).__name__
+
+
 def fetch_json(url: str) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"User-Agent": f"{APP_ID}-installer", "Accept": "application/vnd.github+json"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.load(response)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        fail(f"Could not query the latest GitHub release: {exc}")
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        fail(f"Could not query the latest GitHub release: {describe_http_failure(exc, 30)}.")
 
 
 def latest_release_metadata() -> dict[str, Any]:

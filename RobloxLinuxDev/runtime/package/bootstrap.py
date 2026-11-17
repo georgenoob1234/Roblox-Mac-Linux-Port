@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Small headless state helper for the Roblox release bootstrapper."""
+import contextlib
+import fcntl
 import json
 import os
 import sys
@@ -11,15 +13,25 @@ DEFAULTS = {
     "auto_update": "ask",
     "check_interval_hours": 24,
     "skipped_version": "",
+    "skipped_port_version": "",
+    # Time of the last successful client check, and of the last attempt.
     "last_check": 0,
+    "last_attempt": 0,
     "last_known_latest": "",
     "last_known_latest_display": "",
+    # Why the last client update check failed ("" after a successful one).
+    "last_check_error": "",
     "window_decoration": "auto",
     "cursor_appearance": "system",
     "port_last_check": 0,
+    "port_last_attempt": 0,
     "port_latest": "",
 }
 VALID_MODES = {"auto", "ask", "off"}
+TIMESTAMPS = ("last_check", "last_attempt", "port_last_check", "port_last_attempt")
+# A failed lookup (offline, GitHub rate limit) is retried after this long,
+# not at every launch; after a successful one check_interval_hours applies.
+RETRY_AFTER_FAILURE = 3600
 VALID_DECORATIONS = {"auto", "system", "gtk", "legacy"}
 VALID_CURSORS = {"system", "legacy"}
 KNOWN_DISPLAY_VERSIONS = {
@@ -50,12 +62,13 @@ def read_settings(data):
         values["check_interval_hours"] = max(0, interval)
     except (TypeError, ValueError):
         values["check_interval_hours"] = DEFAULTS["check_interval_hours"]
-    for key in ("last_check", "port_last_check"):
+    for key in TIMESTAMPS:
         try:
             values[key] = max(0, int(values.get(key, 0)))
         except (TypeError, ValueError):
             values[key] = 0
-    for key in ("skipped_version", "last_known_latest", "last_known_latest_display", "port_latest"):
+    for key in ("skipped_version", "skipped_port_version", "last_known_latest", "last_known_latest_display", "port_latest",
+                "last_check_error"):
         value = values.get(key, "")
         values[key] = value if isinstance(value, str) else ""
     if values.get("window_decoration") not in VALID_DECORATIONS:
@@ -90,6 +103,21 @@ def write_settings(data, values):
         except OSError:
             pass
         raise
+
+
+@contextlib.contextmanager
+def settings_lock(data):
+    """Serialise read-modify-write of bootstrapper.json: the launcher's
+    background update check and the Settings window can write at once, and
+    an unlocked "set" could silently undo the other's change."""
+    path = Path(data)
+    path.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path / "bootstrapper.json.lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def installed_version(version_dir):
@@ -156,6 +184,33 @@ def emit(phase, percent, message, bytes_done=0, bytes_total=0, cancellable=True)
                       "cancellable": bool(cancellable)}, separators=(",", ":")))
 
 
+def settings_change(data, operation, argv):
+    values = read_settings(data)
+    if operation == "set" and len(argv) == 6:
+        key, value = argv[4], argv[5]
+        if key not in DEFAULTS:
+            raise SystemExit(2)
+        if key == "auto_update" and value not in VALID_MODES:
+            raise SystemExit("auto_update must be auto, ask or off")
+        if key == "window_decoration" and value not in VALID_DECORATIONS:
+            raise SystemExit("window_decoration must be auto, system, gtk or legacy")
+        if key == "cursor_appearance" and value not in VALID_CURSORS:
+            raise SystemExit("cursor_appearance must be system or legacy")
+        if key == "check_interval_hours":
+            value = max(0, int(value))
+        elif key in TIMESTAMPS:
+            value = max(0, int(value))
+        values[key] = value
+        write_settings(data, values)
+        return
+    if operation == "reset_appearance" and len(argv) == 4:
+        values["window_decoration"] = DEFAULTS["window_decoration"]
+        values["cursor_appearance"] = DEFAULTS["cursor_appearance"]
+        write_settings(data, values)
+        return
+    raise SystemExit(2)
+
+
 def main(argv):
     if len(argv) < 2:
         raise SystemExit("usage: bootstrap.py settings|status|event DATA ...")
@@ -169,27 +224,9 @@ def main(argv):
                 raise SystemExit(2)
             print(json.dumps(values[key]) if not isinstance(values[key], str) else values[key])
             return
-        if operation == "set" and len(argv) == 6:
-            key, value = argv[4], argv[5]
-            if key not in DEFAULTS:
-                raise SystemExit(2)
-            if key == "auto_update" and value not in VALID_MODES:
-                raise SystemExit("auto_update must be auto, ask or off")
-            if key == "window_decoration" and value not in VALID_DECORATIONS:
-                raise SystemExit("window_decoration must be auto, system, gtk or legacy")
-            if key == "cursor_appearance" and value not in VALID_CURSORS:
-                raise SystemExit("cursor_appearance must be system or legacy")
-            if key == "check_interval_hours":
-                value = max(0, int(value))
-            elif key in {"last_check", "port_last_check"}:
-                value = max(0, int(value))
-            values[key] = value
-            write_settings(data, values)
-            return
-        if operation == "reset_appearance" and len(argv) == 4:
-            values["window_decoration"] = DEFAULTS["window_decoration"]
-            values["cursor_appearance"] = DEFAULTS["cursor_appearance"]
-            write_settings(data, values)
+        if operation in {"set", "reset_appearance"}:
+            with settings_lock(data):
+                settings_change(data, operation, argv)
             return
         raise SystemExit(2)
     if command == "status" and len(argv) == 4:
@@ -230,11 +267,18 @@ def main(argv):
                 value = ""
         print(value)
         return
-    if command == "due" and len(argv) == 4:
+    if command == "due" and len(argv) in (4, 5):
+        # due DATA NOW [last_check|port_last_check]: is that check due?
         values = read_settings(argv[2])
         now = int(argv[3])
+        key = argv[4] if len(argv) == 5 else "last_check"
+        if key not in ("last_check", "port_last_check"):
+            raise SystemExit(2)
         interval = values["check_interval_hours"]
-        print("1" if interval == 0 or now - values["last_check"] >= interval * 3600 else "0")
+        succeeded, attempted = values[key], values[key.replace("check", "attempt")]
+        # An attempt newer than the last success failed or is still running.
+        waiting = attempted > succeeded and 0 <= now - attempted < RETRY_AFTER_FAILURE
+        print("1" if interval == 0 or (not waiting and now - succeeded >= interval * 3600) else "0")
         return
     raise SystemExit(2)
 

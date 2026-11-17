@@ -13,8 +13,33 @@ fi
 # DO_NOT_SHARE: a FUSE mount below it makes the launch-time in-namespace
 # bind-mount of the data directory fail with EINVAL.
 umask 077
-mkdir -p "$HERE/DO_NOT_SHARE/tmp"
-chmod 700 "$HERE/DO_NOT_SHARE"
+# run.sh's own failures come before bootstrap.sh can report anything: say what
+# failed, why and what to do where a launch from the desktop sees it (a
+# notification), and in the launcher log once the data folder exists (B6).
+LOG=$HERE/DO_NOT_SHARE/launcher.log
+run_failed() {
+    echo "roblox: $1" >&2
+    _body=$1
+    if [ -d "$HERE/DO_NOT_SHARE" ] &&
+       printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG" 2>/dev/null; then
+        _body="$1 Details: $LOG"
+    fi
+    if command -v gdbus >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] &&
+       gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+           --method org.freedesktop.Notifications.Notify Roblox 0 '' 'Roblox could not start' "$_body" '[]' '{}' 10000 >/dev/null 2>&1; then
+        :
+    elif command -v notify-send >/dev/null 2>&1 && notify-send --app-name=Roblox 'Roblox could not start' "$_body" >/dev/null 2>&1; then
+        :
+    elif command -v kdialog >/dev/null 2>&1 && timeout 8 kdialog --title 'Roblox could not start' --passivepopup "$_body" 10 >/dev/null 2>&1; then
+        :
+    elif command -v zenity >/dev/null 2>&1; then
+        timeout 8 zenity --notification --text="Roblox could not start: $_body" >/dev/null 2>&1 || true
+    fi
+    exit 1
+}
+if ! _err=$(mkdir -p "$HERE/DO_NOT_SHARE/tmp" 2>&1) || ! _err=$(chmod 700 "$HERE/DO_NOT_SHARE" 2>&1); then
+    run_failed "Its data folder $HERE/DO_NOT_SHARE could not be created (${_err##*: }). Make sure the install folder is writable and the disk has free space."
+fi
 # Repair an interrupted port-file transaction before any payload file is used.
 # The transaction, its journal and its backups live next to the install
 # directory, and its recovery entry point is kept outside the payload, so this
@@ -36,18 +61,22 @@ run_port_recovery() {
     elif [ -f "$HERE/installer.py" ]; then
         ROBLOX_MAC_LOCK_HELD=1 python3 "$HERE/installer.py" recover --prefix "$HERE"
     else
-        echo 'roblox: an interrupted port update must be repaired before launching, but its recovery helper is missing. Reinstall the port.' >&2
+        echo 'its recovery helper is missing' >&2
         return 1
     fi
 }
 recover_port_transaction() {
     port_transaction_pending || return 0
     _port_recovery_status=0
+    _port_recovery_errors=$HERE/DO_NOT_SHARE/.port-recovery-errors
     (
         exec 9>"$HERE/DO_NOT_SHARE/instance.lock" || exit 3
         flock -n -E 73 9 || exit 4
         run_port_recovery
-    ) || _port_recovery_status=$?
+    ) 2>"$_port_recovery_errors" || _port_recovery_status=$?
+    cat "$_port_recovery_errors" >&2 2>/dev/null || true
+    _why=$(sed -n '/[^[:space:]]/p' "$_port_recovery_errors" 2>/dev/null | tail -n 1 | sed -e 's/^roblox: //' -e 's/^! //' -e 's/[.]$//')
+    rm -f -- "$_port_recovery_errors"
     case "$_port_recovery_status" in
         # 3 is the installer's applied/pending status: the committed release is
         # live, but its transaction durability is still unconfirmed. Launching
@@ -55,9 +84,9 @@ recover_port_transaction() {
         # the committed state. 4 means another instance owns the lock.
         0|3|4) return 0;;
     esac
-    return 1
+    run_failed "An interrupted port update could not be repaired (${_why:-the repair ended with status $_port_recovery_status}). Reinstall the port with its installer; DO_NOT_SHARE is kept."
 }
-recover_port_transaction || exit 1
+recover_port_transaction
 export APPIMAGELAUNCHER_DISABLE=1 _FORCE_HEADLESS=1
 export TARGET_APPIMAGE=$HERE/RobloxLinux.AppImage
 [ -n "${APPIMAGE_TARGET_DIR:-}" ] && [ -d "${APPIMAGE_TARGET_DIR:-}" ] || unset APPIMAGE_TARGET_DIR
@@ -75,7 +104,8 @@ if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG
 fi
 _created_app_target=0
 if [ -z "${APPIMAGE_TARGET_DIR:-}" ] || [ ! -d "${APPIMAGE_TARGET_DIR:-}" ]; then
-    _app_target=$(mktemp -d "$_short_base/rbx-mnt.XXXXXX")
+    _app_target=$(mktemp -d "$_short_base/rbx-mnt.XXXXXX" 2>&1) ||
+        run_failed "No temporary folder could be made in $_short_base (${_app_target##*: }). Make sure it is writable and the disk has free space."
     chmod 700 "$_app_target"
     export APPIMAGE_TARGET_DIR=$_app_target
     _created_app_target=1
@@ -267,7 +297,8 @@ if ! _is_internal_updater "$@"; then
     fi
     _created_run_alias=0
     if [ -z "${ROBLOX_MAC_ALIAS_DIR:-}" ] || [ ! -d "${ROBLOX_MAC_ALIAS_DIR:-}" ]; then
-        _alias_dir=$(mktemp -d "$_short_base/rbx.XXXXXX")
+        _alias_dir=$(mktemp -d "$_short_base/rbx.XXXXXX" 2>&1) ||
+            run_failed "No temporary folder could be made in $_short_base (${_alias_dir##*: }). Make sure it is writable and the disk has free space."
         chmod 700 "$_alias_dir"
         mkdir -m 700 "$_alias_dir/stage"
         mkdir -m 700 "$_alias_dir/data"

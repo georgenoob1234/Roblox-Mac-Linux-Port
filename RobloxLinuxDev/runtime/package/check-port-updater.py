@@ -1784,7 +1784,7 @@ exit 3
 
     # The GTK UI must take the same lock and consult the same state file, so
     # the handshake cannot be bypassed by the window itself.
-    ui_source = (PACKAGE / "bootstrapper-ui.c").read_text()
+    ui_source = "\n".join(path.read_text() for path in [PACKAGE / "bootstrapper-ui.c", *sorted((PACKAGE / "ui").glob("*.[ch]"))])
     assert "flock(fd, LOCK_EX)" in ui_source, "the UI must take the shared cancel lock"
     assert '"%s.lock"' in ui_source, "the UI must use the shared lock file"
     assert '.bootstrap-cancel-state' in ui_source, "the UI must read the shared state file"

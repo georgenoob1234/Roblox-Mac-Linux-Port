@@ -26,11 +26,17 @@ network, Darling runtime or real client is needed:
   16c. staged bundle symlinks are handled deliberately and persisted without error
 """
 import fcntl
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+# Launches in this check must never reach the tester's desktop.
+import sys as _sys  # noqa: E402
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import quiet_desktop  # noqa: E402
+quiet_desktop.install()
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "package"
@@ -58,9 +64,10 @@ assert "trap 'exit 130' INT" in UPDATE and "trap 'exit 143' TERM HUP" in UPDATE
 assert 'exec 7<"$HERE"' in UPDATE
 assert 'flock -n -E 74 7' in UPDATE
 assert 'exec 8<"$HERE"' not in UPDATE
-assert '--client-version 7>&- 8>&- 9>&-' in UPDATE
+assert '--client-version >"$version_file" 7>&- 8>&- 9>&-' in UPDATE
 assert '--download-client 7>&- 9>&-' in UPDATE
-assert '--prepare-shaders 7>&- 8>&- 9>&-' in UPDATE
+# Shader preparation keeps FD 8 too: it reports its progress there.
+assert '--prepare-shaders 7>&- 9>&-' in UPDATE
 # The updater stages inside the launcher-managed work directory; the runtime's
 # release confinement accepts ROBLOX_MAC_DATA there by canonical path prefix,
 # so staging must not masquerade as a live-launch alias data directory.
@@ -134,7 +141,7 @@ case "${1:-}" in
     chmod +x "$base/RobloxPlayer.app/Contents/MacOS/RobloxPlayer"
     printf '%s\\n' "$version" > "$base/.version";;
 --prepare-shaders)
-    test ! -e /proc/$$/fd/7; test ! -e /proc/$$/fd/8; test ! -e /proc/$$/fd/9
+    test ! -e /proc/$$/fd/7; test ! -e /proc/$$/fd/9
     cache="$(dirname "$ROBLOX_MAC_APP")/spv-cache-v1"
     mkdir -p "$cache"; printf '{}\\n' > "$cache/report.json";;
 --shell) mkdir -p "$(dirname -- "$0")/DO_NOT_SHARE/prefix";;
@@ -169,7 +176,10 @@ def snapshot(private):
         if not path.is_file():
             continue
         rel = str(path.relative_to(private))
-        if rel == "instance.lock" or rel.startswith("tmp/") or path.name.startswith((".check.", ".bootstrap-")):
+        # Launcher-owned files, not user data: the lock, transient state and
+        # the launcher's own log (bootstrap.sh writes launcher.log on purpose).
+        if rel in ("instance.lock", "launcher.log", "launcher.log.1") or rel.startswith("tmp/") or \
+                path.name.startswith((".check.", ".bootstrap-")):
             continue
         out[rel] = path.read_bytes()
     return out
@@ -393,8 +403,17 @@ with tempfile.TemporaryDirectory(prefix="roblox recovery ") as tmpdir:
     assert (release / "launched").exists(), "S7: launcher did not reach its download/check path"
     assert not (release / ".update-work").exists(), "S7: stale staging not removed"
     assert lock_free(private), "S7: the launch stranded the instance lock"
-    assert_intact(private, before, "S7")
-    print("  PASS 7: a missing client with stale staging continues to the download/check path.")
+    # With no client the launch looks up the latest version even when no check
+    # is due, and installs it, so its settings record the lookup; the rest of
+    # DO_NOT_SHARE, and the user's own choices in the settings, are unchanged.
+    settings = json.loads((private / "bootstrapper.json").read_text())
+    assert (settings["auto_update"], settings["check_interval_hours"]) == ("off", 24), settings
+    assert (release / "RobloxVersion/.version").read_text().strip() == settings["last_known_latest"], settings
+    settings_files = ("bootstrapper.json", "bootstrapper.json.lock")
+    unchanged = {k: v for k, v in before.items() if k not in settings_files}
+    assert {k: v for k, v in snapshot(private).items() if k not in settings_files} == unchanged, "S7: DO_NOT_SHARE changed"
+    assert not list(private.glob(".update.*")), "S7: staging leaked into DO_NOT_SHARE"
+    print("  PASS 7: a missing client with stale staging is installed and started.")
 
     # 8. Crash after the install rename but before cleanup: keep the new client.
     release, private = make_release(tmp / "s8")

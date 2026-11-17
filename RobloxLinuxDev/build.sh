@@ -86,6 +86,12 @@ fi
 python3 -B runtime/optimized/native/timezone-sidecar/check.py --library runtime/optimized/native/lib/libsystem_c.dylib
 python3 -B runtime/package/check-diagnostics.py
 python3 -B runtime/package/check-release.py
+python3 -B runtime/package/make-ui-icons.py --check
+python3 -B runtime/package/check-bootstrapper-windows.py
+python3 -B runtime/package/check-launch-updates.py
+python3 -B runtime/package/check-client-download.py
+python3 -B runtime/package/check-run-failures.py
+python3 -B runtime/package/check-progress-fd.py
 python3 -B runtime/package/check-update-recovery.py
 sh runtime/package/build-appimage.sh
 printf '\nBuilt: %s/runtime/package/roblox-mac-x86_64.AppImage\n' "$HERE"

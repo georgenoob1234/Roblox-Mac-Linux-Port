@@ -50,6 +50,7 @@ UPDATER = r'''#!/bin/sh
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 echo 'client-update' >> "$HERE/trace"
 printf 'progress-fd=%s\n' "${ROBLOX_MAC_PROGRESS_FD:-}" >> "$HERE/trace"
+printf 'update-final=%s\n' "${ROBLOX_MAC_UPDATE_FINAL:-1}" >> "$HERE/trace"
 [ -z "${CLIENT_UPDATE_ERROR:-}" ] || { echo 'fetching client version-0000bb' >&2; echo "$CLIENT_UPDATE_ERROR" >&2; exit 1; }
 printf '%s\n' "${CLIENT_LATEST:-version-0000bb}" > "$HERE/RobloxVersion/.version"
 '''
@@ -61,6 +62,7 @@ def trace(line):
         stream.write(line + "\n")
 if sys.argv[1] == "release-status":
     trace("port-check")
+    import time; time.sleep(float(os.environ.get("PORT_DELAY", "0")))
     latest = os.environ.get("PORT_LATEST", "")
     if not latest:
         print("! Could not query the latest GitHub release: could not reach GitHub (test).", file=sys.stderr)
@@ -87,7 +89,10 @@ sys.exit(2)
 
 PROMPT_UI = r'''#!/bin/sh
 case "${2:-}" in
-  --progress) cat >/dev/null; exit 0;;
+  --progress)
+    # Records every event; CANCEL_AFTER=N presses Cancel after N seconds.
+    [ -z "${CANCEL_AFTER:-}" ] || { (sleep "$CANCEL_AFTER"; : > "$ROBLOX_MAC_CANCEL_FILE") & }
+    cat >> "$TRACE.events"; exit 0;;
   --dialog) shift 2; printf 'prompt client=%s/%s port=%s/%s\n' "${2:-}" "${1:-}" "${4:-}" "${3:-}" >> "$TRACE"; exit "${PROMPT_ANSWER:-0}";;
 esac
 exit 3
@@ -225,7 +230,8 @@ def check_port_offer_only_when_newer(tmp):
     commit id, "dev") is never offered a release, which could be a downgrade;
     an older latest release is not offered either."""
     cases = [("v1.1.1", "v1.2.0", True), ("v1.2.0", "v1.2.0", False), ("v1.10.0", "v1.9.9", False),
-             ("v1.9.9", "v1.10.0", True), ("fc2ec72", "v1.2.0", False), ("dev", "v9.9.9", False)]
+             ("v1.9.9", "v1.10.0", True), ("fc2ec72", "v1.2.0", False), ("dev", "v9.9.9", False),
+             ("v1.2", "v1.2.0", False), ("v1.2.0", "v1.2", False)]
     for installed, latest, offered in cases:
         release = make_release(tmp, {"auto_update": "ask"})
         (release / ".roblox-mac-port-version").write_text(installed + "\n")
@@ -346,6 +352,17 @@ def check_no_client_is_installed_or_not_started(tmp):
         assert prompts(trace) == ["prompt client=/0.748.0.7480000 port=/"], (settings, trace)
         assert "client-update" in trace, (settings, trace)
         expect_game(games, "place", "v1.1.1", "version-0000bb")
+    # Review 2026-11-17: a version left behind (an old .display-version, old
+    # diagnostics) must not turn the Install prompt back into an update prompt.
+    release = no_client({"auto_update": "ask"})
+    (release / "RobloxVersion/.display-version").write_text("0.700.0.7000001")
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", PROMPT_ANSWER="0")
+    assert prompts(trace) == ["prompt client=/0.748.0.7480000 port=/"], trace
+    # Off means no updates: a port release recorded earlier is not installed along with the client.
+    release = no_client({"auto_update": "off", "port_latest": "v1.2.0"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.2.0", PROMPT_ANSWER="0")
+    assert prompts(trace) == ["prompt client=/0.748.0.7480000 port=/"] and "port-update" not in trace, trace
+    expect_game(games, "place", "v1.1.1", "version-0000bb")
     # Auto installs without asking.
     release = no_client({"auto_update": "auto"})
     result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1")
@@ -406,10 +423,62 @@ def check_lingering_appimage_daemon_does_not_delay(tmp):
     expect_game(games, "place", "v1.1.1", "version-0000aa")
 
 
+def events_of(release):
+    path = release / "trace.events"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+
+
+def check_window_stays_until_the_last_step(tmp):
+    """Review 2026-11-17: "update" closes the progress window. In a launch,
+    more follows (a port update, the launch itself), so the client update ends
+    with a step that keeps the window; only Settings' "Update now" ends with
+    "update"."""
+    for port_latest in ("v1.2.0", "v1.1.1"):
+        release = make_release(tmp, {"auto_update": "auto"})
+        result, trace, games = launch(release, "place", PORT_LATEST=port_latest)
+        assert "client-update" in trace and "update-final=0" in trace, (port_latest, trace)
+        events = events_of(release)
+        phases = [e["phase"] for e in events]
+        done = phases.index("complete")
+        assert "update" not in phases[:done], (port_latest, phases)
+        if port_latest == "v1.1.1":
+            assert "update" not in phases and phases[-1] == "launching", phases
+        else:
+            # The port update runs in the same window; its own "update" ends that
+            # window only because the launcher then restarts with a new one.
+            port_started = next(i for i, e in enumerate(events) if i > done and e["phase"] == "checking")
+            assert "update" not in phases[done:port_started], phases
+        assert len(games) == 1, (port_latest, trace)
+
+
+def check_cancel_while_checking_is_honoured(tmp):
+    """Review 2026-11-17: Cancel pressed while "Checking for updates" waited for
+    the port lookup was ignored and the game started."""
+    release = make_release(tmp, {"auto_update": "ask", "check_interval_hours": 24, "last_check": int(time.time()),
+                                 "last_known_latest": "version-0000aa"})
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1", PORT_DELAY="3", CANCEL_AFTER="0.5",
+                                  ROBLOX_MAC_UPDATE_CHECK_GRACE="5")
+    assert result.returncode == 125 and not games, (result.returncode, trace)
+
+
+def check_failed_recovery_is_reported(tmp):
+    """Review 2026-11-17: an interrupted update that left no usable client was
+    reported on stderr only; a launch from the desktop showed nothing."""
+    release = make_release(tmp, {"auto_update": "ask"})
+    (release / ".update-work").mkdir()
+    (release / ".update-work/TXN").write_text("committed version-0000bb 1\n")
+    result, trace, games = launch(release, "place", PORT_LATEST="v1.1.1")
+    assert result.returncode != 0 and not games, (result.returncode, trace)
+    sent = [line for line in notifications(release) if "Roblox could not start" in line]
+    assert sent and "interrupted update" in sent[-1], notifications(release)
+    assert (release / ".update-work/TXN").exists(), "the evidence must be kept"
+
+
 CHECKS = [check_updates_end_in_the_requested_game, check_skip_failed_auto_and_off, check_failures_say_what_why_and_where,
           check_port_offer_only_when_newer, check_failed_checks_retry_after_an_hour,
           check_no_client_is_installed_or_not_started, check_progress_fd_only_with_a_window,
-          check_lingering_appimage_daemon_does_not_delay]
+          check_lingering_appimage_daemon_does_not_delay, check_window_stays_until_the_last_step,
+          check_cancel_while_checking_is_honoured, check_failed_recovery_is_reported]
 
 
 def main():

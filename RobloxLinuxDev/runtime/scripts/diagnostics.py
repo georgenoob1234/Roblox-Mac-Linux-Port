@@ -165,6 +165,9 @@ def main():
             pass_fds = (int(progress_fd),)
         except OSError:
             pass
+    if not pass_fds:
+        # The command must not take the number for its pipe: it is not open.
+        env.pop('ROBLOX_MAC_PROGRESS_FD', None)
     with (folder / 'runtime.log').open('wb') as log:
         process = subprocess.Popen([str(launcher), *args], stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True, env=env,

@@ -460,6 +460,10 @@ print(status.get("installed_display_version") or installed)' "$client_latest" "$
                 client_shown=$(printf '%s\n' "$shown" | sed -n 1p)
                 installed_shown=$(printf '%s\n' "$shown" | sed -n 2p)
             fi
+            # No client installed: an old readable version (a leftover
+            # .display-version, old diagnostics) must not turn the Install
+            # prompt back into an update prompt.
+            [ -n "$client_installed" ] || installed_shown=
         else
             installed_shown=
         fi
@@ -737,6 +741,10 @@ def parse(value):
     match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", value.strip())
     return tuple(int(part) for part in match.group(1).split(".")) if match else None
 installed, latest = parse(sys.argv[1]), parse(sys.argv[2])
+if installed and latest:
+    # Missing parts count as 0 (v1.2 == v1.2.0), as in Settings (launcher.c).
+    width = max(len(installed), len(latest))
+    installed, latest = installed + (0,) * (width - len(installed)), latest + (0,) * (width - len(latest))
 sys.exit(0 if installed and latest and latest > installed else 1)
 PY
 }
@@ -762,23 +770,35 @@ finish_port_lookup() {
 # window's pipe is open on FD 8. Otherwise 8 is free and a child would write
 # into a pipe, socket or file of its own that landed there.
 progress_fd() { if [ "$UI_FD" = 1 ]; then printf 8; fi; }
+# do_update [more]: "more" when other steps follow in this window (a port
+# update, the launch); then the update ends with a step that keeps the window
+# open instead of "update", which closes it.
 do_update() {
+    update_final=1
+    [ "${1:-}" != more ] || update_final=0
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
     event downloading 25 'Downloading Roblox' 0 0 true
     # The bootstrapper keeps FD 9; updater children must not inherit it.
     update_errors=$DATA/.update-errors.$$
     timeout --foreground --kill-after=5s "${ROBLOX_MAC_UPDATE_TIMEOUT:-30m}" sh -c \
         'exec 9>&-; exec "$@"' sh env ROBLOX_MAC_LOCK_HELD=1 \
-            ROBLOX_MAC_PROGRESS_FD="$(progress_fd)" ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
+            ROBLOX_MAC_PROGRESS_FD="$(progress_fd)" ROBLOX_MAC_UPDATE_FINAL="$update_final" \
+            ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" \
             sh "$HERE/update-roblox.sh" 2>"$update_errors"
     update_status=$?
     keep_errors "$update_errors" update
     if [ "$update_status" -ne 0 ]; then
         if cancelled; then
             rm -f -- "$update_errors"
-            event cancelled 0 'Update cancelled; keeping the installed client' 0 0 false
-            say 'Update cancelled; the installed client was kept.'
-            notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
+            if [ -n "$(installed_version)" ]; then
+                event cancelled 0 'Update cancelled; keeping the installed client' 0 0 false
+                say 'Update cancelled; the installed client was kept.'
+                notify 'Update cancelled; the installed client was kept. Roblox was not started.' 'Roblox update cancelled'
+            else
+                event cancelled 0 'Install cancelled' 0 0 false
+                say 'Install cancelled; nothing was installed.'
+                notify 'Install cancelled; nothing was installed. Roblox was not started.' 'Roblox install cancelled'
+            fi
             return 125
         fi
         if [ "$update_status" -eq 124 ]; then
@@ -798,7 +818,11 @@ do_update() {
     rm -f -- "$update_errors"
     if cancelled; then event cancelled 0 'Update cancelled' 0 0 false; return 125; fi
     # update-roblox.sh reported its own steps; do not wind the bar back.
-    event update 100 'Update complete' 0 0 false
+    if [ "$update_final" = 1 ]; then
+        event update 100 'Update complete' 0 0 false
+    else
+        event complete 100 'Roblox updated' 0 0 true
+    fi
 }
 
 do_port_update() {
@@ -938,7 +962,10 @@ if ! flock -n -E 73 9; then
     notify 'Roblox is already running.' 'Roblox is already running'
     exit 0
 fi
-recover_interrupted_update || { exec 9>&-; finish_progress; exit 1; }
+recover_interrupted_update || {
+    report_failure 'Roblox could not start' 'an interrupted update left no usable client' \
+        'Reinstall the port with its installer; DO_NOT_SHARE is kept.'
+    exec 9>&-; finish_progress; exit 1; }
 start_progress || { exec 9>&-; exit 1; }
 first_run || { exec 9>&-; finish_progress; exit 1; }
 installed=$(installed_version)
@@ -956,9 +983,10 @@ unset ROBLOX_MAC_PORT_RESTARTED
 if [ "$client_missing" = 1 ]; then latest=$(check_latest wait); else latest=$(check_latest); fi
 check_result=$?
 port_latest=$(finish_port_lookup)
-if [ "$check_result" -eq 125 ] || [ "$UI_CANCELLED" -eq 1 ]; then
+if [ "$check_result" -eq 125 ] || cancelled; then
+    event cancelled 0 'Launch cancelled' 0 0 false
     finish_progress
-    notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'
+    say 'Launch cancelled while checking for updates; nothing was changed.'
     exit 125
 fi
 if [ "$client_missing" = 1 ] && [ -z "$latest" ]; then
@@ -981,6 +1009,8 @@ if [ "$restarted" != 1 ] && [ -f "$HERE/installer.py" ] && [ -n "$port_latest" ]
         port_offer=$port_latest
     fi
 fi
+# Off means no updates: only a missing client is offered (as an install).
+[ "$mode" != off ] || port_offer=
 [ -n "$port_offer" ] || port_installed=
 answer=1
 if [ -n "$client_offer$port_offer" ]; then
@@ -999,8 +1029,9 @@ if [ "$answer" -eq 125 ]; then
     exit 125
 fi
 if [ "$answer" -eq 0 ] && [ -n "$client_offer" ]; then
-    do_update; result=$?
-    [ "$result" -eq 125 ] && { finish_progress; notify 'Update cancelled; the installed client was kept. The browser link was not launched.' 'Roblox update cancelled'; exit 125; }
+    # The launch (or a port update) follows in the same window.
+    do_update more; result=$?
+    [ "$result" -eq 125 ] && { finish_progress; exit 125; }
     # A failed install has nothing to start; do_update has said why.
     [ -n "$(installed_version)" ] || { exec 9>&-; finish_progress; exit 1; }
 fi
@@ -1032,6 +1063,13 @@ if [ -n "${ROBLOX_MAC_URI_RECEIVED_AT:-}" ] && [ -n "${ROBLOX_MAC_LAUNCH_URI:-}"
         notify 'The browser link expired; Roblox is launching normally.' 'Roblox link expired'
         unset ROBLOX_MAC_LAUNCH_URI
     fi
+fi
+# Cancel pressed at the last moment (while checking, or between steps).
+if cancelled; then
+    event cancelled 0 'Launch cancelled' 0 0 false
+    finish_progress
+    say 'Launch cancelled; Roblox was not started.'
+    exit 125
 fi
 event launching 100 'Launching Roblox' 0 0 false
 finish_progress

@@ -85,10 +85,34 @@ def written_to_inherited_pipe(kind, path):
         return reader.read()
 
 
+def translate_all_probe_survives(shell):
+    """translate-all.sh checks the named descriptor before using it. The check
+    must not end the script when the descriptor is closed (review 2026-11-17:
+    `: >&8` is a special builtin, and its failed redirection exits the shell)."""
+    text = (HERE.parent / "metal" / "translate-all.sh").read_text()
+    start = text.index("progress_fd=${ROBLOX_MAC_PROGRESS_FD:-}")
+    end = text.index("\n", text.index("|| progress_fd=", start))
+    probe = text[start:end] + '\necho "survived fd=[$progress_fd]"\n'
+    result = subprocess.run([shell, "-c", probe], env={**os.environ, "ROBLOX_MAC_PROGRESS_FD": "8"},
+                            capture_output=True, text=True, close_fds=True, timeout=30)
+    return result.stdout.strip() == "survived fd=[]", (shell, result.returncode, result.stdout, result.stderr)
+
+
 def main():
+    import shutil
+    failed = 0
+    for shell in ("sh", "dash"):
+        if not shutil.which(shell):
+            print(f"skip translate-all probe under {shell}: not installed")
+            continue
+        ok, detail = translate_all_probe_survives(shell)
+        if ok:
+            print(f"ok   translate-all.sh: a closed descriptor is dropped, not fatal ({shell})")
+        else:
+            failed += 1
+            print(f"FAIL translate-all.sh probe under {shell}: {detail}")
     readers = [("prepare-cache", HERE.parent / "metal" / "prepare-cache.py"),
                ("installer", TOP / "installer" / "installer.py")]
-    failed = 0
     for kind, path in readers:
         for label, check in (("never writes to a descriptor it did not inherit",
                               lambda: written_to_foreign_fd(kind, path) == "b''"),

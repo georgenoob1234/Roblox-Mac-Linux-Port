@@ -25,7 +25,8 @@ mkdir -p "$TMPDIR"
 progress_fd=${ROBLOX_MAC_PROGRESS_FD:-}
 case "$progress_fd" in ''|*[!0-9]*) progress_fd=;; esac
 # Only a descriptor that is open now is the updater's pipe.
-[ -z "$progress_fd" ] || { : >&"$progress_fd"; } 2>/dev/null || progress_fd=
+# (`true`, not `:`: a failed redirection on a special builtin ends the script.)
+[ -z "$progress_fd" ] || { true >&"$progress_fd"; } 2>/dev/null || progress_fd=
 poller=
 total=$(find "$OUT/air" -maxdepth 1 -name '*.air' | wc -l)
 if [ -n "$progress_fd" ] && [ "$total" -gt 0 ]; then

@@ -264,5 +264,11 @@ mv "$WORK/next" "$HERE/RobloxVersion"
 # The install is only committed once both sides of this rename are synced;
 # that is what makes deleting the backup safe afterwards.
 fsync_dir "$HERE" "$WORK"
-progress update 100 'Update complete' 0 0 false
+# "update" closes the window; when the launcher has more to do in it (the
+# launch, a port update) it asks for a step that keeps the window open.
+if [ "${ROBLOX_MAC_UPDATE_FINAL:-1}" = 0 ]; then
+    progress complete 100 'Roblox updated' 0 0 true
+else
+    progress update 100 'Update complete' 0 0 false
+fi
 echo "Roblox updated: $(cat "$HERE/RobloxVersion/.version")"

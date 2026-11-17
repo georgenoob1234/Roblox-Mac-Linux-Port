@@ -178,15 +178,18 @@ ROBLOX_MAC_DATA="$WORK/data" \
     ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --download-client 7>&- 9>&-
 mv "$WORK/data" "$WORK/next"
 if cancelled; then progress cancelled 0 'Update cancelled' 0 0 false; exit 125; fi
-progress verifying 74 'Verifying the downloaded client' 0 0 true
+# The shader tools report "Translating shaders" then "Checking shaders (N of M)" from 74 to 90 % on the
+# progress channel (FD 8), so the window does not sit still on the long step.
+progress preparing 74 'Preparing shaders' 0 0 true
 if ! ROBLOX_MAC_DATA="$WORK/next/runtime" ROBLOX_MAC_APP="$WORK/next/RobloxPlayer.app" \
-    ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --debug --prepare-shaders 7>&- 8>&- 9>&- ||
+    ROBLOX_MAC_PROGRESS_FD="${ROBLOX_MAC_PROGRESS_FD:-}" \
+    ROBLOX_MAC_CANCEL_FILE="${ROBLOX_MAC_CANCEL_FILE:-}" sh "$HERE/run.sh" --debug --prepare-shaders 7>&- 9>&- ||
    [ ! -f "$WORK/next/spv-cache-v1/report.json" ]; then
     echo 'Shader preparation failed; the previous client has not been changed.' >&2
     exit 1
 fi
 if cancelled; then progress cancelled 0 'Update cancelled' 0 0 false; exit 125; fi
-progress preparing 90 'Preparing shaders' 0 0 true
+progress verifying 90 'Verifying the downloaded client' 0 0 true
 rm -rf -- "$WORK/next/runtime"
 # Verify the staged client in full before committing anything.
 if [ ! -x "$WORK/next/RobloxPlayer.app/Contents/MacOS/RobloxPlayer" ] ||

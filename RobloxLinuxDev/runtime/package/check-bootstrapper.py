@@ -445,9 +445,10 @@ case "${1:-}" in
 esac
 if [ "${1:-}" = --prepare-shaders ]; then
     test ! -e /proc/$$/fd/7
-    test ! -e /proc/$$/fd/8
+    test -e /proc/$$/fd/8
     test ! -e /proc/$$/fd/9
     printf 'prepare-locks-closed\\n' >> "$TRACE"
+    printf '%s\\n' '{"phase":"preparing","percent":80,"message":"Preparing shaders (5 of 10)","bytes_done":0,"bytes_total":0,"cancellable":true}' >&8
     mkdir -p "$(dirname -- "$ROBLOX_MAC_APP")/spv-cache-v1"
     printf '{}\\n' > "$(dirname -- "$ROBLOX_MAC_APP")/spv-cache-v1/report.json"
     exit 0
@@ -468,7 +469,14 @@ exit 2
     byte_events = [event for event in handoff_lines
                    if event["phase"] == "downloading" and event["bytes_total"] == 100]
     assert [event["bytes_done"] for event in byte_events[:2]] == [10, 40], byte_events
-    assert any(event["phase"] == "verifying" for event in handoff_lines)
+    # George (e2e 2026-11-17): "Verifying" sat at 74 % during shader preparation.
+    # The long step is labelled "Preparing shaders" and reports its own progress;
+    # "Verifying" is the short check after it.
+    phases = [event["phase"] for event in handoff_lines]
+    assert "preparing" in phases and "verifying" in phases, phases
+    assert phases.index("preparing") < phases.index("verifying"), phases
+    assert {"phase": "preparing", "percent": 74} .items() <= next(e for e in handoff_lines if e["phase"] == "preparing").items(), handoff_lines
+    assert any(e["message"] == "Preparing shaders (5 of 10)" for e in handoff_lines), handoff_lines
     assert handoff_lines[-1]["phase"] == "update"
     assert handoff_trace.read_text().splitlines() == [
         "download-locks-closed", "prepare-locks-closed"]

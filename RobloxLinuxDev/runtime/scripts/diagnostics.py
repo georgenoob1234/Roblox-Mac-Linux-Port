@@ -155,9 +155,20 @@ def main():
     start, started = time.monotonic(), time.time()
     env = dict(os.environ)
     env.setdefault('VK_LOADER_DEBUG', 'error,warn')
+    # The updater's progress channel must reach the launched command (shader
+    # preparation reports through it); Popen closes every other descriptor.
+    pass_fds = ()
+    progress_fd = env.get('ROBLOX_MAC_PROGRESS_FD', '')
+    if progress_fd.isdigit():
+        try:
+            os.fstat(int(progress_fd))
+            pass_fds = (int(progress_fd),)
+        except OSError:
+            pass
     with (folder / 'runtime.log').open('wb') as log:
         process = subprocess.Popen([str(launcher), *args], stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, start_new_session=True, env=env)
+                                   stderr=subprocess.STDOUT, start_new_session=True, env=env,
+                                   pass_fds=pass_fds)
 
         def forward(signum, frame):
             try:

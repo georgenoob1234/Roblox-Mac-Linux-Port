@@ -66,7 +66,8 @@ assert 'flock -n -E 74 7' in UPDATE
 assert 'exec 8<"$HERE"' not in UPDATE
 assert '--client-version 7>&- 8>&- 9>&-' in UPDATE
 assert '--download-client 7>&- 9>&-' in UPDATE
-assert '--prepare-shaders 7>&- 8>&- 9>&-' in UPDATE
+# Shader preparation keeps FD 8 too: it reports its progress there.
+assert '--prepare-shaders 7>&- 9>&-' in UPDATE
 # The updater stages inside the launcher-managed work directory; the runtime's
 # release confinement accepts ROBLOX_MAC_DATA there by canonical path prefix,
 # so staging must not masquerade as a live-launch alias data directory.
@@ -140,7 +141,7 @@ case "${1:-}" in
     chmod +x "$base/RobloxPlayer.app/Contents/MacOS/RobloxPlayer"
     printf '%s\\n' "$version" > "$base/.version";;
 --prepare-shaders)
-    test ! -e /proc/$$/fd/7; test ! -e /proc/$$/fd/8; test ! -e /proc/$$/fd/9
+    test ! -e /proc/$$/fd/7; test ! -e /proc/$$/fd/9
     cache="$(dirname "$ROBLOX_MAC_APP")/spv-cache-v1"
     mkdir -p "$cache"; printf '{}\\n' > "$cache/report.json";;
 --shell) mkdir -p "$(dirname -- "$0")/DO_NOT_SHARE/prefix";;

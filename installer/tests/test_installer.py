@@ -404,6 +404,7 @@ def test_desktop_conflicts_and_association_preservation() -> None:
 
 if __name__ == "__main__":
     test_install_update_reinstall_uninstall_and_recovery()
+    test_state_aware_menu_and_desktop_choice()
     test_symlink_archive_checksum_and_download_failures()
     test_release_check_failures_name_the_cause()
     test_desktop_conflicts_and_association_preservation()

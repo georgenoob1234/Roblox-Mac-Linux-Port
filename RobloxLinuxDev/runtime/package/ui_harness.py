@@ -34,15 +34,15 @@ class Display:
         self.process = None
         self.number = None
 
-    def __enter__(self):
+    def _start(self):
+        if self.process:
+            if self.process.poll() is None:
+                self.process.kill()
+            self.process.wait()
+            self.process = None
         broadwayd = shutil.which("broadwayd")
         if not broadwayd:
             raise Unavailable("broadwayd is not installed (GTK 3's libgtk-3-bin)")
-        # Socket names are limited to 108 bytes and build.sh points TMPDIR deep
-        # into the checkout, so the runtime directory goes to /tmp when it can.
-        short = "/tmp" if os.access("/tmp", os.W_OK) else None
-        self.runtime = tempfile.mkdtemp(prefix="ui-display-", dir=short)
-        os.chmod(self.runtime, 0o700)
         # GDK and broadwayd meet on an abstract socket named after the runtime
         # directory and the display number, so a private runtime directory
         # cannot collide with any other display. The web view broadwayd also
@@ -68,12 +68,24 @@ class Display:
                 # Keep draining so broadwayd never blocks on a full pipe.
                 threading.Thread(target=process.stdout.read, daemon=True).start()
                 self.process, self.number = process, number
-                return self
+                return
             process.kill()
             process.wait()
             process.stdout.close()
-        self.__exit__(None, None, None)
         raise Unavailable("broadwayd did not start")
+
+    def __enter__(self):
+        # Socket names are limited to 108 bytes and build.sh points TMPDIR deep
+        # into the checkout, so the runtime directory goes to /tmp when it can.
+        short = "/tmp" if os.access("/tmp", os.W_OK) else None
+        self.runtime = tempfile.mkdtemp(prefix="ui-display-", dir=short)
+        os.chmod(self.runtime, 0o700)
+        try:
+            self._start()
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
 
     def __exit__(self, *exc):
         if self.process:
@@ -93,6 +105,8 @@ class Display:
         return env
 
     def open(self, *argv, env=None, stdin=subprocess.DEVNULL):
+        if self.process is None or self.process.poll() is not None:
+            self._start()
         return Window(self, argv, env, stdin)
 
 
@@ -118,14 +132,18 @@ class Window:
 
     def __exit__(self, *exc):
         if self.process.poll() is None:
-            self.process.kill()
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
         self.process.wait()
         if self.process.stderr:
             self.process.stderr.close()
         os.close(self.commands)
         shutil.rmtree(self.state, ignore_errors=True)
 
-    def send(self, command, timeout=5.0):
+    def send(self, command, timeout=15.0):
         """Send one command; return its JSON answer, or None if the UI has exited."""
         os.write(self.commands, (command + "\n").encode())
         deadline = time.monotonic() + timeout

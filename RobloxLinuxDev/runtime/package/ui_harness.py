@@ -33,6 +33,7 @@ class Display:
         self.runtime = None
         self.process = None
         self.number = None
+        self._dirty = False
 
     def _start(self):
         if self.process:
@@ -67,7 +68,7 @@ class Display:
             if b"Listening on" in output and b"Unable" not in output and process.poll() is None:
                 # Keep draining so broadwayd never blocks on a full pipe.
                 threading.Thread(target=process.stdout.read, daemon=True).start()
-                self.process, self.number = process, number
+                self.process, self.number, self._dirty = process, number, False
                 return
             process.kill()
             process.wait()
@@ -105,7 +106,7 @@ class Display:
         return env
 
     def open(self, *argv, env=None, stdin=subprocess.DEVNULL):
-        if self.process is None or self.process.poll() is not None:
+        if self._dirty or self.process is None or self.process.poll() is not None:
             self._start()
         return Window(self, argv, env, stdin)
 
@@ -114,6 +115,7 @@ class Window:
     """One bootstrapper-ui process and its test channel."""
 
     def __init__(self, display, argv, env, stdin):
+        self.display = display
         self.state = tempfile.mkdtemp(prefix="ui-test-")
         self.command_path = Path(self.state) / "in"
         self.reply_path = Path(self.state) / "out"
@@ -132,6 +134,9 @@ class Window:
 
     def __exit__(self, *exc):
         if self.process.poll() is None:
+            # Abrupt client teardown can kill broadwayd asynchronously; restart
+            # it before the next window instead of racing its exit.
+            self.display._dirty = True
             self.process.terminate()
             try:
                 self.process.wait(timeout=2)

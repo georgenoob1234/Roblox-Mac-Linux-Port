@@ -510,6 +510,30 @@ static void cancel_gl_handoff() {
     if(gl_handoff_callback)wl_callback_destroy(gl_handoff_callback);
     gl_handoff_callback=nullptr;
 }
+static void sync_browser_visibility() {
+    if(!game)return;
+    if((current!=nullptr)==browser_visible)return;
+    browser_visible=current!=nullptr;
+    can_present=!browser_visible;
+    cancel_gl_handoff();
+    cancel_vulkan_handoff();
+    if(browser_visible) {
+        // Browser visibility must not leave a NULL buffer cached behind
+        // the synchronization used for Vulkan-to-GL handoff.
+        wl_subsurface_set_desync(subsurface);
+        if(vulkan_subsurface)wl_subsurface_set_desync(vulkan_subsurface);
+        auto surface=(wl_surface*)SDL_GetPointerProperty(SDL_GetWindowProperties(game),SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER,nullptr);
+        wl_surface_attach(surface,nullptr,0,0);wl_surface_commit(surface);
+        if(vulkan_surface){wl_surface_attach(vulkan_surface,nullptr,0,0);wl_surface_commit(vulkan_surface);}
+    } else {
+        // Re-arm the game subsurfaces and schedule a toplevel commit as soon
+        // as the browser closes instead of waiting for a later guest poll.
+        wl_subsurface_set_desync(subsurface);
+        if(vulkan_subsurface)wl_subsurface_set_desync(vulkan_subsurface);
+        if(window)gtk_widget_queue_draw(window);
+    }
+    wl_display_flush(display);
+}
 static void pump() {
     // Drain currently ready events only; never block the guest render thread.
     for(int i=0;i<64 && g_main_context_pending(nullptr);i++)g_main_context_iteration(nullptr,FALSE);
@@ -517,22 +541,7 @@ static void pump() {
     wl_display_dispatch_queue_pending(display,pointer_queue);
     refresh_pointer_focus();
     update_profiler_overlay();
-    if((current!=nullptr)!=browser_visible) {
-        browser_visible=current!=nullptr;
-        can_present=!browser_visible;
-        if(browser_visible) {
-            cancel_gl_handoff();
-            cancel_vulkan_handoff();
-            // Browser visibility must not leave a NULL buffer cached behind
-            // the synchronization used for Vulkan-to-GL handoff.
-            wl_subsurface_set_desync(subsurface);
-            if(vulkan_subsurface)wl_subsurface_set_desync(vulkan_subsurface);
-            auto surface=(wl_surface*)SDL_GetPointerProperty(SDL_GetWindowProperties(game),SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER,nullptr);
-            wl_surface_attach(surface,nullptr,0,0);wl_surface_commit(surface);
-            if(vulkan_surface){wl_surface_attach(vulkan_surface,nullptr,0,0);wl_surface_commit(vulkan_surface);}
-            wl_display_flush(display);
-        }
-    }
+    sync_browser_visibility();
 }
 static Uint8 gtk_click_counts[256];
 static bool translate_gtk_button(const GdkEventButton &b,const GdkEvent *next,SDL_MouseButtonEvent &out) {
@@ -1031,7 +1040,7 @@ static bool initialize_ui() {
     auto focus=+[](GObject*,GParamSpec*,gpointer){refresh_pointer_focus();};
     g_signal_connect(window,"notify::is-active",G_CALLBACK(focus),nullptr);
     g_signal_connect(window,"notify::visible",G_CALLBACK(focus),nullptr);
-    g_signal_connect(stack,"notify::visible-child",G_CALLBACK(focus),nullptr);pump();
+    g_signal_connect(stack,"notify::visible-child",G_CALLBACK(+[](GObject*,GParamSpec*,gpointer){sync_browser_visibility();refresh_pointer_focus();}),nullptr);pump();
     g_printerr("WAYLAND helper ready\n");return true;
 }
 // GTK/JSC must run on a Linux pthread stack. Darling switches its guest main
@@ -1150,17 +1159,34 @@ static bool ignore_terminal_resize() {
     // is irrelevant to this GUI; Wayland configure events resize its windows.
     return signal(SIGWINCH,SIG_IGN)!=SIG_ERR;
 }
+static bool block_native_thread_signals(sigset_t *previous) {
+    // Native GTK/WebKit/SDL/driver threads have no Darling per-thread RPC
+    // socket, so any signal routed to them through Darling's process-wide
+    // sigexc_handler would otherwise abort. Block all async signals here so
+    // the UI thread and every child thread it spawns inherit the mask, while
+    // leaving synchronous fault signals unblocked and Darwin threads intact.
+    sigset_t mask;
+    if(sigfillset(&mask)!=0)return false;
+    for(int sig:{SIGSEGV,SIGBUS,SIGFPE,SIGILL,SIGTRAP,SIGABRT,SIGSYS})
+        sigdelset(&mask,sig);
+    return pthread_sigmask(SIG_BLOCK,&mask,previous)==0;
+}
 extern "C" const RbxWaylandAPI *rbx_wayland_api() {
     static bool ready=[] {
         // Set the disposition before starting any native helper threads.
         if(!ignore_terminal_resize()){g_printerr("Wayland signal setup failed: %s\n",strerror(errno));return false;}
+        sigset_t previous_mask;
+        bool masked=block_native_thread_signals(&previous_mask);
+        if(!masked)g_printerr("Wayland native signal mask setup failed: %s\n",strerror(errno));
         std::promise<bool> startup;auto result=startup.get_future();
         std::thread([&startup] {
             ui_thread=std::this_thread::get_id();
             auto main=g_main_context_default();g_main_context_acquire(main);
             bool ok=initialize_ui();startup.set_value(ok);
             if(ok)gtk_main();g_main_context_release(main);
-        }).detach();return result.get();
+        }).detach();
+        if(masked)pthread_sigmask(SIG_SETMASK,&previous_mask,nullptr);
+        return result.get();
     }();
     static RbxWaylandAPI api={native_display,
         [](int w,int h)->void*{return on_ui([=]{return create_window(w,h);});},native_surface,

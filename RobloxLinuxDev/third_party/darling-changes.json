@@ -11,7 +11,9 @@
     "src/external/darlingserver/src/server.cpp",
     "src/external/darlingserver/src/message.cpp",
     "src/external/darlingserver/internal-include/darlingserver/message.hpp",
-    "src/startup/darling.c"
+    "src/startup/darling.c",
+    "src/startup/mldr/elfcalls/threads.c",
+    "src/external/xnu/darling/src/libsystem_kernel/emulation/src/linux_premigration/signal/sigexc.c"
   ],
   "deleted": []
 }

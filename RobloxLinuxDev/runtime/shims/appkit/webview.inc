@@ -4,6 +4,7 @@
 #import <Foundation/NSDate.h>
 #import <Foundation/NSHTTPCookie.h>
 #import <Foundation/NSNull.h>
+#import <Foundation/NSException.h>
 static char stateKey;
 static BOOL validUserAgent(NSString *agent) {
     const unsigned char *p=(const unsigned char *)[agent UTF8String];
@@ -89,13 +90,17 @@ static long request(NSMutableDictionary *message,void (^completion)(id,NSError *
     NSMutableArray *scripts=stateFor(self)[@"scripts"];if(!scripts)stateFor(self)[@"scripts"]=scripts=[NSMutableArray array];[scripts addObject:script];
 }
 @end
-@interface RbxFrameInfo:NSObject { @public NSURLRequest *_request; }
+@interface RbxFrameInfo:NSObject { @public NSURLRequest *_request;BOOL _mainFrame;id _webView; }
 @end
 @implementation RbxFrameInfo
 - (id)request {return _request;}
+- (BOOL)isMainFrame {return _mainFrame;}
+- (id)webView {return _webView;}
+- (id)securityOrigin {return nil;}
+- (id)copyWithZone:(NSZone *)zone {return [self retain];}
 - (void)dealloc {[_request release];[super dealloc];}
 @end
-@interface RbxNavigation:NSObject { @public NSURLRequest *_request;long _type; }
+@interface RbxNavigation:NSObject { @public NSURLRequest *_request;long _type;id _webView; }
 @end
 @implementation RbxNavigation
 - (NSURLRequest *)request {return _request;}
@@ -103,7 +108,8 @@ static long request(NSMutableDictionary *message,void (^completion)(id,NSError *
 - (id)targetFrame {
     // New-window requests are handled by the GTK host; these actions target an
     // existing frame. nil tells Roblox to open an external desktop browser.
-    RbxFrameInfo *frame=[[[RbxFrameInfo alloc] init] autorelease];frame->_request=[_request retain];return frame;
+    RbxFrameInfo *frame=[[[RbxFrameInfo alloc] init] autorelease];
+    frame->_request=[_request retain];frame->_mainFrame=YES;frame->_webView=_webView;return frame;
 }
 - (id)sourceFrame {return nil;}
 - (void)dealloc {[_request release];[super dealloc];}
@@ -202,9 +208,28 @@ static void receiveMessage(NSDictionary *message) {
         if(stage==2 && [delegate respondsToSelector:@selector(webView:didCommitNavigation:)])[delegate webView:view didCommitNavigation:view->_navigation];
         if(stage==3 && [delegate respondsToSelector:@selector(webView:didFinishNavigation:)])[delegate webView:view didFinishNavigation:view->_navigation];
     } else if([type isEqual:@"navigation"]) {
-        RbxNavigation *action=[[[RbxNavigation alloc] init] autorelease];action->_request=[[NSURLRequest requestWithURL:[NSURL URLWithString:message[@"url"]]] retain];action->_type=[message[@"type"] longValue];if(action->_type==5)action->_type=-1;
-        void (^decide)(long)=^(long allow){sendMessage([NSDictionary dictionaryWithObjectsAndKeys:@"policy",@"op",message[@"decision"],@"decision",[NSNumber numberWithInt:allow!=0],@"allow",nil]);};
-        if([delegate respondsToSelector:@selector(webView:decidePolicyForNavigationAction:decisionHandler:)])[delegate webView:view decidePolicyForNavigationAction:action decisionHandler:decide];else decide(1);
+        id decisionKey=message[@"decision"];
+        NSString *urlString=message[@"url"];
+        NSURL *url=urlString?[NSURL URLWithString:urlString]:nil;
+        RbxNavigation *action=[[[RbxNavigation alloc] init] autorelease];
+        action->_request=url?[[NSURLRequest requestWithURL:url] retain]:nil;
+        action->_type=[message[@"type"] longValue];if(action->_type==5)action->_type=-1;
+        action->_webView=view;
+        __block BOOL decided=NO;
+        void (^decide)(long)=^(long allow){
+            if(decided || !decisionKey)return;
+            decided=YES;
+            sendMessage([NSDictionary dictionaryWithObjectsAndKeys:@"policy",@"op",decisionKey,@"decision",[NSNumber numberWithInt:allow!=0],@"allow",nil]);
+        };
+        if([delegate respondsToSelector:@selector(webView:decidePolicyForNavigationAction:decisionHandler:)]) {
+            @try {
+                [delegate webView:view decidePolicyForNavigationAction:action decisionHandler:decide];
+            } @catch(NSException *exception) {
+                fprintf(stderr,"roblox-mac: webView navigation delegate exception: %s: %s\n",
+                    [[exception name] UTF8String]?: "",[[exception reason] UTF8String]?: "");
+                decide(1);
+            }
+        } else decide(1);
     } else if([type isEqual:@"message"]) {
         id controller=[view->_configuration userContentController],handler=[[stateFor(controller)[@"handlers"][message[@"name"]] retain] autorelease];
         RbxScriptMessage *m=[[[RbxScriptMessage alloc] init] autorelease];m->_body=[message[@"body"] retain];m->_name=[message[@"name"] copy];m->_webView=[view retain];

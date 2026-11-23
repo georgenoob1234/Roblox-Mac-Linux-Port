@@ -93,7 +93,8 @@ struct Peer {int fd;std::string input;std::deque<std::string> output;guint write
 static Peer *peer;
 struct Page {long id;WebKitWebView *view;bool delegate=false;std::string panel_title;};
 static std::map<long,Page*> pages;
-static std::map<long,WebKitPolicyDecision*> decisions;
+struct PendingDecision {WebKitPolicyDecision *decision;long page_id;guint timeout_id;};
+static std::map<long,PendingDecision> decisions;
 static long decision_id;
 static bool native_wayland;
 static bool close_requested;
@@ -155,6 +156,12 @@ static void send_object(JsonObject *o) {
 static JsonObject *event(Page *p,const char *type) {
     auto o=json_object_new();json_object_set_int_member(o,"view",p?p->id:0);json_object_set_string_member(o,"event",type);return o;
 }
+static bool allowed_navigation_url(const char *url) {
+    if(!url)return false;
+    if(!g_strcmp0(url,"about:blank") || !g_strcmp0(url,"about:srcdoc"))return true;
+    if(g_str_has_prefix(url,"blob:https://") || g_str_has_prefix(url,"blob:http://") || g_str_has_prefix(url,"data:"))return true;
+    return false;
+}
 static bool web_url(const char *url) {
     if(!url || strlen(url)>16384)return false;
     for(const unsigned char *p=(const unsigned char*)url;*p;p++)if(*p<32 || *p==127)return false;
@@ -205,8 +212,27 @@ static void controls() {
         }
     }
 }
+static void cancel_page_decisions(long page_id) {
+    for(auto it=decisions.begin();it!=decisions.end();) {
+        if(it->second.page_id==page_id) {
+            if(it->second.timeout_id)g_source_remove(it->second.timeout_id);
+            webkit_policy_decision_ignore(it->second.decision);
+            g_object_unref(it->second.decision);
+            it=decisions.erase(it);
+        } else ++it;
+    }
+}
+static void cancel_all_decisions() {
+    for(auto &kv:decisions) {
+        auto &entry=kv.second;
+        if(entry.timeout_id)g_source_remove(entry.timeout_id);
+        webkit_policy_decision_ignore(entry.decision);
+        g_object_unref(entry.decision);
+    }
+    decisions.clear();
+}
 static void return_to_game(GtkWidget*,gpointer) {
-    if(current)send_object(event(current,"closed"));
+    if(current){cancel_page_decisions(current->id);send_object(event(current,"closed"));}
     current=nullptr;
     gtk_stack_set_visible_child(GTK_STACK(stack),socket_view);controls();
     gtk_widget_grab_focus(socket_view);
@@ -237,11 +263,12 @@ static gboolean policy(WebKitWebView *view,WebKitPolicyDecision *d,WebKitPolicyD
         auto o=event(p,"launch-url");json_object_set_string_member(o,"url",url);
         send_object(o);webkit_policy_decision_ignore(d);return TRUE;
     }
-    if(!web_url(url) && g_strcmp0(url,"about:blank")){webkit_policy_decision_ignore(d);return TRUE;}
+    if(!web_url(url) && !allowed_navigation_url(url)){webkit_policy_decision_ignore(d);return TRUE;}
     if(type==WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {webkit_policy_decision_ignore(d);webkit_web_view_load_uri(view,url);return TRUE;}
     if(!p->delegate)return FALSE;
-    long id=++decision_id;decisions[id]=(WebKitPolicyDecision*)g_object_ref(d);
-    g_timeout_add_seconds(15,expire_policy,(gpointer)id);
+    long id=++decision_id;
+    guint timer=g_timeout_add_seconds(15,expire_policy,(gpointer)id);
+    decisions[id]={(WebKitPolicyDecision*)g_object_ref(d),p->id,timer};
     auto o=event(p,"navigation");json_object_set_int_member(o,"decision",id);json_object_set_string_member(o,"url",url);
     json_object_set_int_member(o,"type",webkit_navigation_action_get_navigation_type(action));send_object(o);return TRUE;
 }
@@ -260,10 +287,23 @@ static Page *page(long id) {
     if(!context) {
         std::string base=browser_data;
         auto manager=webkit_website_data_manager_new("base-data-directory",(base+"/data").c_str(),"base-cache-directory",(base+"/cache").c_str(),nullptr);
+        // Login challenges (e.g. Arkose / PerimeterX) run inside third-party
+        // iframes; ITP and NO_THIRD_PARTY cookie policies break verification.
+        webkit_website_data_manager_set_itp_enabled(manager,FALSE);
         context=webkit_web_context_new_with_website_data_manager(manager);g_object_unref(manager);
-        webkit_cookie_manager_set_persistent_storage(webkit_web_context_get_cookie_manager(context),(base+"/cookies.sqlite").c_str(),WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+        auto cookies=webkit_web_context_get_cookie_manager(context);
+        webkit_cookie_manager_set_persistent_storage(cookies,(base+"/cookies.sqlite").c_str(),WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+        webkit_cookie_manager_set_accept_policy(cookies,WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
     }
     auto manager=webkit_user_content_manager_new();
+    // Keep navigator.platform consistent when compatible_user_agent() presents
+    // a macOS User-Agent, so anti-bot checks do not flag a Mac-UA/Linux-platform mismatch.
+    static const char *platform_shim=
+        "if(navigator.userAgent&&navigator.userAgent.indexOf('Macintosh')!==-1){"
+        "try{Object.defineProperty(Navigator.prototype,'platform',{get:function(){return 'MacIntel';},configurable:true});}catch(e){}}";
+    auto shim=webkit_user_script_new(platform_shim,WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,nullptr,nullptr);
+    webkit_user_content_manager_add_script(manager,shim);webkit_user_script_unref(shim);
     auto p=new Page{id,WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,"web-context",context,"user-content-manager",manager,nullptr))};
     g_object_unref(manager);pages[id]=p;
     gtk_stack_add_named(GTK_STACK(stack),GTK_WIDGET(p->view),std::to_string(id).c_str());
@@ -312,7 +352,13 @@ static void cookie_added(GObject *source,GAsyncResult *result,gpointer data) {
 }
 static gboolean expire_policy(gpointer data) {
     long id=(long)data;auto i=decisions.find(id);
-    if(i!=decisions.end()){webkit_policy_decision_ignore(i->second);g_object_unref(i->second);decisions.erase(i);}return G_SOURCE_REMOVE;
+    if(i!=decisions.end()){
+        i->second.timeout_id=0;
+        webkit_policy_decision_ignore(i->second.decision);
+        g_object_unref(i->second.decision);
+        decisions.erase(i);
+    }
+    return G_SOURCE_REMOVE;
 }
 static void handle(JsonObject *o) {
     const char *op=str(o,"op");long id=num(o,"view");
@@ -322,9 +368,17 @@ static void handle(JsonObject *o) {
         return;
     }
     if(!strcmp(op,"policy")) {
-        long d=num(o,"decision");if(decisions.count(d)){auto p=decisions[d];if(num(o,"allow"))webkit_policy_decision_use(p);else webkit_policy_decision_ignore(p);g_object_unref(p);decisions.erase(d);}return;
+        long d=num(o,"decision");auto i=decisions.find(d);
+        if(i!=decisions.end()){
+            if(i->second.timeout_id)g_source_remove(i->second.timeout_id);
+            auto p=i->second.decision;
+            if(num(o,"allow"))webkit_policy_decision_use(p);else webkit_policy_decision_ignore(p);
+            g_object_unref(p);decisions.erase(i);
+        }
+        return;
     }
     if(!strcmp(op,"close")){
+        cancel_page_decisions(id);
         if(current && current->id==id){current=nullptr;return_to_game(nullptr,nullptr);}
         if(pages.count(id) && pages[id]->view){webkit_web_view_stop_loading(pages[id]->view);gtk_widget_destroy(GTK_WIDGET(pages[id]->view));pages[id]->view=nullptr;}
         return;
@@ -395,7 +449,7 @@ static gboolean incoming(gint fd,GIOCondition condition,gpointer data) {
         }
     }
     if(n==0 || (condition&(G_IO_HUP|G_IO_ERR)) || p->input.size()>1024*1024) {
-        for(auto [id,d]:decisions){webkit_policy_decision_ignore(d);g_object_unref(d);}decisions.clear();
+        cancel_all_decisions();
         if(p->write_watch)g_source_remove(p->write_watch);
         close(fd);if(peer==p)peer=nullptr;delete p;return G_SOURCE_REMOVE;
     }return G_SOURCE_CONTINUE;
@@ -570,6 +624,6 @@ int main(int argc,char **argv) {
     guest=g_subprocess_launcher_spawnv(launcher,(const gchar*const*)(argv+1),&error);g_object_unref(launcher);
     if(!guest){g_printerr("roblox-mac: client launch failed\n");unlink(socket_path.c_str());return 1;}
     g_subprocess_wait_async(guest,nullptr,guest_done,nullptr);gtk_main();
-    for(auto [id,d]:decisions){webkit_policy_decision_ignore(d);g_object_unref(d);}
+    cancel_all_decisions();
     gtk_widget_destroy(window);close(listener);unlink(socket_path.c_str());g_object_unref(guest);return exit_status;
 }

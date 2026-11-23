@@ -180,6 +180,23 @@ int main() {
     assert(sigaction(SIGWINCH,nullptr,&now)==0 && now.sa_handler==SIG_IGN);
     assert(sigaction(SIGTERM,nullptr,&now)==0 && now.sa_handler==old_term.sa_handler);
     assert(sigaction(SIGWINCH,&old_resize,nullptr)==0);
+    // Native UI threads inherit a blocked async-signal mask while keeping
+    // synchronous fault signals unblocked and restoring the caller's mask.
+    sigset_t caller_before{},caller_after{},saved_mask{};
+    assert(pthread_sigmask(SIG_SETMASK,nullptr,&caller_before)==0);
+    assert(block_native_thread_signals(&saved_mask));
+    std::thread([]{
+        sigset_t child_mask{};
+        assert(pthread_sigmask(SIG_SETMASK,nullptr,&child_mask)==0);
+        assert(sigismember(&child_mask,SIGPIPE)==1);
+        assert(sigismember(&child_mask,SIGUSR1)==1);
+        assert(sigismember(&child_mask,SIGWINCH)==1);
+        assert(sigismember(&child_mask,SIGSEGV)==0);
+        assert(sigismember(&child_mask,SIGABRT)==0);
+    }).join();
+    assert(pthread_sigmask(SIG_SETMASK,&saved_mask,nullptr)==0);
+    assert(pthread_sigmask(SIG_SETMASK,nullptr,&caller_after)==0);
+    assert(sigismember(&caller_after,SIGPIPE)==sigismember(&caller_before,SIGPIPE));
     assert(compatible_user_agent("Mozilla/5.0 Roblox/DarwinRobloxApp/0.738 (GlobalDist)")=="Mozilla/5.0 Roblox/Darwin RobloxApp/0.738 (GlobalDist)");
     assert(compatible_user_agent("CustomProbe/1.0")=="CustomProbe/1.0");
     assert(compatible_user_agent("Mozilla/5.0 (X11; Linux x86_64) Roblox/DarwinRobloxApp/0.738")=="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Roblox/Darwin RobloxApp/0.738");
